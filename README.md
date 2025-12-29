@@ -43,13 +43,30 @@ Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_deskt
 ## Available Tools
 
 ### User Management
+- `hello_propel` - Test server connection
 - `list_users` - List users with optional filters (program, status, organization)
+- `get_user` - Get detailed info for a specific user by email
+- `add_user` - Create a new user
+
+### Access Management
+- `list_access` - List access grants filtered by user or program
+- `get_reviews_due` - Show overdue and upcoming access reviews
+
+### Training Management
+- `get_training_status` - Get training status for a specific user
+- `get_expired_training` - List all users with expired training
+
+### Compliance Reporting
+- `get_compliance_report` - Generate compliance reports:
+  - `access_list` - Who has access to what
+  - `review_status` - Are access reviews current?
+  - `training_compliance` - Training completion status
+  - `terminated_audit` - Check for terminated users with access
+  - `business_associates` - List of business associates
 
 ### Configuration Management
-- *(Coming soon)*
-
-### Compliance & Reporting
-- *(Coming soon)*
+- `list_programs` - List all programs with clinic/location hierarchy
+- `get_config` - Get a configuration value with inheritance info
 
 ## Development
 
