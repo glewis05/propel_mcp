@@ -1,0 +1,7 @@
+{
+  "extraPaths": [
+    "../requirements_toolkit",
+    "../configurations_toolkit"
+  ],
+  "reportMissingImports": "warning"
+}
