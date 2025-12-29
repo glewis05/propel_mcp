@@ -196,6 +196,20 @@ def list_users(
                 active_only=True
             )
 
+            # get_access_by_scope doesn't include user status, so fetch it separately
+            if access_list:
+                conn = manager.conn
+                user_ids = list(set(a.get('user_id') for a in access_list if a.get('user_id')))
+                if user_ids:
+                    placeholders = ','.join(['?' for _ in user_ids])
+                    cursor = conn.execute(
+                        f"SELECT user_id, status FROM users WHERE user_id IN ({placeholders})",
+                        user_ids
+                    )
+                    status_map = {row['user_id']: row['status'] for row in cursor.fetchall()}
+                    for access in access_list:
+                        access['status'] = status_map.get(access.get('user_id'))
+
             # Filter by status and organization if provided
             if status:
                 access_list = [a for a in access_list if a.get('status') == status]
@@ -486,6 +500,19 @@ def export_annual_review(
 
         if not access_list:
             return "No users found matching the criteria."
+
+        # get_access_by_scope doesn't include user status, so fetch it separately
+        conn = manager.conn
+        user_ids = list(set(a.get('user_id') for a in access_list if a.get('user_id')))
+        if user_ids:
+            placeholders = ','.join(['?' for _ in user_ids])
+            cursor = conn.execute(
+                f"SELECT user_id, status FROM users WHERE user_id IN ({placeholders})",
+                user_ids
+            )
+            status_map = {row['user_id']: row['status'] for row in cursor.fetchall()}
+            for access in access_list:
+                access['status'] = status_map.get(access.get('user_id'))
 
         # Get program name for file
         program_name = None
@@ -994,12 +1021,13 @@ def get_compliance_report(
             data = reports.business_associate_report()
             result = f"Business Associates Report\n"
             result += f"==========================\n\n"
-            result += f"Total Business Associates: {data['summary']['total']}\n"
-            result += f"Active: {data['summary']['active']}\n\n"
+            result += f"Total External Users: {data['summary']['total_external_users']}\n"
+            result += f"Organizations: {data['summary']['organizations']}\n"
+            result += f"Total Access Grants: {data['summary']['total_access_grants']}\n\n"
 
-            for ba in data.get('associates', []):
+            for ba in data.get('all_external_users', []):
                 result += f"• {ba.get('name')} ({ba.get('organization')})\n"
-                result += f"  Email: {ba.get('email')} | Status: {ba.get('status')}\n\n"
+                result += f"  Email: {ba.get('email')} | Programs: {ba.get('programs')}\n\n"
 
         return result
 
