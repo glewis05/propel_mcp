@@ -83,6 +83,7 @@ def list_users(
     Returns:
         Formatted list of users with their status and access count
     """
+    manager = None
     try:
         manager = get_access_manager()
         users = manager.list_users(
@@ -91,7 +92,6 @@ def list_users(
             organization_filter=organization,
             include_access_count=True
         )
-        manager.close()
 
         if not users:
             return "No users found matching the criteria."
@@ -110,6 +110,9 @@ def list_users(
 
     except Exception as e:
         return f"Error listing users: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
 
 
 @mcp.tool()
@@ -123,12 +126,12 @@ def get_user(email: str) -> str:
     Returns:
         User details including status, organization, and access grants
     """
+    manager = None
     try:
         manager = get_access_manager()
         user = manager.get_user(email=email)
 
         if not user:
-            manager.close()
             return f"User not found: {email}"
 
         # Get user's access grants
@@ -136,8 +139,6 @@ def get_user(email: str) -> str:
 
         # Get user's training status
         training = manager.get_training_status(user['user_id'])
-
-        manager.close()
 
         result = f"User: {user['name']}\n"
         result += f"Email: {user['email']}\n"
@@ -167,6 +168,9 @@ def get_user(email: str) -> str:
 
     except Exception as e:
         return f"Error getting user: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
 
 
 @mcp.tool()
@@ -188,13 +192,13 @@ def add_user(
     Returns:
         Confirmation with new user's ID
     """
+    manager = None
     try:
         manager = get_access_manager()
 
         # Check if user already exists
         existing = manager.get_user(email=email)
         if existing:
-            manager.close()
             return f"User already exists with email: {email}"
 
         user_id = manager.create_user(
@@ -203,7 +207,6 @@ def add_user(
             organization=organization,
             is_business_associate=is_business_associate
         )
-        manager.close()
 
         result = f"User created successfully!\n"
         result += f"  Name: {name}\n"
@@ -217,6 +220,9 @@ def add_user(
 
     except Exception as e:
         return f"Error creating user: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
 
 
 # ============================================================
@@ -238,22 +244,22 @@ def list_access(
     Returns:
         List of access grants with roles and scope
     """
+    manager = None
     try:
         manager = get_access_manager()
 
         user_id = None
+        user_info = None
         if user_email:
             user = manager.get_user(email=user_email)
             if not user:
-                manager.close()
                 return f"User not found: {user_email}"
             user_id = user['user_id']
+            user_info = user  # Store for display
 
         # Get access based on filters provided
-        user_info = None  # Store user info for display
         if user_id:
-            # User-specific access - store user info for display
-            user_info = user  # from earlier get_user call
+            # User-specific access
             access_list = manager.get_user_access(user_id, active_only=True)
             # Filter by program if provided
             if program:
@@ -261,7 +267,6 @@ def list_access(
                     program_id = manager._resolve_program_id(program)
                     access_list = [a for a in access_list if a.get('program_id') == program_id]
                 except ValueError:
-                    manager.close()
                     return f"Program not found: {program}"
         elif program:
             # Scope-specific access
@@ -269,13 +274,10 @@ def list_access(
                 program_id = manager._resolve_program_id(program)
                 access_list = manager.get_access_by_scope(program_id=program_id, active_only=True)
             except ValueError:
-                manager.close()
                 return f"Program not found: {program}"
         else:
             # No filters - get all access (scope-based with no filter)
             access_list = manager.get_access_by_scope(active_only=True)
-
-        manager.close()
 
         if not access_list:
             return "No access grants found matching the criteria."
@@ -306,6 +308,9 @@ def list_access(
 
     except Exception as e:
         return f"Error listing access: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
 
 
 @mcp.tool()
@@ -319,6 +324,7 @@ def get_reviews_due(program: Optional[str] = None) -> str:
     Returns:
         List of access grants needing review
     """
+    manager = None
     try:
         manager = get_access_manager()
 
@@ -327,11 +333,9 @@ def get_reviews_due(program: Optional[str] = None) -> str:
             try:
                 program_id = manager._resolve_program_id(program)
             except ValueError:
-                manager.close()
                 return f"Program not found: {program}"
 
         reviews = manager.get_reviews_due(program_id=program_id)
-        manager.close()
 
         if not reviews:
             return "No reviews are currently due. All access reviews are up to date!"
@@ -342,14 +346,14 @@ def get_reviews_due(program: Optional[str] = None) -> str:
         result = f"Access Reviews Due: {len(reviews)} total\n\n"
 
         if overdue:
-            result += f"⚠️  OVERDUE ({len(overdue)}):\n"
+            result += f"OVERDUE ({len(overdue)}):\n"
             for r in overdue:
                 result += f"  • {r.get('user_name')} - {r.get('program_name')} ({r.get('role')})\n"
                 result += f"    Due: {r.get('next_review_due')} | Days overdue: {r.get('days_overdue')}\n"
             result += "\n"
 
         if due_soon:
-            result += f"📅 Due Soon ({len(due_soon)}):\n"
+            result += f"Due Soon ({len(due_soon)}):\n"
             for r in due_soon:
                 result += f"  • {r.get('user_name')} - {r.get('program_name')} ({r.get('role')})\n"
                 result += f"    Due: {r.get('next_review_due')}\n"
@@ -358,6 +362,9 @@ def get_reviews_due(program: Optional[str] = None) -> str:
 
     except Exception as e:
         return f"Error getting reviews: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
 
 
 # ============================================================
@@ -375,16 +382,15 @@ def get_training_status(user_email: str) -> str:
     Returns:
         List of training records with completion status
     """
+    manager = None
     try:
         manager = get_access_manager()
 
         user = manager.get_user(email=user_email)
         if not user:
-            manager.close()
             return f"User not found: {user_email}"
 
         training = manager.get_training_status(user['user_id'])
-        manager.close()
 
         if not training:
             return f"No training records found for {user['name']}."
@@ -397,7 +403,7 @@ def get_training_status(user_email: str) -> str:
         expired = [t for t in training if t.get('status') == 'Expired']
 
         if current:
-            result += f"✅ Current ({len(current)}):\n"
+            result += f"Current ({len(current)}):\n"
             for t in current:
                 result += f"  • {t.get('training_type')}"
                 if t.get('expires_date'):
@@ -406,13 +412,13 @@ def get_training_status(user_email: str) -> str:
             result += "\n"
 
         if pending:
-            result += f"⏳ Pending ({len(pending)}):\n"
+            result += f"Pending ({len(pending)}):\n"
             for t in pending:
                 result += f"  • {t.get('training_type')} (assigned: {t.get('assigned_date')})\n"
             result += "\n"
 
         if expired:
-            result += f"❌ Expired ({len(expired)}):\n"
+            result += f"Expired ({len(expired)}):\n"
             for t in expired:
                 result += f"  • {t.get('training_type')} (expired: {t.get('expires_date')})\n"
 
@@ -420,6 +426,9 @@ def get_training_status(user_email: str) -> str:
 
     except Exception as e:
         return f"Error getting training status: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
 
 
 @mcp.tool()
@@ -430,15 +439,15 @@ def get_expired_training() -> str:
     Returns:
         List of users and their expired training records
     """
+    manager = None
     try:
         manager = get_access_manager()
         expired = manager.get_expired_training()
-        manager.close()
 
         if not expired:
             return "No expired training found. All training is current!"
 
-        result = f"⚠️  Expired Training: {len(expired)} record(s)\n\n"
+        result = f"Expired Training: {len(expired)} record(s)\n\n"
 
         for record in expired:
             result += f"• {record.get('user_name')} ({record.get('user_email')})\n"
@@ -449,6 +458,9 @@ def get_expired_training() -> str:
 
     except Exception as e:
         return f"Error getting expired training: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
 
 
 # ============================================================
@@ -483,6 +495,7 @@ def get_compliance_report(
     if report_type not in valid_reports:
         return f"Invalid report type. Choose from: {', '.join(valid_reports)}"
 
+    manager = None
     try:
         manager = get_access_manager()
         reports = ComplianceReports(manager)
@@ -492,7 +505,6 @@ def get_compliance_report(
             try:
                 program_id = manager._resolve_program_id(program)
             except ValueError:
-                manager.close()
                 return f"Program not found: {program}"
 
         result = ""
@@ -525,7 +537,7 @@ def get_compliance_report(
             result += f"Overdue: {data['summary']['overdue']}\n"
 
             if data['summary']['overdue'] > 0:
-                result += f"\n⚠️  Action Required: {data['summary']['overdue']} overdue reviews\n"
+                result += f"\nAction Required: {data['summary']['overdue']} overdue reviews\n"
 
         elif report_type == 'training_compliance':
             data = reports.training_compliance_report()
@@ -542,9 +554,9 @@ def get_compliance_report(
             result += f"=====================\n\n"
 
             if not data.get('violations'):
-                result += "✅ No issues found. All terminated users have had access revoked.\n"
+                result += "No issues found. All terminated users have had access revoked.\n"
             else:
-                result += f"⚠️  VIOLATIONS FOUND: {len(data['violations'])}\n\n"
+                result += f"VIOLATIONS FOUND: {len(data['violations'])}\n\n"
                 for v in data['violations']:
                     result += f"• {v.get('user_name')} - still has {v.get('active_grants')} active grant(s)\n"
 
@@ -559,11 +571,13 @@ def get_compliance_report(
                 result += f"• {ba.get('name')} ({ba.get('organization')})\n"
                 result += f"  Email: {ba.get('email')} | Status: {ba.get('status')}\n\n"
 
-        manager.close()
         return result
 
     except Exception as e:
         return f"Error generating report: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
 
 
 # ============================================================
@@ -578,10 +592,10 @@ def list_programs() -> str:
     Returns:
         Formatted hierarchy of programs, clinics, and locations
     """
+    cm = None
     try:
         cm = get_config_manager()
         programs = cm.list_programs()
-        cm.close()
 
         if not programs:
             return "No programs found in the database."
@@ -590,20 +604,20 @@ def list_programs() -> str:
         result += "=========\n\n"
 
         for program in programs:
-            result += f"📁 {program.get('name')} ({program.get('prefix')})\n"
+            result += f"[{program.get('prefix')}] {program.get('name')}\n"
             result += f"   Type: {program.get('program_type')} | Status: {program.get('status')}\n"
 
             clinics = program.get('clinics', [])
             if clinics:
                 for clinic in clinics:
-                    result += f"   └── 🏥 {clinic.get('name')}"
+                    result += f"   +-- {clinic.get('name')}"
                     if clinic.get('code'):
                         result += f" [{clinic.get('code')}]"
                     result += "\n"
 
                     locations = clinic.get('locations', [])
                     for loc in locations:
-                        result += f"       └── 📍 {loc.get('name')}"
+                        result += f"       +-- {loc.get('name')}"
                         if loc.get('code'):
                             result += f" [{loc.get('code')}]"
                         result += "\n"
@@ -614,6 +628,9 @@ def list_programs() -> str:
 
     except Exception as e:
         return f"Error listing programs: {str(e)}"
+    finally:
+        if cm:
+            cm.close()
 
 
 @mcp.tool()
@@ -635,6 +652,7 @@ def get_config(
     Returns:
         Configuration value with source and inheritance chain
     """
+    cm = None
     try:
         cm = get_config_manager()
         im = InheritanceManager(cm)
@@ -642,31 +660,26 @@ def get_config(
         # Resolve IDs
         program_id = cm.get_program_id(program)
         if not program_id:
-            cm.close()
             return f"Program not found: {program}"
 
         clinic_id = None
         if clinic:
             clinic_id = cm.get_clinic_id(program_id, clinic)
             if not clinic_id:
-                cm.close()
                 return f"Clinic not found: {clinic}"
 
         location_id = None
         if location:
             if not clinic_id:
-                cm.close()
                 return "Location requires clinic to be specified"
             location_id = cm.get_location_id(clinic_id, location)
             if not location_id:
-                cm.close()
                 return f"Location not found: {location}"
 
         # Get config with inheritance
         config = im.resolve_with_inheritance(
             config_key, program_id, clinic_id, location_id
         )
-        cm.close()
 
         if not config:
             return f"Configuration not found: {config_key}"
@@ -681,7 +694,7 @@ def get_config(
         if chain:
             result += f"\nInheritance Chain:\n"
             for level in chain:
-                marker = "→" if level.get('is_effective') else " "
+                marker = ">" if level.get('is_effective') else " "
                 override = "*" if level.get('is_override') else ""
                 result += f"  {marker} {level.get('level')}: {level.get('value', '(inherited)')}{override}\n"
 
@@ -689,6 +702,9 @@ def get_config(
 
     except Exception as e:
         return f"Error getting config: {str(e)}"
+    finally:
+        if cm:
+            cm.close()
 
 
 # ============================================================
