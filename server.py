@@ -132,10 +132,10 @@ def get_user(email: str) -> str:
             return f"User not found: {email}"
 
         # Get user's access grants
-        access_list = manager.list_access(user_id=user['user_id'])
+        access_list = manager.get_user_access(user['user_id'], active_only=False)
 
         # Get user's training status
-        training = manager.get_user_training(user['user_id'])
+        training = manager.get_training_status(user['user_id'])
 
         manager.close()
 
@@ -249,25 +249,49 @@ def list_access(
                 return f"User not found: {user_email}"
             user_id = user['user_id']
 
-        program_id = None
-        if program:
+        # Get access based on filters provided
+        user_info = None  # Store user info for display
+        if user_id:
+            # User-specific access - store user info for display
+            user_info = user  # from earlier get_user call
+            access_list = manager.get_user_access(user_id, active_only=True)
+            # Filter by program if provided
+            if program:
+                try:
+                    program_id = manager._resolve_program_id(program)
+                    access_list = [a for a in access_list if a.get('program_id') == program_id]
+                except ValueError:
+                    manager.close()
+                    return f"Program not found: {program}"
+        elif program:
+            # Scope-specific access
             try:
                 program_id = manager._resolve_program_id(program)
+                access_list = manager.get_access_by_scope(program_id=program_id, active_only=True)
             except ValueError:
                 manager.close()
                 return f"Program not found: {program}"
+        else:
+            # No filters - get all access (scope-based with no filter)
+            access_list = manager.get_access_by_scope(active_only=True)
 
-        access_list = manager.list_access(user_id=user_id, program_id=program_id)
         manager.close()
 
         if not access_list:
             return "No access grants found matching the criteria."
 
-        # Group by user
+        # Format results
         result = f"Found {len(access_list)} access grant(s):\n\n"
+
+        # If user-specific query, show user header once
+        if user_info:
+            result += f"User: {user_info['name']} ({user_info['email']})\n\n"
+
         for access in access_list:
             status = "Active" if access.get('is_active') else "Revoked"
-            result += f"• {access.get('user_name', 'Unknown')} ({access.get('user_email')})\n"
+            # For scope-based queries, show user per access grant
+            if not user_info:
+                result += f"• {access.get('user_name', 'Unknown')} ({access.get('email', 'N/A')})\n"
             result += f"  Program: {access.get('program_name')} | Role: {access.get('role')} | Status: {status}\n"
             if access.get('clinic_name'):
                 result += f"  Scope: {access.get('clinic_name')}"
@@ -359,7 +383,7 @@ def get_training_status(user_email: str) -> str:
             manager.close()
             return f"User not found: {user_email}"
 
-        training = manager.get_user_training(user['user_id'])
+        training = manager.get_training_status(user['user_id'])
         manager.close()
 
         if not training:
@@ -478,16 +502,19 @@ def get_compliance_report(
             result = f"Access List Report\n"
             result += f"==================\n\n"
             result += f"Total Users: {data['summary']['total_users']}\n"
-            result += f"Total Access Grants: {data['summary']['total_grants']}\n\n"
+            result += f"Total Access Grants: {data['summary']['total_access_grants']}\n\n"
 
-            for user in data.get('users', [])[:20]:  # Limit to 20
-                result += f"• {user.get('name')} ({user.get('email')})\n"
-                for grant in user.get('access', []):
-                    result += f"  - {grant.get('program')}: {grant.get('role')}\n"
-                result += "\n"
+            # Group by user for cleaner display
+            users_seen = set()
+            for access in data.get('access_list', [])[:50]:  # Limit to 50 entries
+                user_key = access.get('user_id')
+                if user_key not in users_seen:
+                    result += f"• {access.get('user_name')} ({access.get('email')})\n"
+                    users_seen.add(user_key)
+                result += f"  - {access.get('program_name')}: {access.get('role')}\n"
 
-            if len(data.get('users', [])) > 20:
-                result += f"... and {len(data['users']) - 20} more users\n"
+            if len(data.get('access_list', [])) > 50:
+                result += f"\n... and {len(data['access_list']) - 50} more access grants\n"
 
         elif report_type == 'review_status':
             data = reports.review_status_report(program_id=program_id)
