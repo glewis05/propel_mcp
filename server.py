@@ -2938,6 +2938,809 @@ def export_compliance_dashboard(
 
 
 # ============================================================
+# CONFIGURATION VIEWING TOOLS
+# ============================================================
+
+@mcp.tool()
+def get_program_overview(program: str) -> str:
+    """
+    Get comprehensive overview of a program including all clinics, locations, and config summary.
+
+    Args:
+        program: Program prefix (e.g., "P4M") or name
+
+    Returns:
+        Program hierarchy with config counts and override summary
+    """
+    cm = None
+    try:
+        cm = get_config_manager()
+
+        # Resolve program
+        program_id = cm.get_program_id(program)
+        if not program_id:
+            return f"Program not found: {program}"
+
+        # Get program details
+        cursor = cm.conn.cursor()
+        cursor.execute("""
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM clinics c WHERE c.program_id = p.program_id) as clinic_count,
+                   (SELECT COUNT(*) FROM locations l
+                    JOIN clinics c ON l.clinic_id = c.clinic_id
+                    WHERE c.program_id = p.program_id) as location_count,
+                   (SELECT COUNT(*) FROM config_values cv WHERE cv.program_id = p.program_id AND cv.clinic_id IS NULL) as program_config_count
+            FROM programs p WHERE p.program_id = ?
+        """, (program_id,))
+        program_data = dict(cursor.fetchone())
+
+        result = f"Program: {program_data['name']} [{program_data.get('prefix', '')}]\n"
+        result += "=" * 50 + "\n\n"
+        result += f"Type: {program_data.get('program_type', 'N/A')}\n"
+        result += f"Status: {program_data.get('status', 'Active')}\n\n"
+
+        result += f"Hierarchy:\n"
+        result += f"  Clinics: {program_data['clinic_count']}\n"
+        result += f"  Locations: {program_data['location_count']}\n"
+        result += f"  Program-level configs: {program_data['program_config_count']}\n\n"
+
+        # Get clinics with their locations
+        cursor.execute("""
+            SELECT c.clinic_id, c.name, c.code,
+                   (SELECT COUNT(*) FROM locations l WHERE l.clinic_id = c.clinic_id) as location_count,
+                   (SELECT COUNT(*) FROM config_values cv WHERE cv.clinic_id = c.clinic_id AND cv.location_id IS NULL) as clinic_config_count
+            FROM clinics c
+            WHERE c.program_id = ?
+            ORDER BY c.name
+        """, (program_id,))
+
+        clinics = cursor.fetchall()
+
+        if clinics:
+            result += "Clinics:\n"
+            for clinic in clinics:
+                clinic_dict = dict(clinic)
+                result += f"\n  [{clinic_dict.get('code', '')}] {clinic_dict['name']}\n"
+                result += f"      Locations: {clinic_dict['location_count']} | Clinic-level configs: {clinic_dict['clinic_config_count']}\n"
+
+                # Get locations for this clinic
+                cursor.execute("""
+                    SELECT l.name, l.code,
+                           (SELECT COUNT(*) FROM config_values cv WHERE cv.location_id = l.location_id) as location_config_count
+                    FROM locations l
+                    WHERE l.clinic_id = ?
+                    ORDER BY l.name
+                """, (clinic_dict['clinic_id'],))
+
+                locations = cursor.fetchall()
+                for loc in locations:
+                    loc_dict = dict(loc)
+                    result += f"      +-- {loc_dict['name']}"
+                    if loc_dict.get('code'):
+                        result += f" [{loc_dict['code']}]"
+                    result += f" ({loc_dict['location_config_count']} overrides)\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error getting program overview: {str(e)}"
+    finally:
+        if cm:
+            cm.close()
+
+
+@mcp.tool()
+def get_clinic_config(
+    program: str,
+    clinic: str,
+    category: Optional[str] = None
+) -> str:
+    """
+    Get all configuration values for a specific clinic with inheritance info.
+
+    Args:
+        program: Program prefix (e.g., "P4M")
+        clinic: Clinic name or code
+        category: Optional category filter (e.g., "helpdesk", "operations", "lab_order")
+
+    Returns:
+        All configs for the clinic showing effective values and sources
+    """
+    cm = None
+    try:
+        cm = get_config_manager()
+        im = InheritanceManager(cm)
+
+        program_id = cm.get_program_id(program)
+        if not program_id:
+            return f"Program not found: {program}"
+
+        clinic_id = cm.get_clinic_id(program_id, clinic)
+        if not clinic_id:
+            return f"Clinic not found: {clinic}"
+
+        # Get clinic name
+        cursor = cm.conn.cursor()
+        cursor.execute("SELECT name FROM clinics WHERE clinic_id = ?", (clinic_id,))
+        clinic_name = cursor.fetchone()['name']
+
+        # Get all config definitions
+        cursor.execute("""
+            SELECT config_key, display_name, category, default_value
+            FROM config_definitions
+            ORDER BY category, display_name
+        """)
+        definitions = cursor.fetchall()
+
+        result = f"Configuration: {clinic_name} ({program})\n"
+        result += "=" * 50 + "\n\n"
+
+        current_category = None
+        for defn in definitions:
+            defn_dict = dict(defn)
+
+            # Filter by category if specified
+            if category and category.lower() not in defn_dict['category'].lower():
+                continue
+
+            # Print category header
+            if defn_dict['category'] != current_category:
+                current_category = defn_dict['category']
+                result += f"\n[{current_category.upper()}]\n"
+
+            # Get effective value with inheritance
+            config = im.resolve_with_inheritance(
+                defn_dict['config_key'], program_id, clinic_id, None
+            )
+
+            effective_value = config.get('value') if config else defn_dict['default_value']
+            effective_level = config.get('effective_level', 'default') if config else 'default'
+            is_override = config.get('is_override', False) if config else False
+
+            # Format display
+            display = defn_dict.get('display_name') or defn_dict['config_key']
+            override_marker = "*" if is_override else ""
+            source_indicator = f" [{effective_level}]" if effective_level != 'clinic' else ""
+
+            result += f"  {display}: {effective_value or '(not set)'}{override_marker}{source_indicator}\n"
+
+        result += "\n* = overridden at this level\n"
+        result += "[level] = inherited from that level\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error getting clinic config: {str(e)}"
+    finally:
+        if cm:
+            cm.close()
+
+
+@mcp.tool()
+def compare_clinic_configs(
+    program: str,
+    clinic1: str,
+    clinic2: str
+) -> str:
+    """
+    Compare configuration values between two clinics.
+
+    Args:
+        program: Program prefix (e.g., "P4M")
+        clinic1: First clinic name or code
+        clinic2: Second clinic name or code
+
+    Returns:
+        Side-by-side comparison highlighting differences
+    """
+    cm = None
+    try:
+        cm = get_config_manager()
+        im = InheritanceManager(cm)
+
+        program_id = cm.get_program_id(program)
+        if not program_id:
+            return f"Program not found: {program}"
+
+        clinic1_id = cm.get_clinic_id(program_id, clinic1)
+        if not clinic1_id:
+            return f"Clinic not found: {clinic1}"
+
+        clinic2_id = cm.get_clinic_id(program_id, clinic2)
+        if not clinic2_id:
+            return f"Clinic not found: {clinic2}"
+
+        # Get clinic names
+        cursor = cm.conn.cursor()
+        cursor.execute("SELECT name FROM clinics WHERE clinic_id = ?", (clinic1_id,))
+        clinic1_name = cursor.fetchone()['name']
+        cursor.execute("SELECT name FROM clinics WHERE clinic_id = ?", (clinic2_id,))
+        clinic2_name = cursor.fetchone()['name']
+
+        # Get all config definitions
+        cursor.execute("""
+            SELECT config_key, display_name, category
+            FROM config_definitions
+            ORDER BY category, display_name
+        """)
+        definitions = cursor.fetchall()
+
+        result = f"Config Comparison: {clinic1_name} vs {clinic2_name}\n"
+        result += "=" * 60 + "\n\n"
+
+        differences = []
+        same_count = 0
+
+        current_category = None
+        for defn in definitions:
+            defn_dict = dict(defn)
+
+            # Get values for both clinics
+            config1 = im.resolve_with_inheritance(defn_dict['config_key'], program_id, clinic1_id, None)
+            config2 = im.resolve_with_inheritance(defn_dict['config_key'], program_id, clinic2_id, None)
+
+            value1 = config1.get('value') if config1 else None
+            value2 = config2.get('value') if config2 else None
+
+            if value1 != value2:
+                differences.append({
+                    'category': defn_dict['category'],
+                    'key': defn_dict.get('display_name') or defn_dict['config_key'],
+                    'value1': value1 or '(not set)',
+                    'value2': value2 or '(not set)'
+                })
+            else:
+                same_count += 1
+
+        # Display differences grouped by category
+        if differences:
+            result += f"DIFFERENCES ({len(differences)}):\n"
+            current_category = None
+            for diff in differences:
+                if diff['category'] != current_category:
+                    current_category = diff['category']
+                    result += f"\n[{current_category.upper()}]\n"
+                result += f"  {diff['key']}:\n"
+                result += f"    {clinic1_name}: {diff['value1']}\n"
+                result += f"    {clinic2_name}: {diff['value2']}\n"
+        else:
+            result += "No differences found.\n"
+
+        result += f"\n\nSummary: {len(differences)} differences, {same_count} same\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error comparing clinics: {str(e)}"
+    finally:
+        if cm:
+            cm.close()
+
+
+@mcp.tool()
+def get_config_overrides(
+    program: str,
+    clinic: Optional[str] = None
+) -> str:
+    """
+    Get all configuration overrides (non-inherited values) for a program or clinic.
+
+    Args:
+        program: Program prefix (e.g., "P4M")
+        clinic: Optional clinic name to filter to specific clinic
+
+    Returns:
+        List of all overridden configs with their values
+    """
+    cm = None
+    try:
+        cm = get_config_manager()
+
+        program_id = cm.get_program_id(program)
+        if not program_id:
+            return f"Program not found: {program}"
+
+        cursor = cm.conn.cursor()
+
+        # Get program name
+        cursor.execute("SELECT name FROM programs WHERE program_id = ?", (program_id,))
+        program_name = cursor.fetchone()['name']
+
+        result = f"Configuration Overrides: {program_name}\n"
+        result += "=" * 50 + "\n"
+
+        # Build query based on scope
+        if clinic:
+            clinic_id = cm.get_clinic_id(program_id, clinic)
+            if not clinic_id:
+                return f"Clinic not found: {clinic}"
+
+            cursor.execute("SELECT name FROM clinics WHERE clinic_id = ?", (clinic_id,))
+            clinic_name = cursor.fetchone()['name']
+            result += f"Clinic: {clinic_name}\n\n"
+
+            # Get clinic and location overrides
+            cursor.execute("""
+                SELECT cv.config_key, cv.value, cv.source, cv.updated_date,
+                       cd.display_name, cd.category,
+                       c.name as clinic_name, l.name as location_name
+                FROM config_values cv
+                JOIN config_definitions cd ON cv.config_key = cd.config_key
+                LEFT JOIN clinics c ON cv.clinic_id = c.clinic_id
+                LEFT JOIN locations l ON cv.location_id = l.location_id
+                WHERE cv.program_id = ? AND cv.clinic_id = ?
+                ORDER BY cv.location_id IS NULL DESC, cd.category, cd.display_name
+            """, (program_id, clinic_id))
+        else:
+            result += "\n"
+            # Get all overrides for the program
+            cursor.execute("""
+                SELECT cv.config_key, cv.value, cv.source, cv.updated_date,
+                       cd.display_name, cd.category,
+                       c.name as clinic_name, l.name as location_name
+                FROM config_values cv
+                JOIN config_definitions cd ON cv.config_key = cd.config_key
+                LEFT JOIN clinics c ON cv.clinic_id = c.clinic_id
+                LEFT JOIN locations l ON cv.location_id = l.location_id
+                WHERE cv.program_id = ?
+                ORDER BY cv.clinic_id IS NULL DESC, cv.location_id IS NULL DESC,
+                         c.name, l.name, cd.category, cd.display_name
+            """, (program_id,))
+
+        overrides = cursor.fetchall()
+
+        if not overrides:
+            result += "No overrides found. All values are inherited from defaults.\n"
+            return result
+
+        # Group and display
+        current_scope = None
+        for override in overrides:
+            ov = dict(override)
+
+            # Determine scope
+            if ov['location_name']:
+                scope = f"Location: {ov['clinic_name']} > {ov['location_name']}"
+            elif ov['clinic_name']:
+                scope = f"Clinic: {ov['clinic_name']}"
+            else:
+                scope = "Program-level"
+
+            if scope != current_scope:
+                current_scope = scope
+                result += f"\n[{scope}]\n"
+
+            display = ov.get('display_name') or ov['config_key']
+            result += f"  {display}: {ov['value']}\n"
+            result += f"    Source: {ov['source']} | Updated: {ov['updated_date']}\n"
+
+        result += f"\nTotal overrides: {len(overrides)}\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error getting overrides: {str(e)}"
+    finally:
+        if cm:
+            cm.close()
+
+
+@mcp.tool()
+def get_clinic_providers(
+    program: str,
+    clinic: str
+) -> str:
+    """
+    Get all providers (healthcare staff) for a clinic with their NPIs.
+
+    Args:
+        program: Program prefix (e.g., "P4M")
+        clinic: Clinic name or code
+
+    Returns:
+        List of providers with NPI, location, and specialty info
+    """
+    cm = None
+    try:
+        cm = get_config_manager()
+
+        program_id = cm.get_program_id(program)
+        if not program_id:
+            return f"Program not found: {program}"
+
+        clinic_id = cm.get_clinic_id(program_id, clinic)
+        if not clinic_id:
+            return f"Clinic not found: {clinic}"
+
+        cursor = cm.conn.cursor()
+
+        # Get clinic name
+        cursor.execute("SELECT name FROM clinics WHERE clinic_id = ?", (clinic_id,))
+        clinic_name = cursor.fetchone()['name']
+
+        # Get providers
+        cursor.execute("""
+            SELECT p.name, p.npi, p.specialty, p.status,
+                   l.name as location_name
+            FROM providers p
+            LEFT JOIN locations l ON p.location_id = l.location_id
+            JOIN clinics c ON (p.location_id IN (SELECT location_id FROM locations WHERE clinic_id = c.clinic_id)
+                              OR p.clinic_id = c.clinic_id)
+            WHERE c.clinic_id = ?
+            ORDER BY l.name, p.name
+        """, (clinic_id,))
+
+        providers = cursor.fetchall()
+
+        result = f"Providers: {clinic_name} ({program})\n"
+        result += "=" * 50 + "\n\n"
+
+        if not providers:
+            result += "No providers found for this clinic.\n"
+            return result
+
+        current_location = None
+        active_count = 0
+        for prov in providers:
+            prov_dict = dict(prov)
+
+            location = prov_dict.get('location_name') or '(Clinic-wide)'
+            if location != current_location:
+                current_location = location
+                result += f"\n[{location}]\n"
+
+            status = prov_dict.get('status', 'Active')
+            status_marker = "" if status == 'Active' else f" ({status})"
+            if status == 'Active':
+                active_count += 1
+
+            result += f"  {prov_dict['name']}{status_marker}\n"
+            result += f"    NPI: {prov_dict.get('npi', 'Not set')}"
+            if prov_dict.get('specialty'):
+                result += f" | Specialty: {prov_dict['specialty']}"
+            result += "\n"
+
+        result += f"\nTotal: {len(providers)} providers ({active_count} active)\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error getting providers: {str(e)}"
+    finally:
+        if cm:
+            cm.close()
+
+
+@mcp.tool()
+def get_clinic_appointment_types(
+    program: str,
+    clinic: str
+) -> str:
+    """
+    Get appointment type filters for a clinic and its locations.
+
+    Args:
+        program: Program prefix (e.g., "P4M")
+        clinic: Clinic name or code
+
+    Returns:
+        List of appointment types included/excluded for extract filtering
+    """
+    cm = None
+    try:
+        cm = get_config_manager()
+
+        program_id = cm.get_program_id(program)
+        if not program_id:
+            return f"Program not found: {program}"
+
+        clinic_id = cm.get_clinic_id(program_id, clinic)
+        if not clinic_id:
+            return f"Clinic not found: {clinic}"
+
+        cursor = cm.conn.cursor()
+
+        # Get clinic name
+        cursor.execute("SELECT name FROM clinics WHERE clinic_id = ?", (clinic_id,))
+        clinic_name = cursor.fetchone()['name']
+
+        # Get appointment types
+        cursor.execute("""
+            SELECT at.name, at.code, at.include, at.exclude_reason,
+                   l.name as location_name
+            FROM appointment_types at
+            LEFT JOIN locations l ON at.location_id = l.location_id
+            WHERE at.clinic_id = ? OR at.location_id IN (
+                SELECT location_id FROM locations WHERE clinic_id = ?
+            )
+            ORDER BY l.name NULLS FIRST, at.include DESC, at.name
+        """, (clinic_id, clinic_id))
+
+        appt_types = cursor.fetchall()
+
+        result = f"Appointment Types: {clinic_name} ({program})\n"
+        result += "=" * 50 + "\n\n"
+
+        if not appt_types:
+            result += "No appointment type filters configured.\n"
+            result += "All appointment types will be included in extracts.\n"
+            return result
+
+        current_location = None
+        included_count = 0
+        excluded_count = 0
+
+        for at in appt_types:
+            at_dict = dict(at)
+
+            location = at_dict.get('location_name') or '(Clinic-wide)'
+            if location != current_location:
+                current_location = location
+                result += f"\n[{location}]\n"
+
+            included = at_dict.get('include', True)
+            if included:
+                included_count += 1
+                result += f"  [INCLUDE] {at_dict['name']}"
+            else:
+                excluded_count += 1
+                result += f"  [EXCLUDE] {at_dict['name']}"
+
+            if at_dict.get('code'):
+                result += f" ({at_dict['code']})"
+            result += "\n"
+
+            if not included and at_dict.get('exclude_reason'):
+                result += f"           Reason: {at_dict['exclude_reason']}\n"
+
+        result += f"\nSummary: {included_count} included, {excluded_count} excluded\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error getting appointment types: {str(e)}"
+    finally:
+        if cm:
+            cm.close()
+
+
+@mcp.tool()
+def export_program_configs(
+    program: str,
+    output_dir: Optional[str] = None,
+    include_audit: bool = False
+) -> str:
+    """
+    Export all configurations for a program to Excel (Configuration Matrix format).
+
+    Args:
+        program: Program prefix (e.g., "P4M")
+        output_dir: Directory to save file (default: ~/Downloads)
+        include_audit: If True, include audit history sheet
+
+    Returns:
+        Path to generated Excel file
+    """
+    cm = None
+    try:
+        cm = get_config_manager()
+
+        program_id = cm.get_program_id(program)
+        if not program_id:
+            return f"Program not found: {program}"
+
+        cursor = cm.conn.cursor()
+
+        # Get program info
+        cursor.execute("SELECT name, prefix FROM programs WHERE program_id = ?", (program_id,))
+        program_data = dict(cursor.fetchone())
+        program_name = program_data['name']
+        program_prefix = program_data.get('prefix', '')
+
+        if output_dir:
+            out_path = os.path.expanduser(output_dir)
+        else:
+            out_path = os.path.expanduser("~/Downloads")
+        os.makedirs(out_path, exist_ok=True)
+
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        filename = f"{program_prefix}_configurations_{today_str}.xlsx"
+        filepath = os.path.join(out_path, filename)
+
+        wb = Workbook()
+
+        # Styles
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        category_fill = PatternFill(start_color="D6DCE5", end_color="D6DCE5", fill_type="solid")
+        override_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+
+        # --- CONFIGURATION MATRIX SHEET ---
+        ws = wb.active
+        ws.title = "Configuration Matrix"
+
+        # Get clinics and locations
+        cursor.execute("""
+            SELECT c.clinic_id, c.name as clinic_name
+            FROM clinics c WHERE c.program_id = ?
+            ORDER BY c.name
+        """, (program_id,))
+        clinics = [dict(row) for row in cursor.fetchall()]
+
+        # Build location map
+        location_columns = []
+        for clinic in clinics:
+            cursor.execute("""
+                SELECT l.location_id, l.name
+                FROM locations l WHERE l.clinic_id = ?
+                ORDER BY l.name
+            """, (clinic['clinic_id'],))
+            locations = [dict(row) for row in cursor.fetchall()]
+
+            if locations:
+                for loc in locations:
+                    location_columns.append({
+                        'clinic_id': clinic['clinic_id'],
+                        'clinic_name': clinic['clinic_name'],
+                        'location_id': loc['location_id'],
+                        'location_name': loc['name'],
+                        'header': f"{clinic['clinic_name']}\n{loc['name']}"
+                    })
+            else:
+                location_columns.append({
+                    'clinic_id': clinic['clinic_id'],
+                    'clinic_name': clinic['clinic_name'],
+                    'location_id': None,
+                    'location_name': None,
+                    'header': clinic['clinic_name']
+                })
+
+        # Headers
+        headers = ['Config Key', 'Display Name', 'Program Default'] + [lc['header'] for lc in location_columns]
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            cell.border = thin_border
+
+        # Get config definitions
+        cursor.execute("""
+            SELECT config_key, display_name, category, default_value
+            FROM config_definitions
+            ORDER BY category, display_name
+        """)
+        definitions = [dict(row) for row in cursor.fetchall()]
+
+        im = InheritanceManager(cm)
+
+        row = 2
+        current_category = None
+
+        for defn in definitions:
+            # Category header row
+            if defn['category'] != current_category:
+                current_category = defn['category']
+                cell = ws.cell(row=row, column=1, value=current_category.upper())
+                cell.fill = category_fill
+                cell.font = Font(bold=True)
+                for col in range(1, len(headers) + 1):
+                    ws.cell(row=row, column=col).fill = category_fill
+                    ws.cell(row=row, column=col).border = thin_border
+                row += 1
+
+            # Config key
+            ws.cell(row=row, column=1, value=defn['config_key']).border = thin_border
+            ws.cell(row=row, column=2, value=defn.get('display_name', '')).border = thin_border
+
+            # Program default
+            prog_config = im.resolve_with_inheritance(defn['config_key'], program_id, None, None)
+            prog_value = prog_config.get('value') if prog_config else defn.get('default_value')
+            cell = ws.cell(row=row, column=3, value=prog_value or "—")
+            cell.border = thin_border
+            if prog_config and prog_config.get('is_override'):
+                cell.fill = override_fill
+
+            # Location columns
+            for col_idx, loc_col in enumerate(location_columns, 4):
+                config = im.resolve_with_inheritance(
+                    defn['config_key'],
+                    program_id,
+                    loc_col['clinic_id'],
+                    loc_col['location_id']
+                )
+
+                effective_value = config.get('value') if config else None
+                effective_level = config.get('effective_level') if config else None
+
+                # Determine if this is inherited or set at this level
+                if loc_col['location_id']:
+                    is_set_here = effective_level == 'location'
+                else:
+                    is_set_here = effective_level == 'clinic'
+
+                if is_set_here:
+                    cell = ws.cell(row=row, column=col_idx, value=effective_value or "—")
+                    cell.fill = override_fill
+                else:
+                    cell = ws.cell(row=row, column=col_idx, value="—")
+
+                cell.border = thin_border
+
+            row += 1
+
+        # Adjust column widths
+        ws.column_dimensions['A'].width = 25
+        ws.column_dimensions['B'].width = 30
+        ws.column_dimensions['C'].width = 20
+        for col in range(4, len(headers) + 1):
+            ws.column_dimensions[get_column_letter(col)].width = 18
+
+        ws.freeze_panes = 'D2'
+
+        # --- AUDIT HISTORY SHEET (if requested) ---
+        if include_audit:
+            ws2 = wb.create_sheet("Audit History")
+            cursor.execute("""
+                SELECT ch.config_key, ch.old_value, ch.new_value,
+                       ch.changed_by, ch.changed_date, ch.change_reason,
+                       c.name as clinic_name, l.name as location_name
+                FROM config_history ch
+                LEFT JOIN clinics c ON ch.clinic_id = c.clinic_id
+                LEFT JOIN locations l ON ch.location_id = l.location_id
+                WHERE ch.program_id = ?
+                ORDER BY ch.changed_date DESC
+                LIMIT 500
+            """, (program_id,))
+
+            audit_rows = cursor.fetchall()
+
+            audit_headers = ['Date', 'Config Key', 'Clinic', 'Location', 'Old Value', 'New Value', 'Changed By', 'Reason']
+            for col, header in enumerate(audit_headers, 1):
+                cell = ws2.cell(row=1, column=col, value=header)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.border = thin_border
+
+            for row_num, audit in enumerate(audit_rows, 2):
+                audit_dict = dict(audit)
+                ws2.cell(row=row_num, column=1, value=audit_dict['changed_date']).border = thin_border
+                ws2.cell(row=row_num, column=2, value=audit_dict['config_key']).border = thin_border
+                ws2.cell(row=row_num, column=3, value=audit_dict.get('clinic_name', '')).border = thin_border
+                ws2.cell(row=row_num, column=4, value=audit_dict.get('location_name', '')).border = thin_border
+                ws2.cell(row=row_num, column=5, value=audit_dict.get('old_value', '')).border = thin_border
+                ws2.cell(row=row_num, column=6, value=audit_dict.get('new_value', '')).border = thin_border
+                ws2.cell(row=row_num, column=7, value=audit_dict.get('changed_by', '')).border = thin_border
+                ws2.cell(row=row_num, column=8, value=audit_dict.get('change_reason', '')).border = thin_border
+
+            ws2.freeze_panes = 'A2'
+
+        wb.save(filepath)
+
+        result = f"Configuration Export: {program_name}\n"
+        result += "=" * 50 + "\n\n"
+        result += f"File: {filepath}\n"
+        result += f"Generated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}\n\n"
+        result += f"Contents:\n"
+        result += f"  - Configuration Matrix ({len(definitions)} configs x {len(location_columns)} columns)\n"
+        if include_audit:
+            result += f"  - Audit History (up to 500 recent changes)\n"
+        result += f"\nNote: Yellow cells indicate overrides (non-inherited values)\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error exporting configs: {str(e)}"
+    finally:
+        if cm:
+            cm.close()
+
+
+# ============================================================
 # RUN SERVER
 # ============================================================
 if __name__ == "__main__":
