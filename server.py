@@ -26,8 +26,12 @@ import os
 import sys
 import csv
 import importlib.util
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Optional
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # MCP library
 from mcp.server.fastmcp import FastMCP
@@ -89,6 +93,9 @@ REQ_DB_PATH = os.environ.get(
     "REQUIREMENTS_DB_PATH",
     os.path.expanduser("~/projects/requirements_toolkit/data/client_product_database.db")
 )
+
+# Notion Dashboard Page ID (created by Claude)
+NOTION_DASHBOARD_PAGE_ID = "2dab5d1d-1631-81bb-8eeb-c4f4397de747"
 
 
 # ============================================================
@@ -1774,6 +1781,1160 @@ def get_coverage_gaps(program_prefix: str) -> str:
     finally:
         if db:
             db.close()
+
+
+# ============================================================
+# EXCEL EXPORT HELPER FUNCTIONS
+# ============================================================
+
+def _create_review_status_excel(rows: list, output_dir: str, filename: str) -> str:
+    """Create formatted Excel file for review status report with manager response columns."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Review Status"
+
+    # Styles
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    overdue_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    due_soon_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    response_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")  # Light green for response columns
+    thin_border = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
+    )
+
+    if rows:
+        # Add manager response columns to each row
+        for row in rows:
+            row['Action'] = ''  # Blank = Keep, or "Terminate" or "Update"
+            row['New Role'] = ''  # Only if Action = Update
+            row['Manager Notes'] = ''  # Reason for change
+
+        headers = list(rows[0].keys())
+
+        # Find which columns are response columns
+        response_cols = ['Action', 'New Role', 'Manager Notes']
+
+        # Write headers
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = thin_border
+
+        # Write data rows
+        for row_num, row_data in enumerate(rows, 2):
+            for col, header in enumerate(headers, 1):
+                cell = ws.cell(row=row_num, column=col, value=row_data.get(header, ''))
+                cell.border = thin_border
+
+                # Apply status-based highlighting to non-response columns
+                if header not in response_cols:
+                    if row_data.get('Review Status') == 'OVERDUE':
+                        cell.fill = overdue_fill
+                    elif row_data.get('Review Status') == 'Due Soon':
+                        cell.fill = due_soon_fill
+                else:
+                    # Light green background for response columns (to fill in)
+                    cell.fill = response_fill
+
+        # Auto-adjust column widths
+        for col in range(1, len(headers) + 1):
+            max_length = 0
+            column_letter = get_column_letter(col)
+            for row in range(1, len(rows) + 2):
+                try:
+                    cell_value = ws.cell(row=row, column=col).value
+                    if cell_value:
+                        max_length = max(max_length, len(str(cell_value)))
+                except:
+                    pass
+            ws.column_dimensions[column_letter].width = min(max_length + 2, 40)
+
+        # Make response columns wider for easier data entry
+        for col, header in enumerate(headers, 1):
+            if header in response_cols:
+                ws.column_dimensions[get_column_letter(col)].width = 20
+
+    # Add instructions sheet
+    instructions_ws = wb.create_sheet("Instructions")
+    instructions_ws['A1'] = "Annual Access Review Instructions"
+    instructions_ws['A1'].font = Font(bold=True, size=14)
+    instructions_ws['A3'] = "For each user, review their access and fill in the green columns:"
+    instructions_ws['A5'] = "ACTION Column:"
+    instructions_ws['B5'] = "Leave BLANK to keep current access (recertify)"
+    instructions_ws['B6'] = "Enter 'Terminate' to revoke access"
+    instructions_ws['B7'] = "Enter 'Update' to change their role"
+    instructions_ws['A9'] = "NEW ROLE Column (only if Action = Update):"
+    instructions_ws['B9'] = "Read-Write-Order"
+    instructions_ws['B10'] = "Read-Write"
+    instructions_ws['B11'] = "Read-Only"
+    instructions_ws['A13'] = "MANAGER NOTES Column:"
+    instructions_ws['B13'] = "Required for Terminate or Update actions"
+    instructions_ws['B14'] = "Example: 'Left organization', 'Role change per manager request'"
+    instructions_ws['A16'] = "When complete, save the file and send back for import."
+    instructions_ws.column_dimensions['A'].width = 35
+    instructions_ws.column_dimensions['B'].width = 50
+
+    # Freeze header row on main sheet
+    ws.freeze_panes = 'A2'
+
+    filepath = os.path.join(output_dir, f"{filename}.xlsx")
+    wb.save(filepath)
+    return filepath
+
+
+def _create_terminated_audit_excel(rows: list, output_dir: str, filename: str, violations_count: int) -> str:
+    """Create formatted Excel file for terminated user audit."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Terminated Audit"
+
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    violation_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    compliant_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    thin_border = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
+    )
+
+    if rows:
+        headers = list(rows[0].keys())
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = thin_border
+
+        for row_num, row_data in enumerate(rows, 2):
+            for col, header in enumerate(headers, 1):
+                cell = ws.cell(row=row_num, column=col, value=row_data.get(header, ''))
+                cell.border = thin_border
+                compliance_status = row_data.get('Compliance Status', '')
+                if 'VIOLATION' in compliance_status:
+                    cell.fill = violation_fill
+                elif 'Compliant' in compliance_status:
+                    cell.fill = compliant_fill
+                if header == 'Access Still Active' and 'VIOLATION' in str(row_data.get(header, '')):
+                    cell.fill = violation_fill
+                    cell.font = Font(bold=True, color="9C0006")
+
+        for col in range(1, len(headers) + 1):
+            max_length = 0
+            column_letter = get_column_letter(col)
+            for row in range(1, len(rows) + 2):
+                try:
+                    cell_value = ws.cell(row=row, column=col).value
+                    if cell_value:
+                        max_length = max(max_length, len(str(cell_value)))
+                except:
+                    pass
+            ws.column_dimensions[column_letter].width = min(max_length + 2, 40)
+
+    ws.freeze_panes = 'A2'
+
+    summary_ws = wb.create_sheet("Summary")
+    summary_ws['A1'] = "Terminated User Audit Summary"
+    summary_ws['A1'].font = Font(bold=True, size=14)
+    summary_ws['A3'] = "Generated:"
+    summary_ws['B3'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+    summary_ws['A4'] = "Total Users:"
+    summary_ws['B4'] = len(set(r.get('Email') for r in rows if r.get('Email')))
+    summary_ws['A5'] = "Violations:"
+    summary_ws['B5'] = violations_count
+    if violations_count > 0:
+        summary_ws['B5'].fill = violation_fill
+        summary_ws['C5'] = "ACTION REQUIRED"
+        summary_ws['C5'].font = Font(bold=True, color="9C0006")
+    else:
+        summary_ws['B5'].fill = compliant_fill
+        summary_ws['C5'] = "All access properly revoked"
+        summary_ws['C5'].font = Font(color="006100")
+
+    filepath = os.path.join(output_dir, f"{filename}.xlsx")
+    wb.save(filepath)
+    return filepath
+
+
+# ============================================================
+# COMPLIANCE EXCEL EXPORT TOOLS
+# ============================================================
+
+@mcp.tool()
+def export_review_status(
+    program: Optional[str] = None,
+    include_current: bool = False,
+    output_format: str = "xlsx",
+    output_dir: Optional[str] = None
+) -> str:
+    """
+    Export access review status to Excel for compliance tracking.
+
+    Args:
+        program: Filter by program name or prefix
+        include_current: If True, include reviews that are current (not just issues)
+        output_format: "xlsx" or "csv"
+        output_dir: Directory to save file (default: ~/Downloads)
+
+    Returns:
+        Path to generated file and summary statistics
+    """
+    manager = None
+    try:
+        manager = get_access_manager()
+
+        program_id = None
+        program_name = None
+        if program:
+            try:
+                program_id = manager._resolve_program_id(program)
+                cursor = manager.conn.cursor()
+                cursor.execute("SELECT name FROM programs WHERE program_id = ?", (program_id,))
+                row = cursor.fetchone()
+                if row:
+                    program_name = row['name']
+            except ValueError:
+                return f"Program not found: {program}"
+
+        try:
+            status_data = manager.get_review_status_detail(
+                program_id=program_id,
+                include_current=include_current
+            )
+        except AttributeError:
+            reviews_due = manager.get_reviews_due(program_id=program_id)
+            today = date.today()
+            due_soon_cutoff = (today + timedelta(days=30)).isoformat()
+            today_str = today.isoformat()
+
+            status_data = {
+                'overdue': [],
+                'due_soon': [],
+                'current': [],
+                'summary': {'overdue_count': 0, 'due_soon_count': 0, 'current_count': 0, 'as_of_date': today_str}
+            }
+
+            for review in reviews_due:
+                next_due = review.get('next_review_due')
+                if next_due and next_due <= today_str:
+                    status_data['overdue'].append(review)
+                elif next_due and next_due <= due_soon_cutoff:
+                    status_data['due_soon'].append(review)
+
+            status_data['summary']['overdue_count'] = len(status_data['overdue'])
+            status_data['summary']['due_soon_count'] = len(status_data['due_soon'])
+
+        has_issues = (status_data['summary']['overdue_count'] > 0 or
+                      status_data['summary']['due_soon_count'] > 0)
+
+        if not has_issues and not include_current:
+            return (
+                "All access reviews are current!\n\n"
+                f"Summary (as of {status_data['summary']['as_of_date']}):\n"
+                f"  Overdue: 0\n"
+                f"  Due Soon: 0\n"
+                f"  Current: {status_data['summary'].get('current_count', 'N/A')}\n\n"
+                "No export generated - use include_current=True for full export."
+            )
+
+        if output_dir:
+            out_path = os.path.expanduser(output_dir)
+        else:
+            out_path = os.path.expanduser("~/Downloads")
+        os.makedirs(out_path, exist_ok=True)
+
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        if program_name:
+            safe_name = program_name.replace(' ', '_').replace('/', '-')
+            filename = f"{safe_name}_review_status_{today_str}"
+        else:
+            filename = f"access_review_status_{today_str}"
+
+        export_rows = []
+
+        for item in status_data['overdue']:
+            export_rows.append({
+                'Review Status': 'OVERDUE',
+                'Days Overdue': item.get('days_overdue', ''),
+                'User Name': item.get('user_name', ''),
+                'Email': item.get('email', ''),
+                'Role': item.get('role', ''),
+                'Program': item.get('program_name', ''),
+                'Clinic': item.get('clinic_name', ''),
+                'Location': item.get('location_name', ''),
+                'Granted Date': item.get('granted_date', ''),
+                'Last Review': item.get('last_review_date', ''),
+                'Next Review Due': item.get('next_review_due', ''),
+                'Review Cycle': item.get('review_cycle', ''),
+                'Action Needed': ''
+            })
+
+        for item in status_data['due_soon']:
+            export_rows.append({
+                'Review Status': 'Due Soon',
+                'Days Overdue': '',
+                'User Name': item.get('user_name', ''),
+                'Email': item.get('email', ''),
+                'Role': item.get('role', ''),
+                'Program': item.get('program_name', ''),
+                'Clinic': item.get('clinic_name', ''),
+                'Location': item.get('location_name', ''),
+                'Granted Date': item.get('granted_date', ''),
+                'Last Review': item.get('last_review_date', ''),
+                'Next Review Due': item.get('next_review_due', ''),
+                'Review Cycle': item.get('review_cycle', ''),
+                'Action Needed': ''
+            })
+
+        if include_current:
+            for item in status_data.get('current', []):
+                export_rows.append({
+                    'Review Status': 'Current',
+                    'Days Overdue': '',
+                    'User Name': item.get('user_name', ''),
+                    'Email': item.get('email', ''),
+                    'Role': item.get('role', ''),
+                    'Program': item.get('program_name', ''),
+                    'Clinic': item.get('clinic_name', ''),
+                    'Location': item.get('location_name', ''),
+                    'Granted Date': item.get('granted_date', ''),
+                    'Last Review': item.get('last_review_date', ''),
+                    'Next Review Due': item.get('next_review_due', ''),
+                    'Review Cycle': item.get('review_cycle', ''),
+                    'Action Needed': ''
+                })
+
+        if not export_rows:
+            return "No data to export."
+
+        if output_format.lower() == "xlsx":
+            filepath = _create_review_status_excel(export_rows, out_path, filename)
+        else:
+            filepath = os.path.join(out_path, f"{filename}.csv")
+            headers = list(export_rows[0].keys())
+            with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(export_rows)
+
+        result = f"Access Review Status Export\n"
+        result += f"{'=' * 50}\n\n"
+        result += f"File: {filepath}\n"
+        result += f"Generated: {today_str}\n\n"
+        if program_name:
+            result += f"Program: {program_name}\n\n"
+        result += f"Summary:\n"
+        result += f"  OVERDUE: {status_data['summary']['overdue_count']}"
+        if status_data['summary']['overdue_count'] > 0:
+            result += " - ACTION REQUIRED"
+        result += "\n"
+        result += f"  Due Soon: {status_data['summary']['due_soon_count']}\n"
+        result += f"  Total exported: {len(export_rows)}\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error exporting review status: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
+
+
+@mcp.tool()
+def import_review_response(
+    file_path: str,
+    reviewed_by: str,
+    preview_only: bool = True
+) -> str:
+    """
+    Import completed annual access review responses from clinic manager.
+
+    Processes the Excel file that was exported with export_review_status
+    and filled in by the clinic manager.
+
+    Action column values:
+    - Blank or empty: Recertify (confirm access, set next review date)
+    - "Terminate": Revoke access (Manager Notes required)
+    - "Update": Change role to New Role value (New Role required)
+
+    Args:
+        file_path: Path to completed Excel review file
+        reviewed_by: Name of clinic manager who completed the review
+        preview_only: If True (default), show what WOULD happen without making changes.
+                     Set to False to actually process the review.
+
+    Returns:
+        Summary of review actions taken or planned
+    """
+    manager = None
+    try:
+        manager = get_access_manager()
+
+        result = manager.process_review_response(
+            file_path=file_path,
+            reviewed_by=reviewed_by,
+            preview_only=preview_only
+        )
+
+        # Build response
+        mode = "PREVIEW MODE (no changes made)" if preview_only else "REVIEW IMPORT COMPLETE"
+
+        output = f"Annual Access Review Import - {mode}\n"
+        output += f"{'=' * 50}\n\n"
+        output += f"File: {file_path}\n"
+        output += f"Reviewed By: {reviewed_by}\n\n"
+
+        # Summary
+        summary = result['summary']
+        output += f"Summary:\n"
+        output += f"  Total rows: {summary['total_rows']}\n"
+        output += f"  Recertified (keep): {summary['recertified']}\n"
+        output += f"  Updated (role change): {summary['updated']}\n"
+        output += f"  Terminated (revoked): {summary['terminated']}\n"
+        output += f"  Skipped: {summary['skipped']}\n"
+        output += f"  Errors: {summary['errors']}\n\n"
+
+        # Show preview actions
+        if result['preview']:
+            output += f"Actions:\n"
+            for action in result['preview'][:30]:
+                icon = {
+                    'RECERTIFY': '[KEEP]',
+                    'UPDATE': '[UPDATE]',
+                    'TERMINATE': '[REVOKE]'
+                }.get(action['action'], '-')
+
+                output += f"  {icon} {action['name']} ({action['email']})\n"
+                output += f"      {action['action']}: {action['details']}\n"
+
+            if len(result['preview']) > 30:
+                remaining = len(result['preview']) - 30
+                output += f"\n  ... and {remaining} more actions\n"
+
+        # Show errors
+        if result['errors']:
+            output += f"\nErrors:\n"
+            for err in result['errors'][:10]:
+                output += f"  Row {err['row']}: {err['email']} - {err['error']}\n"
+            if len(result['errors']) > 10:
+                output += f"  ... and {len(result['errors']) - 10} more errors\n"
+
+        # Next step hint
+        if preview_only:
+            total_actions = summary['recertified'] + summary['updated'] + summary['terminated']
+            if total_actions > 0:
+                output += f"\nTo apply these changes, run again with preview_only=False"
+
+        return output
+
+    except FileNotFoundError as e:
+        return f"File not found: {file_path}\n\nMake sure the file exists and the path is correct."
+    except Exception as e:
+        return f"Error processing review: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
+
+
+@mcp.tool()
+def export_terminated_audit(
+    since_date: Optional[str] = None,
+    output_format: str = "xlsx",
+    output_dir: Optional[str] = None
+) -> str:
+    """
+    Export full terminated user audit to Excel.
+
+    Args:
+        since_date: Only include users terminated on/after this date (YYYY-MM-DD)
+        output_format: "xlsx" or "csv"
+        output_dir: Directory to save file (default: ~/Downloads)
+
+    Returns:
+        Path to generated file and compliance summary
+    """
+    manager = None
+    try:
+        manager = get_access_manager()
+
+        try:
+            terminated_users = manager.get_all_terminated_users(
+                include_access_history=True,
+                since_date=since_date
+            )
+        except AttributeError:
+            cursor = manager.conn.cursor()
+            query = """
+                SELECT u.user_id, u.name, u.email, u.organization, u.updated_date as termination_date
+                FROM users u WHERE u.status = 'Terminated'
+            """
+            params = []
+            if since_date:
+                query += " AND u.updated_date >= ?"
+                params.append(since_date)
+            query += " ORDER BY u.updated_date DESC"
+
+            cursor.execute(query, params)
+            terminated_users = []
+
+            for row in cursor.fetchall():
+                user = dict(row)
+                user['terminated_by'] = 'See audit log'
+                user['termination_reason'] = 'See audit log'
+
+                cursor.execute("""
+                    SELECT ua.access_id, ua.role, ua.is_active, ua.granted_date,
+                           ua.revoked_date, ua.revoked_by, ua.revoke_reason,
+                           p.name as program_name, c.name as clinic_name, l.name as location_name
+                    FROM user_access ua
+                    JOIN programs p ON ua.program_id = p.program_id
+                    LEFT JOIN clinics c ON ua.clinic_id = c.clinic_id
+                    LEFT JOIN locations l ON ua.location_id = l.location_id
+                    WHERE ua.user_id = ?
+                """, (user['user_id'],))
+
+                access_history = [dict(r) for r in cursor.fetchall()]
+                user['access_history'] = access_history
+                active_count = sum(1 for a in access_history if a['is_active'])
+                user['active_access_count'] = active_count
+                user['compliance_status'] = 'VIOLATION' if active_count > 0 else 'Compliant'
+                terminated_users.append(user)
+
+        if not terminated_users:
+            period = f" since {since_date}" if since_date else ""
+            return f"No terminated users found{period}."
+
+        if output_dir:
+            out_path = os.path.expanduser(output_dir)
+        else:
+            out_path = os.path.expanduser("~/Downloads")
+        os.makedirs(out_path, exist_ok=True)
+
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        if since_date:
+            filename = f"terminated_audit_{since_date}_to_{today_str}"
+        else:
+            filename = f"terminated_audit_full_{today_str}"
+
+        export_rows = []
+        violations_count = 0
+
+        for user in terminated_users:
+            is_violation = user['compliance_status'] == 'VIOLATION'
+            if is_violation:
+                violations_count += 1
+
+            access_history = user.get('access_history', [])
+
+            if not access_history:
+                export_rows.append({
+                    'Compliance Status': 'Compliant' if not is_violation else 'VIOLATION',
+                    'User Name': user.get('name', ''),
+                    'Email': user.get('email', ''),
+                    'Organization': user.get('organization', ''),
+                    'Termination Date': user.get('termination_date', ''),
+                    'Terminated By': user.get('terminated_by', ''),
+                    'Termination Reason': user.get('termination_reason', ''),
+                    'Previous Role': '(No access grants)',
+                    'Previous Program': '',
+                    'Previous Clinic': '',
+                    'Access Granted': '',
+                    'Access Revoked': '',
+                    'Revoked By': '',
+                    'Revocation Reason': '',
+                    'Access Still Active': 'No'
+                })
+            else:
+                for i, access in enumerate(access_history):
+                    export_rows.append({
+                        'Compliance Status': ('Compliant' if not is_violation else 'VIOLATION') if i == 0 else '',
+                        'User Name': user.get('name', '') if i == 0 else '',
+                        'Email': user.get('email', '') if i == 0 else '',
+                        'Organization': user.get('organization', '') if i == 0 else '',
+                        'Termination Date': user.get('termination_date', '') if i == 0 else '',
+                        'Terminated By': user.get('terminated_by', '') if i == 0 else '',
+                        'Termination Reason': user.get('termination_reason', '') if i == 0 else '',
+                        'Previous Role': access.get('role', ''),
+                        'Previous Program': access.get('program_name', ''),
+                        'Previous Clinic': access.get('clinic_name', ''),
+                        'Access Granted': access.get('granted_date', ''),
+                        'Access Revoked': access.get('revoked_date', '') if not access.get('is_active') else '',
+                        'Revoked By': access.get('revoked_by', '') if not access.get('is_active') else '',
+                        'Revocation Reason': access.get('revoke_reason', '') if not access.get('is_active') else '',
+                        'Access Still Active': 'YES - VIOLATION!' if access.get('is_active') else 'No'
+                    })
+
+        if output_format.lower() == "xlsx":
+            filepath = _create_terminated_audit_excel(export_rows, out_path, filename, violations_count)
+        else:
+            filepath = os.path.join(out_path, f"{filename}.csv")
+            headers = list(export_rows[0].keys())
+            with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(export_rows)
+
+        result = f"Terminated User Audit Export\n"
+        result += f"{'=' * 50}\n\n"
+        result += f"File: {filepath}\n"
+        result += f"Generated: {today_str}\n"
+        if since_date:
+            result += f"Period: {since_date} to present\n"
+        result += "\n"
+        result += f"Summary:\n"
+        result += f"  Total terminated users: {len(terminated_users)}\n"
+        result += f"  Compliant: {len(terminated_users) - violations_count}\n"
+        result += f"  VIOLATIONS: {violations_count}"
+        if violations_count > 0:
+            result += " - IMMEDIATE ACTION REQUIRED"
+        result += "\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error exporting terminated audit: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
+
+
+# ============================================================
+# DASHBOARD TOOLS
+# ============================================================
+
+def _generate_dashboard_react(data: dict) -> str:
+    """Generate React component code for visual dashboard."""
+
+    # Prepare data for the component
+    programs_data = json.dumps([
+        {"name": p["program_name"], "users": p["user_count"]}
+        for p in data["users_by_program"]
+    ])
+
+    roles_data = json.dumps([
+        {"name": r["role"], "count": r["count"], "percentage": r["percentage"]}
+        for r in data["role_distribution"]
+    ])
+
+    imm = data["immediate_attention"]
+    upcoming = data["upcoming"]
+    totals = data["totals"]
+
+    return f'''
+import React from 'react';
+import {{ BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell }} from 'recharts';
+
+export default function ComplianceDashboard() {{
+  const programData = {programs_data};
+  const roleData = {roles_data};
+  const COLORS = ['#4472C4', '#ED7D31', '#A5A5A5', '#FFC000', '#5B9BD5'];
+
+  return (
+    <div className="p-6 bg-gray-50 min-h-screen">
+      <h1 className="text-2xl font-bold text-gray-800 mb-6">Compliance Dashboard</h1>
+
+      {{/* Alert Cards */}}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+        <div className={{"p-4 rounded-lg " + ({imm['reviews_overdue']} > 0 ? "bg-red-100 border-2 border-red-400" : "bg-green-100")}}>
+          <div className="text-3xl font-bold">{imm['reviews_overdue']}</div>
+          <div className="text-sm text-gray-600">Reviews Overdue</div>
+        </div>
+        <div className={{"p-4 rounded-lg " + ({imm['terminated_violations']} > 0 ? "bg-red-100 border-2 border-red-400" : "bg-green-100")}}>
+          <div className="text-3xl font-bold">{imm['terminated_violations']}</div>
+          <div className="text-sm text-gray-600">Access Violations</div>
+        </div>
+        <div className={{"p-4 rounded-lg " + ({imm['training_expired']} > 0 ? "bg-red-100 border-2 border-red-400" : "bg-green-100")}}>
+          <div className="text-3xl font-bold">{imm['training_expired']}</div>
+          <div className="text-sm text-gray-600">Training Expired</div>
+        </div>
+        <div className="p-4 rounded-lg bg-yellow-100">
+          <div className="text-3xl font-bold">{upcoming['reviews_due_soon']}</div>
+          <div className="text-sm text-gray-600">Reviews Due (30 days)</div>
+        </div>
+      </div>
+
+      {{/* Stats Row */}}
+      <div className="grid grid-cols-4 gap-4 mb-6">
+        <div className="bg-white p-4 rounded-lg shadow">
+          <div className="text-2xl font-bold text-blue-600">{totals['active_users']}</div>
+          <div className="text-sm text-gray-500">Active Users</div>
+        </div>
+        <div className="bg-white p-4 rounded-lg shadow">
+          <div className="text-2xl font-bold text-blue-600">{totals['total_programs']}</div>
+          <div className="text-sm text-gray-500">Programs</div>
+        </div>
+        <div className="bg-white p-4 rounded-lg shadow">
+          <div className="text-2xl font-bold text-blue-600">{totals['total_clinics']}</div>
+          <div className="text-sm text-gray-500">Clinics</div>
+        </div>
+        <div className="bg-white p-4 rounded-lg shadow">
+          <div className="text-2xl font-bold text-blue-600">{totals['recent_grants_count']}</div>
+          <div className="text-sm text-gray-500">Grants (30 days)</div>
+        </div>
+      </div>
+
+      {{/* Charts Row */}}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="bg-white p-4 rounded-lg shadow">
+          <h3 className="font-semibold mb-4">Users by Program</h3>
+          <ResponsiveContainer width="100%" height={{200}}>
+            <BarChart data={{programData}}>
+              <XAxis dataKey="name" tick={{{{fontSize: 12}}}} />
+              <YAxis />
+              <Tooltip />
+              <Bar dataKey="users" fill="#4472C4" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="bg-white p-4 rounded-lg shadow">
+          <h3 className="font-semibold mb-4">Role Distribution</h3>
+          <ResponsiveContainer width="100%" height={{200}}>
+            <PieChart>
+              <Pie
+                data={{roleData}}
+                dataKey="count"
+                nameKey="name"
+                cx="50%"
+                cy="50%"
+                outerRadius={{70}}
+                label={{({{name, percentage}}) => `${{name}} (${{percentage}}%)`}}
+              >
+                {{roleData.map((entry, index) => (
+                  <Cell key={{index}} fill={{COLORS[index % COLORS.length]}} />
+                ))}}
+              </Pie>
+              <Tooltip />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+    </div>
+  );
+}}
+'''
+
+
+@mcp.tool()
+def get_compliance_dashboard() -> str:
+    """
+    Get compliance dashboard with text summary and visual artifact.
+
+    Shows:
+    - Immediate attention items (overdue reviews, violations, expired training)
+    - Upcoming reviews (next 30 days)
+    - Users by program and clinic
+    - Role distribution
+    - Recent activity
+
+    Returns:
+        Text summary followed by React artifact code for visual dashboard
+    """
+    manager = None
+    try:
+        manager = get_access_manager()
+        data = manager.get_dashboard_data()
+
+        # Build text summary
+        output = "COMPLIANCE DASHBOARD\n"
+        output += f"Generated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}\n"
+        output += "=" * 50 + "\n\n"
+
+        # Immediate attention
+        imm = data['immediate_attention']
+        has_issues = imm['reviews_overdue'] > 0 or imm['terminated_violations'] > 0 or imm['training_expired'] > 0
+
+        if has_issues:
+            output += "IMMEDIATE ATTENTION\n"
+            if imm['reviews_overdue'] > 0:
+                output += f"   - {imm['reviews_overdue']} access reviews OVERDUE\n"
+            if imm['terminated_violations'] > 0:
+                output += f"   - {imm['terminated_violations']} terminated user(s) with ACTIVE ACCESS\n"
+            if imm['training_expired'] > 0:
+                output += f"   - {imm['training_expired']} training record(s) EXPIRED\n"
+            output += "\n"
+        else:
+            output += "NO IMMEDIATE ISSUES\n"
+            output += "   All reviews current, no violations, training up to date\n\n"
+
+        # Upcoming
+        upcoming = data['upcoming']['reviews_due_soon']
+        if upcoming > 0:
+            output += f"UPCOMING (Next 30 Days)\n"
+            output += f"   - {upcoming} review(s) due soon\n\n"
+
+        # Totals
+        totals = data['totals']
+        output += "TOTALS\n"
+        output += f"   - {totals['active_users']} active users\n"
+        output += f"   - {totals['total_programs']} programs\n"
+        output += f"   - {totals['total_clinics']} clinics\n"
+        output += f"   - {totals['recent_grants_count']} access grants in last 30 days\n\n"
+
+        # Users by program
+        output += "USERS BY PROGRAM\n"
+        for prog in data['users_by_program']:
+            output += f"   - {prog['program_name']}: {prog['user_count']} users, {prog['clinic_count']} clinics\n"
+        output += "\n"
+
+        # Role distribution
+        output += "ROLE DISTRIBUTION\n"
+        for role in data['role_distribution']:
+            output += f"   - {role['role']}: {role['count']} ({role['percentage']}%)\n"
+        output += "\n"
+
+        # Recent activity (top 5)
+        if data['recent_activity']:
+            output += "RECENT ACTIVITY (Last 30 Days)\n"
+            for i, activity in enumerate(data['recent_activity'][:5]):
+                output += f"   - {activity['granted_date']}: {activity['user_name']} -> {activity['program_name']}"
+                if activity['clinic_name'] != '(Program-wide)':
+                    output += f" / {activity['clinic_name']}"
+                output += f" ({activity['role']})\n"
+            if len(data['recent_activity']) > 5:
+                output += f"   ... and {len(data['recent_activity']) - 5} more\n"
+
+        # Add React artifact instructions
+        output += "\n" + "=" * 50 + "\n"
+        output += "VISUAL DASHBOARD\n"
+        output += "Creating React artifact with charts...\n\n"
+
+        # Generate React artifact code
+        react_code = _generate_dashboard_react(data)
+        output += "```jsx\n" + react_code + "\n```"
+
+        return output
+
+    except Exception as e:
+        return f"Error generating dashboard: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
+
+
+@mcp.tool()
+def push_dashboard_to_notion() -> str:
+    """
+    Update the Notion compliance dashboard page with current data.
+
+    Updates the page at: https://www.notion.so/2dab5d1d163181bb8eebc4f4397de747
+
+    Returns:
+        Confirmation of update with summary
+    """
+    manager = None
+    try:
+        manager = get_access_manager()
+        data = manager.get_dashboard_data()
+
+        # Build Notion-flavored markdown content
+        now = datetime.now().strftime('%B %d, %Y at %I:%M %p')
+
+        content = f"""# Client Access Compliance Dashboard
+
+**Auto-Updated by Claude MCP**
+This dashboard is automatically updated when you run "push compliance dashboard to Notion" in Claude.
+
+**Last Updated:** {now}
+
+---
+
+## Immediate Attention
+
+| Metric | Count | Status |
+|--------|-------|--------|
+| Access Reviews Overdue | {data['immediate_attention']['reviews_overdue']} | {'ACTION REQUIRED' if data['immediate_attention']['reviews_overdue'] > 0 else 'OK'} |
+| Terminated with Active Access | {data['immediate_attention']['terminated_violations']} | {'VIOLATION' if data['immediate_attention']['terminated_violations'] > 0 else 'OK'} |
+| Training Expired | {data['immediate_attention']['training_expired']} | {'ACTION REQUIRED' if data['immediate_attention']['training_expired'] > 0 else 'OK'} |
+
+---
+
+## Upcoming (Next 30 Days)
+
+| Metric | Count |
+|--------|-------|
+| Reviews Due Soon | {data['upcoming']['reviews_due_soon']} |
+
+---
+
+## Program Summary
+
+| Program | Active Users | Clinics |
+|---------|--------------|---------|
+"""
+        for prog in data['users_by_program']:
+            content += f"| {prog['program_name']} | {prog['user_count']} | {prog['clinic_count']} |\n"
+
+        content += """
+---
+
+## Users by Clinic
+
+| Clinic | Program | Users |
+|--------|---------|-------|
+"""
+        for clinic in data['users_by_clinic'][:15]:  # Top 15
+            content += f"| {clinic['clinic_name']} | {clinic['program_name']} | {clinic['user_count']} |\n"
+
+        content += """
+---
+
+## Role Distribution
+
+| Role | Count | % |
+|------|-------|---|
+"""
+        for role in data['role_distribution']:
+            content += f"| {role['role']} | {role['count']} | {role['percentage']}% |\n"
+
+        content += """
+---
+
+## Recent Activity (Last 30 Days)
+
+| Date | User | Program | Clinic | Role |
+|------|------|---------|--------|------|
+"""
+        for activity in data['recent_activity'][:10]:  # Top 10
+            content += f"| {activity['granted_date']} | {activity['user_name']} | {activity['program_name']} | {activity['clinic_name']} | {activity['role']} |\n"
+
+        content += f"""
+---
+
+## Totals
+
+| Metric | Value |
+|--------|-------|
+| Total Active Users | {data['totals']['active_users']} |
+| Total Programs | {data['totals']['total_programs']} |
+| Total Clinics | {data['totals']['total_clinics']} |
+| Access Grants (Last 30 Days) | {data['totals']['recent_grants_count']} |
+"""
+
+        # Return the content for Notion update
+        # The actual Notion update will be handled by the Notion MCP tools
+        return f"""Dashboard data ready for Notion update.
+
+**Page ID:** {NOTION_DASHBOARD_PAGE_ID}
+**URL:** https://www.notion.so/{NOTION_DASHBOARD_PAGE_ID.replace('-', '')}
+**Last Updated:** {now}
+
+**Summary:**
+- Reviews Overdue: {data['immediate_attention']['reviews_overdue']}
+- Violations: {data['immediate_attention']['terminated_violations']}
+- Training Expired: {data['immediate_attention']['training_expired']}
+- Active Users: {data['totals']['active_users']}
+
+To update Notion, I need to call the Notion update-page tool with this content.
+
+---NOTION_CONTENT_START---
+{content}
+---NOTION_CONTENT_END---
+"""
+
+    except Exception as e:
+        return f"Error preparing dashboard for Notion: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
+
+
+@mcp.tool()
+def export_compliance_dashboard(
+    output_dir: Optional[str] = None
+) -> str:
+    """
+    Export compliance dashboard to Excel for stakeholders.
+
+    Creates a formatted Excel file with multiple sheets:
+    - Summary (all metrics)
+    - Reviews Overdue (detail)
+    - Users by Program
+    - Users by Clinic
+    - Role Distribution
+    - Recent Activity
+
+    Args:
+        output_dir: Directory to save file (default: ~/Downloads)
+
+    Returns:
+        Path to generated file
+    """
+    manager = None
+    try:
+        manager = get_access_manager()
+        data = manager.get_dashboard_data()
+
+        if output_dir:
+            out_path = os.path.expanduser(output_dir)
+        else:
+            out_path = os.path.expanduser("~/Downloads")
+        os.makedirs(out_path, exist_ok=True)
+
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        filename = f"compliance_dashboard_{today_str}.xlsx"
+        filepath = os.path.join(out_path, filename)
+
+        wb = Workbook()
+
+        # Styles
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        alert_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        ok_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+
+        # --- SUMMARY SHEET ---
+        ws = wb.active
+        ws.title = "Summary"
+
+        ws['A1'] = "Compliance Dashboard Summary"
+        ws['A1'].font = Font(bold=True, size=16)
+        ws['A2'] = f"Generated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}"
+
+        ws['A4'] = "IMMEDIATE ATTENTION"
+        ws['A4'].font = Font(bold=True, size=12)
+
+        metrics = [
+            ('Access Reviews Overdue', data['immediate_attention']['reviews_overdue']),
+            ('Terminated with Active Access', data['immediate_attention']['terminated_violations']),
+            ('Training Expired', data['immediate_attention']['training_expired']),
+        ]
+
+        row = 5
+        for metric, value in metrics:
+            ws.cell(row=row, column=1, value=metric)
+            cell = ws.cell(row=row, column=2, value=value)
+            cell.fill = alert_fill if value > 0 else ok_fill
+            row += 1
+
+        row += 1
+        ws.cell(row=row, column=1, value="UPCOMING (Next 30 Days)").font = Font(bold=True, size=12)
+        row += 1
+        ws.cell(row=row, column=1, value="Reviews Due Soon")
+        ws.cell(row=row, column=2, value=data['upcoming']['reviews_due_soon'])
+
+        row += 2
+        ws.cell(row=row, column=1, value="TOTALS").font = Font(bold=True, size=12)
+        row += 1
+        ws.cell(row=row, column=1, value="Active Users")
+        ws.cell(row=row, column=2, value=data['totals']['active_users'])
+        row += 1
+        ws.cell(row=row, column=1, value="Total Programs")
+        ws.cell(row=row, column=2, value=data['totals']['total_programs'])
+        row += 1
+        ws.cell(row=row, column=1, value="Total Clinics")
+        ws.cell(row=row, column=2, value=data['totals']['total_clinics'])
+        row += 1
+        ws.cell(row=row, column=1, value="Access Grants (Last 30 Days)")
+        ws.cell(row=row, column=2, value=data['totals']['recent_grants_count'])
+
+        ws.column_dimensions['A'].width = 35
+        ws.column_dimensions['B'].width = 15
+
+        # --- USERS BY PROGRAM SHEET ---
+        ws2 = wb.create_sheet("Users by Program")
+        headers = ['Program', 'Prefix', 'Active Users', 'Clinics']
+        for col, header in enumerate(headers, 1):
+            cell = ws2.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = thin_border
+
+        for row_num, prog in enumerate(data['users_by_program'], 2):
+            ws2.cell(row=row_num, column=1, value=prog['program_name']).border = thin_border
+            ws2.cell(row=row_num, column=2, value=prog.get('program_prefix', '')).border = thin_border
+            ws2.cell(row=row_num, column=3, value=prog['user_count']).border = thin_border
+            ws2.cell(row=row_num, column=4, value=prog['clinic_count']).border = thin_border
+
+        ws2.column_dimensions['A'].width = 25
+        ws2.freeze_panes = 'A2'
+
+        # --- USERS BY CLINIC SHEET ---
+        ws3 = wb.create_sheet("Users by Clinic")
+        headers = ['Clinic', 'Program', 'Active Users']
+        for col, header in enumerate(headers, 1):
+            cell = ws3.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = thin_border
+
+        for row_num, clinic in enumerate(data['users_by_clinic'], 2):
+            ws3.cell(row=row_num, column=1, value=clinic['clinic_name']).border = thin_border
+            ws3.cell(row=row_num, column=2, value=clinic['program_name']).border = thin_border
+            ws3.cell(row=row_num, column=3, value=clinic['user_count']).border = thin_border
+
+        ws3.column_dimensions['A'].width = 30
+        ws3.column_dimensions['B'].width = 25
+        ws3.freeze_panes = 'A2'
+
+        # --- ROLE DISTRIBUTION SHEET ---
+        ws4 = wb.create_sheet("Role Distribution")
+        headers = ['Role', 'Count', 'Percentage']
+        for col, header in enumerate(headers, 1):
+            cell = ws4.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = thin_border
+
+        for row_num, role in enumerate(data['role_distribution'], 2):
+            ws4.cell(row=row_num, column=1, value=role['role']).border = thin_border
+            ws4.cell(row=row_num, column=2, value=role['count']).border = thin_border
+            ws4.cell(row=row_num, column=3, value=f"{role['percentage']}%").border = thin_border
+
+        ws4.column_dimensions['A'].width = 20
+        ws4.freeze_panes = 'A2'
+
+        # --- RECENT ACTIVITY SHEET ---
+        ws5 = wb.create_sheet("Recent Activity")
+        headers = ['Date', 'User', 'Email', 'Role', 'Program', 'Clinic', 'Granted By']
+        for col, header in enumerate(headers, 1):
+            cell = ws5.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = thin_border
+
+        for row_num, activity in enumerate(data['recent_activity'], 2):
+            ws5.cell(row=row_num, column=1, value=activity['granted_date']).border = thin_border
+            ws5.cell(row=row_num, column=2, value=activity['user_name']).border = thin_border
+            ws5.cell(row=row_num, column=3, value=activity['email']).border = thin_border
+            ws5.cell(row=row_num, column=4, value=activity['role']).border = thin_border
+            ws5.cell(row=row_num, column=5, value=activity['program_name']).border = thin_border
+            ws5.cell(row=row_num, column=6, value=activity['clinic_name']).border = thin_border
+            ws5.cell(row=row_num, column=7, value=activity['granted_by']).border = thin_border
+
+        for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G']:
+            ws5.column_dimensions[col].width = 20
+        ws5.freeze_panes = 'A2'
+
+        wb.save(filepath)
+
+        # Build summary
+        output = f"Compliance Dashboard Export\n"
+        output += f"{'=' * 50}\n\n"
+        output += f"File: {filepath}\n"
+        output += f"Generated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}\n\n"
+        output += f"Sheets included:\n"
+        output += f"  - Summary\n"
+        output += f"  - Users by Program ({len(data['users_by_program'])} programs)\n"
+        output += f"  - Users by Clinic ({len(data['users_by_clinic'])} clinics)\n"
+        output += f"  - Role Distribution ({len(data['role_distribution'])} roles)\n"
+        output += f"  - Recent Activity ({len(data['recent_activity'])} records)\n"
+
+        return output
+
+    except Exception as e:
+        return f"Error exporting dashboard: {str(e)}"
+    finally:
+        if manager:
+            manager.close()
 
 
 # ============================================================
