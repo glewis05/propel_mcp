@@ -77,3 +77,13 @@ python3 server.py
 # Test MCP connection
 # (Use Claude Desktop or MCP inspector)
 ```
+git add .
+git commit -m "Add comprehensive documentation for MCP server tools
+
+- Quick Reference: Daily command cheat sheet
+- Tool Reference: All 35+ tools with parameters and examples
+- Workflow Guide: Step-by-step procedures for onboarding, reviews, audits
+- Database Schema: Complete table documentation
+- Troubleshooting: Common issues and solutions
+- Architecture: System design and data flow diagrams"
+git push
