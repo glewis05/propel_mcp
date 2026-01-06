@@ -3741,6 +3741,405 @@ def export_program_configs(
 
 
 # ============================================================
+# AUDIT COMPLETION TOOLS
+# ============================================================
+
+@mcp.tool()
+def update_clinic_manager(
+    clinic: str,
+    manager_name: str,
+    manager_email: str,
+    program: Optional[str] = None
+) -> str:
+    """
+    Update the clinic manager contact information.
+
+    Args:
+        clinic: Clinic name or code
+        manager_name: Manager's full name
+        manager_email: Manager's email address
+        program: Program name/prefix if clinic name is ambiguous
+
+    Returns:
+        Confirmation of update
+    """
+    manager = None
+    try:
+        import sqlite3
+        db_path = os.path.expanduser("~/projects/data/client_product_database.db")
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Find clinic
+        query = """
+            SELECT c.clinic_id, c.name, p.name as program_name
+            FROM clinics c
+            JOIN programs p ON c.program_id = p.program_id
+            WHERE LOWER(c.name) LIKE LOWER(?) OR LOWER(c.code) = LOWER(?)
+        """
+        params = [f"%{clinic}%", clinic]
+
+        if program:
+            query += " AND (LOWER(p.name) LIKE LOWER(?) OR LOWER(p.prefix) = LOWER(?))"
+            params.extend([f"%{program}%", program])
+
+        cursor.execute(query, params)
+        clinic_row = cursor.fetchone()
+
+        if not clinic_row:
+            conn.close()
+            return f"Clinic not found: {clinic}"
+
+        # Update manager info
+        cursor.execute("""
+            UPDATE clinics
+            SET manager_name = ?, manager_email = ?, updated_date = CURRENT_TIMESTAMP
+            WHERE clinic_id = ?
+        """, (manager_name, manager_email, clinic_row['clinic_id']))
+
+        conn.commit()
+        conn.close()
+
+        return f"""Clinic manager updated
+
+Clinic: {clinic_row['name']}
+Program: {clinic_row['program_name']}
+Manager: {manager_name}
+Email: {manager_email}
+"""
+
+    except Exception as e:
+        return f"Error updating clinic manager: {str(e)}"
+
+
+@mcp.tool()
+def record_audit_completion(
+    clinic: str,
+    audit_year: int,
+    date_initiated: Optional[str] = None,
+    date_reviewed: Optional[str] = None,
+    date_finalized: Optional[str] = None,
+    date_tickets_submitted: Optional[str] = None,
+    date_confirmed: Optional[str] = None,
+    ticket_number: Optional[str] = None,
+    audit_type: str = "Annual",
+    document_version: str = "1.0",
+    notes: Optional[str] = None,
+    program: Optional[str] = None
+) -> str:
+    """
+    Record or update audit completion milestone dates.
+
+    All dates should be in YYYY-MM-DD format.
+    You can update individual dates without affecting others.
+
+    Args:
+        clinic: Clinic name or code
+        audit_year: Year of the audit (e.g., 2025)
+        date_initiated: Date roster sent to clinic manager
+        date_reviewed: Date client returned validation
+        date_finalized: Date internal review finalized
+        date_tickets_submitted: Date change tickets sent to dev
+        date_confirmed: Date dev team confirmed complete
+        ticket_number: Zendesk ticket number (without #)
+        audit_type: 'Annual' or 'Quarterly' (default: Annual)
+        document_version: Document version (default: 1.0)
+        notes: Optional notes
+        program: Program name/prefix if clinic name is ambiguous
+
+    Returns:
+        Confirmation of recorded data
+    """
+    try:
+        import sqlite3
+        db_path = os.path.expanduser("~/projects/data/client_product_database.db")
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Find clinic
+        query = """
+            SELECT c.clinic_id, c.name, c.program_id, p.name as program_name
+            FROM clinics c
+            JOIN programs p ON c.program_id = p.program_id
+            WHERE LOWER(c.name) LIKE LOWER(?) OR LOWER(c.code) = LOWER(?)
+        """
+        params = [f"%{clinic}%", clinic]
+
+        if program:
+            query += " AND (LOWER(p.name) LIKE LOWER(?) OR LOWER(p.prefix) = LOWER(?))"
+            params.extend([f"%{program}%", program])
+
+        cursor.execute(query, params)
+        clinic_row = cursor.fetchone()
+
+        if not clinic_row:
+            conn.close()
+            return f"Clinic not found: {clinic}"
+
+        clinic_id = clinic_row['clinic_id']
+        program_id = clinic_row['program_id']
+
+        # Check if record exists
+        cursor.execute("""
+            SELECT completion_id FROM audit_completions
+            WHERE clinic_id = ? AND audit_year = ? AND audit_type = ?
+        """, (clinic_id, audit_year, audit_type))
+
+        existing = cursor.fetchone()
+
+        if existing:
+            # Update existing
+            cursor.execute("""
+                UPDATE audit_completions SET
+                    date_initiated = COALESCE(?, date_initiated),
+                    date_reviewed = COALESCE(?, date_reviewed),
+                    date_finalized = COALESCE(?, date_finalized),
+                    date_tickets_submitted = COALESCE(?, date_tickets_submitted),
+                    date_confirmed = COALESCE(?, date_confirmed),
+                    ticket_number = COALESCE(?, ticket_number),
+                    document_version = COALESCE(?, document_version),
+                    notes = COALESCE(?, notes),
+                    updated_date = CURRENT_TIMESTAMP
+                WHERE completion_id = ?
+            """, (
+                date_initiated, date_reviewed, date_finalized,
+                date_tickets_submitted, date_confirmed, ticket_number,
+                document_version, notes, existing['completion_id']
+            ))
+            action = "Updated"
+        else:
+            # Insert new
+            cursor.execute("""
+                INSERT INTO audit_completions (
+                    clinic_id, program_id, audit_year, audit_type,
+                    date_initiated, date_reviewed, date_finalized,
+                    date_tickets_submitted, date_confirmed,
+                    ticket_number, document_version, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                clinic_id, program_id, audit_year, audit_type,
+                date_initiated, date_reviewed, date_finalized,
+                date_tickets_submitted, date_confirmed,
+                ticket_number, document_version, notes
+            ))
+            action = "Created"
+
+        conn.commit()
+
+        # Fetch the current state
+        cursor.execute("""
+            SELECT * FROM audit_completions
+            WHERE clinic_id = ? AND audit_year = ? AND audit_type = ?
+        """, (clinic_id, audit_year, audit_type))
+        record = cursor.fetchone()
+
+        conn.close()
+
+        output = f"""{action} audit completion record
+
+Clinic: {clinic_row['name']}
+Program: {clinic_row['program_name']}
+Audit: {audit_year} {audit_type}
+
+TIMELINE
+---------
+Initiated:          {record['date_initiated'] or '(not set)'}
+Reviewed by Client: {record['date_reviewed'] or '(not set)'}
+Finalized:          {record['date_finalized'] or '(not set)'}
+Tickets Submitted:  {record['date_tickets_submitted'] or '(not set)'}
+Confirmed:          {record['date_confirmed'] or '(not set)'}
+
+DETAILS
+-------
+Ticket #: {record['ticket_number'] or '(not set)'}
+Version:  {record['document_version']}
+Notes:    {record['notes'] or '(none)'}
+"""
+        return output
+
+    except Exception as e:
+        return f"Error recording audit completion: {str(e)}"
+
+
+@mcp.tool()
+def generate_audit_memo(
+    clinic: str,
+    audit_year: int,
+    audit_type: str = "Annual",
+    program: Optional[str] = None,
+    output_dir: Optional[str] = None
+) -> str:
+    """
+    Generate a filled audit completion memo Word document.
+
+    Pulls data from the audit_completions table and calculates
+    metrics from access_reviews. Outputs a ready-to-sign document.
+
+    Args:
+        clinic: Clinic name or code
+        audit_year: Year of the audit (e.g., 2025)
+        audit_type: 'Annual' or 'Quarterly' (default: Annual)
+        program: Program name/prefix if clinic name is ambiguous
+        output_dir: Directory to save file (default: ~/Downloads)
+
+    Returns:
+        Path to generated document and summary
+    """
+    try:
+        from docxtpl import DocxTemplate
+        from datetime import datetime
+        import sqlite3
+
+        db_path = os.path.expanduser("~/projects/data/client_product_database.db")
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Find clinic
+        query = """
+            SELECT c.clinic_id, c.name, c.manager_name, c.manager_email,
+                   c.program_id, p.name as program_name
+            FROM clinics c
+            JOIN programs p ON c.program_id = p.program_id
+            WHERE LOWER(c.name) LIKE LOWER(?) OR LOWER(c.code) = LOWER(?)
+        """
+        params = [f"%{clinic}%", clinic]
+
+        if program:
+            query += " AND (LOWER(p.name) LIKE LOWER(?) OR LOWER(p.prefix) = LOWER(?))"
+            params.extend([f"%{program}%", program])
+
+        cursor.execute(query, params)
+        clinic_row = cursor.fetchone()
+
+        if not clinic_row:
+            conn.close()
+            return f"Clinic not found: {clinic}"
+
+        clinic_id = clinic_row['clinic_id']
+
+        # Get audit completion record
+        cursor.execute("""
+            SELECT * FROM audit_completions
+            WHERE clinic_id = ? AND audit_year = ? AND audit_type = ?
+        """, (clinic_id, audit_year, audit_type))
+
+        record = cursor.fetchone()
+        if not record:
+            conn.close()
+            return f"No audit completion record found for {clinic_row['name']} {audit_year} {audit_type}. Use record_audit_completion first."
+
+        # Calculate metrics
+        cursor.execute("""
+            SELECT
+                COUNT(*) as total_reviewed,
+                SUM(CASE WHEN status = 'Revoked' THEN 1 ELSE 0 END) as revocations,
+                SUM(CASE WHEN status = 'Modified' THEN 1 ELSE 0 END) as modifications
+            FROM access_reviews ar
+            JOIN user_access ua ON ar.access_id = ua.access_id
+            WHERE ua.clinic_id = ?
+            AND strftime('%Y', ar.review_date) = ?
+        """, (clinic_id, str(audit_year)))
+        metrics = cursor.fetchone()
+
+        cursor.execute("""
+            SELECT COUNT(*) as new_requests
+            FROM user_access
+            WHERE clinic_id = ? AND strftime('%Y', granted_date) = ?
+        """, (clinic_id, str(audit_year)))
+        new_grants = cursor.fetchone()
+
+        conn.close()
+
+        # Format dates
+        def format_date(date_str):
+            if not date_str:
+                return '(Not Set)'
+            try:
+                dt = datetime.strptime(date_str, '%Y-%m-%d')
+                return dt.strftime('%B %d, %Y')
+            except:
+                return date_str
+
+        # Prepare context
+        context = {
+            'clinic_name': clinic_row['name'],
+            'audit_year': audit_year,
+            'audit_type': audit_type,
+            'document_version': record['document_version'] or '1.0',
+            'date_initiated': format_date(record['date_initiated']),
+            'date_reviewed': format_date(record['date_reviewed']),
+            'date_finalized': format_date(record['date_finalized']),
+            'date_tickets_submitted': format_date(record['date_tickets_submitted']),
+            'date_confirmed': format_date(record['date_confirmed']),
+            'ticket_number': record['ticket_number'] or '(Not Set)',
+            'manager_name': clinic_row['manager_name'] or '(Not Set)',
+            'manager_email': clinic_row['manager_email'] or '(Not Set)',
+            'total_reviewed': metrics['total_reviewed'] if metrics else 0,
+            'revocations': metrics['revocations'] if metrics else 0,
+            'modifications': metrics['modifications'] if metrics else 0,
+            'new_requests': new_grants['new_requests'] if new_grants else 0
+        }
+
+        # Load and render template
+        template_path = os.path.expanduser(
+            '~/projects/configurations_toolkit/templates/audit_completion_memo.docx'
+        )
+
+        if not os.path.exists(template_path):
+            return f"Template not found: {template_path}\nRun the template creation script first."
+
+        doc = DocxTemplate(template_path)
+        doc.render(context)
+
+        # Save output
+        if output_dir:
+            out_path = os.path.expanduser(output_dir)
+        else:
+            out_path = os.path.expanduser('~/Downloads')
+        os.makedirs(out_path, exist_ok=True)
+
+        safe_clinic = clinic_row['name'].replace(' ', '_').replace('/', '-')
+        filename = f"{safe_clinic}_Audit_Memo_{audit_year}_{audit_type}.docx"
+        filepath = os.path.join(out_path, filename)
+
+        doc.save(filepath)
+
+        return f"""Audit memo generated
+
+File: {filepath}
+
+DOCUMENT CONTENTS
+-----------------
+Clinic: {clinic_row['name']}
+Audit: {audit_year} {audit_type}
+Manager: {context['manager_name']} ({context['manager_email']})
+
+Metrics:
+- Total Reviewed: {context['total_reviewed']}
+- Revocations: {context['revocations']}
+- Modifications: {context['modifications']}
+- New Requests: {context['new_requests']}
+
+Timeline:
+- Initiated: {context['date_initiated']}
+- Reviewed: {context['date_reviewed']}
+- Finalized: {context['date_finalized']}
+- Tickets: {context['date_tickets_submitted']}
+- Confirmed: {context['date_confirmed']}
+
+Ticket #: {context['ticket_number']}
+"""
+
+    except ImportError:
+        return "Error: docxtpl not installed. Run: pip install docxtpl --break-system-packages"
+    except Exception as e:
+        return f"Error generating audit memo: {str(e)}"
+
+
+# ============================================================
 # RUN SERVER
 # ============================================================
 if __name__ == "__main__":
