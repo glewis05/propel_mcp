@@ -13,9 +13,9 @@ CONFIGURATIONS TOOLKIT:
 - Configuration: list_programs, get_config
 
 REQUIREMENTS TOOLKIT:
-- Client/Program: list_clients, get_client_programs, get_program_by_prefix
-- User Stories: list_stories, get_story, get_approval_pipeline
-- Test Cases: list_test_cases, get_test_summary
+- Client/Program: list_clients, get_client_programs, get_program_by_prefix, create_program, create_requirement, link_requirement_to_story
+- User Stories: list_stories, get_story, create_story, update_story, get_approval_pipeline
+- Test Cases: list_test_cases, get_test_summary, create_test_case, update_test_result
 - Reporting: get_program_health, get_client_tree, search_stories, get_coverage_gaps
 """
 
@@ -1324,6 +1324,755 @@ def get_program_by_prefix(prefix: str) -> str:
             db.close()
 
 
+@mcp.tool()
+def create_program(
+    client_name: str,
+    prefix: str,
+    program_name: str,
+    description: Optional[str] = None,
+    status: str = "Active"
+) -> str:
+    """
+    Create a new program for tracking user stories, acceptance criteria, and test cases.
+
+    PURPOSE:
+        Creates a program under an existing client. Programs group related user stories
+        and test cases. Each program has a unique prefix used to generate story IDs
+        (e.g., prefix "P4M" creates stories like P4M-AUTH-001).
+
+    R EQUIVALENT:
+        Like creating a new project folder in RStudio, but with database tracking
+        and unique ID generation.
+
+    Args:
+        client_name: Parent client name (must exist, case-insensitive match)
+        prefix: Short prefix for story IDs (2-6 alphanumeric chars, auto-converted to uppercase)
+        program_name: Full program name (e.g., "Prevention4ME")
+        description: Optional program description
+        status: Program status (default: "Active")
+
+    Returns:
+        Confirmation with program ID and example story IDs, or helpful error message
+
+    WHY THIS APPROACH:
+        - Validates inputs thoroughly to prevent data integrity issues
+        - Case-insensitive client lookup for user convenience
+        - Prefix uniqueness across ALL programs prevents story ID collisions
+        - Audit logging for FDA 21 CFR Part 11 compliance
+    """
+    # Import here to keep dependency local (matches pattern in other tools)
+    import sqlite3
+    import uuid
+    import re
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Validate prefix format
+        # Prefix must be 2-6 alphanumeric characters (letters and numbers only)
+        # Auto-convert to uppercase for consistency
+        # ----------------------------------------------------------------
+        prefix_upper = prefix.upper().strip()
+
+        # Check length
+        if len(prefix_upper) < 2 or len(prefix_upper) > 6:
+            return (
+                f"Invalid prefix length: '{prefix}'\n\n"
+                f"Prefix must be 2-6 characters. Examples:\n"
+                f"  • P4M (3 chars) - good\n"
+                f"  • DISCOVER (8 chars) - too long, try 'DISC'\n"
+                f"  • X (1 char) - too short, try 'XX' or longer"
+            )
+
+        # Check alphanumeric only (no special characters, spaces, or dashes)
+        if not re.match(r'^[A-Z0-9]+$', prefix_upper):
+            return (
+                f"Invalid prefix format: '{prefix}'\n\n"
+                f"Prefix must contain only letters and numbers (no spaces, dashes, or special characters).\n"
+                f"Examples:\n"
+                f"  • P4M - good\n"
+                f"  • P-4M - bad (contains dash)\n"
+                f"  • P 4M - bad (contains space)"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 2: Connect to requirements database
+        # Using direct sqlite3 connection (not the db manager class) for
+        # more control over the transaction and audit logging
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row  # Allows dict-style access to rows
+        cursor = conn.cursor()
+
+        # ----------------------------------------------------------------
+        # STEP 3: Validate client exists (case-insensitive search)
+        # Show available clients if not found to help the user
+        # ----------------------------------------------------------------
+        cursor.execute(
+            "SELECT client_id, name FROM clients WHERE LOWER(name) = LOWER(?)",
+            (client_name,)
+        )
+        client_row = cursor.fetchone()
+
+        if not client_row:
+            # Client not found - show available clients to help user
+            cursor.execute("SELECT name FROM clients WHERE status = 'Active' ORDER BY name")
+            available = cursor.fetchall()
+
+            if available:
+                client_list = "\n".join(f"  • {row['name']}" for row in available)
+                return (
+                    f"Client not found: '{client_name}'\n\n"
+                    f"Available clients:\n{client_list}\n\n"
+                    f"Hint: Client names are matched case-insensitively."
+                )
+            else:
+                return (
+                    f"Client not found: '{client_name}'\n\n"
+                    f"No active clients exist in the database. "
+                    f"Please create a client first."
+                )
+
+        client_id = client_row['client_id']
+        client_name_actual = client_row['name']  # Use actual casing from database
+
+        # ----------------------------------------------------------------
+        # STEP 4: Check prefix uniqueness across ALL programs
+        # This is critical - prevents story ID collisions like P4M-AUTH-001
+        # appearing in multiple programs
+        # ----------------------------------------------------------------
+        cursor.execute(
+            "SELECT name, prefix FROM programs WHERE UPPER(prefix) = ?",
+            (prefix_upper,)
+        )
+        existing_prefix = cursor.fetchone()
+
+        if existing_prefix:
+            return (
+                f"Prefix already in use: '{prefix_upper}'\n\n"
+                f"The prefix '{existing_prefix['prefix']}' is already assigned to "
+                f"program '{existing_prefix['name']}'.\n\n"
+                f"Each prefix must be unique across ALL programs to prevent story ID collisions.\n"
+                f"Suggestion: Try a variation like '{prefix_upper}2' or choose a different abbreviation."
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 5: Check program name uniqueness within the client
+        # Same client can't have two programs with identical names
+        # ----------------------------------------------------------------
+        cursor.execute(
+            "SELECT name FROM programs WHERE client_id = ? AND LOWER(name) = LOWER(?)",
+            (client_id, program_name)
+        )
+        existing_name = cursor.fetchone()
+
+        if existing_name:
+            return (
+                f"Program name already exists for this client: '{existing_name['name']}'\n\n"
+                f"Client '{client_name_actual}' already has a program with this name.\n"
+                f"Please choose a different program name."
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 6: Generate program_id and insert
+        # Using UUID4 for globally unique identifier
+        # ----------------------------------------------------------------
+        program_id = str(uuid.uuid4())
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        cursor.execute(
+            """
+            INSERT INTO programs (
+                program_id, client_id, name, prefix, description, status,
+                created_date, updated_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (program_id, client_id, program_name, prefix_upper, description, status, now, now)
+        )
+
+        # ----------------------------------------------------------------
+        # STEP 7: Log to audit_history for Part 11 compliance
+        # This creates a permanent record of who created what and when
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                'program',                          # record_type
+                program_id,                         # record_id
+                'Created',                          # action
+                'program',                          # field_changed
+                None,                               # old_value (none for create)
+                f'{program_name} [{prefix_upper}]', # new_value
+                'MCP:create_program',               # changed_by - identifies the tool
+                now,                                # changed_date
+                f'New program created under client {client_name_actual}'  # change_reason
+            )
+        )
+
+        # Commit both inserts together (atomic transaction)
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 8: Build success response with next steps
+        # Show example story IDs so user understands the prefix usage
+        # ----------------------------------------------------------------
+        result = f"""Program created successfully!
+
+Program Details:
+  Name: {program_name}
+  Prefix: {prefix_upper}
+  Client: {client_name_actual}
+  Status: {status}
+  Program ID: {program_id}
+"""
+        if description:
+            result += f"  Description: {description}\n"
+
+        result += f"""
+Next Steps - Example Story IDs:
+  When you create user stories for this program, they'll be named like:
+  • {prefix_upper}-AUTH-001 (Authentication story)
+  • {prefix_upper}-DASH-001 (Dashboard story)
+  • {prefix_upper}-DATA-001 (Data management story)
+
+Use these commands to add content:
+  • list_stories(program_prefix="{prefix_upper}") - View all stories
+  • get_program_by_prefix(prefix="{prefix_upper}") - View program stats
+"""
+        return result
+
+    except Exception as e:
+        return f"Error creating program: {str(e)}"
+
+    finally:
+        # Always close the connection, even if an error occurred
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def create_requirement(
+    program_prefix: str,
+    title: str,
+    description: str,
+    source_file: Optional[str] = None,
+    priority: str = "Medium",
+    requirement_type: str = "Technical"
+) -> str:
+    """
+    Create a raw requirement entry that can later be converted to user stories.
+
+    PURPOSE:
+        Captures raw requirements from various sources (meetings, documents,
+        stakeholder requests) before they're refined into user stories.
+        This preserves the original requirement for traceability.
+
+    R EQUIVALENT:
+        Like adding a row to a requirements data.frame, with auto-generated
+        IDs and source tracking.
+
+    REQUIREMENT ID FORMAT:
+        Auto-generated as {PREFIX}-REQ-{NNN}
+        Example: P4M-REQ-001, P4M-REQ-002
+
+    Args:
+        program_prefix: Program prefix (e.g., "P4M", "PROP")
+        title: Short requirement title
+        description: Full requirement description
+        source_file: Where this came from (e.g., "Client Meeting 2025-01-06", "SRS v1.2")
+        priority: "High", "Medium", "Low" (default: "Medium")
+        requirement_type: "Technical", "Workflow", "Process", "Integration" (default: "Technical")
+
+    Returns:
+        Confirmation with generated requirement_id
+
+    WHY THIS APPROACH:
+        - Preserves raw requirements before story conversion
+        - Tracks source for traceability
+        - Auto-increments requirement number within program
+        - Audit logging for Part 11 compliance
+    """
+    import sqlite3
+    import uuid
+    import re
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Validate priority
+        # ----------------------------------------------------------------
+        valid_priorities = ["High", "Medium", "Low"]
+        if priority not in valid_priorities:
+            return (
+                f"Invalid priority: '{priority}'\n\n"
+                f"Valid priorities:\n"
+                f"  • High - Critical, must be addressed first\n"
+                f"  • Medium - Important, normal priority\n"
+                f"  • Low - Nice to have, can be deferred"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 2: Validate requirement_type
+        # ----------------------------------------------------------------
+        valid_types = ["Technical", "Workflow", "Process", "Integration"]
+        if requirement_type not in valid_types:
+            type_list = "\n".join(f"  • {t}" for t in valid_types)
+            return (
+                f"Invalid requirement_type: '{requirement_type}'\n\n"
+                f"Valid types:\n{type_list}\n\n"
+                f"Descriptions:\n"
+                f"  • Technical - System/software functionality\n"
+                f"  • Workflow - Business process steps\n"
+                f"  • Process - Operational procedures\n"
+                f"  • Integration - External system connections"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 3: Connect to database and validate program exists
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT program_id, name, prefix FROM programs WHERE UPPER(prefix) = ?",
+            (program_prefix.upper(),)
+        )
+        program_row = cursor.fetchone()
+
+        if not program_row:
+            # Program not found - show available programs
+            cursor.execute(
+                "SELECT prefix, name FROM programs WHERE status = 'Active' ORDER BY prefix"
+            )
+            available = cursor.fetchall()
+
+            if available:
+                prog_list = "\n".join(f"  • [{row['prefix']}] {row['name']}" for row in available)
+                return (
+                    f"Program not found with prefix: '{program_prefix}'\n\n"
+                    f"Available programs:\n{prog_list}\n\n"
+                    f"Hint: Use the prefix (e.g., 'P4M'), not the full name."
+                )
+            else:
+                return (
+                    f"Program not found: '{program_prefix}'\n\n"
+                    f"No active programs exist. Create a program first with create_program()."
+                )
+
+        program_id = program_row['program_id']
+        program_name = program_row['name']
+        prefix = program_row['prefix']
+
+        # ----------------------------------------------------------------
+        # STEP 4: Generate requirement_id by finding max existing number
+        # Format: {PREFIX}-REQ-{NNN}
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            SELECT requirement_id FROM requirements
+            WHERE requirement_id LIKE ?
+            ORDER BY requirement_id DESC
+            LIMIT 1
+            """,
+            (f"{prefix}-REQ-%",)
+        )
+        last_req = cursor.fetchone()
+
+        if last_req:
+            # Extract the number from the last requirement ID
+            last_id = last_req['requirement_id']
+            match = re.search(r'-REQ-(\d+)$', last_id)
+            if match:
+                next_num = int(match.group(1)) + 1
+            else:
+                next_num = 1
+        else:
+            next_num = 1
+
+        # Format with leading zeros (3 digits)
+        requirement_id = f"{prefix}-REQ-{next_num:03d}"
+
+        # ----------------------------------------------------------------
+        # STEP 5: Insert the requirement
+        # ----------------------------------------------------------------
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        cursor.execute(
+            """
+            INSERT INTO requirements (
+                requirement_id, program_id, title, description, raw_text,
+                source_file, priority, requirement_type,
+                created_date, updated_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                requirement_id,
+                program_id,
+                title,
+                description,
+                description,  # raw_text = original description
+                source_file,
+                priority,
+                requirement_type,
+                now,
+                now
+            )
+        )
+
+        # ----------------------------------------------------------------
+        # STEP 6: Log to audit_history for Part 11 compliance
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                'requirement',                      # record_type
+                requirement_id,                     # record_id
+                'Created',                          # action
+                'requirement',                      # field_changed
+                None,                               # old_value (none for create)
+                title,                              # new_value
+                'MCP:create_requirement',           # changed_by
+                now,                                # changed_date
+                f'New requirement created in {program_name} [{prefix}]'  # change_reason
+            )
+        )
+
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 7: Build success response
+        # ----------------------------------------------------------------
+        result = f"""Requirement created successfully!
+
+Requirement Details:
+  Requirement ID: {requirement_id}
+  Title: {title}
+  Program: {program_name} [{prefix}]
+  Priority: {priority}
+  Type: {requirement_type}
+"""
+        if source_file:
+            result += f"  Source: {source_file}\n"
+
+        result += f"""
+Description:
+  {description[:200]}{'...' if len(description) > 200 else ''}
+
+Next Steps:
+  • Convert to user story: create_story(program_prefix="{prefix}", ...)
+  • View program requirements (use search_stories with program filter)
+  • Link stories to this requirement using requirement_id
+
+Traceability:
+  This requirement ID ({requirement_id}) can be linked to user stories
+  for full requirements traceability in compliance reporting.
+"""
+        return result
+
+    except sqlite3.IntegrityError as e:
+        if "UNIQUE constraint" in str(e):
+            return (
+                f"Requirement ID conflict: '{requirement_id}' already exists.\n\n"
+                f"This shouldn't happen with auto-increment. Please report this bug."
+            )
+        return f"Database integrity error: {str(e)}"
+
+    except Exception as e:
+        return f"Error creating requirement: {str(e)}"
+
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def link_requirement_to_story(
+    requirement_id: str,
+    story_id: str,
+    coverage_status: str = "Full",
+    gap_notes: Optional[str] = None
+) -> str:
+    """
+    Create traceability link between a requirement and a user story.
+
+    PURPOSE:
+        Establishes formal traceability between raw requirements and user stories.
+        Essential for compliance reporting and gap analysis.
+
+    R EQUIVALENT:
+        Like creating a join table row that links two data.frames by foreign key,
+        with metadata about the relationship quality.
+
+    Args:
+        requirement_id: Requirement ID (e.g., "P4M-REQ-001")
+        story_id: Story ID (e.g., "P4M-AUTH-001")
+        coverage_status: How well the story covers the requirement
+                        "Full" - Story completely addresses requirement
+                        "Partial" - Story partially addresses requirement
+                        "None" - Placeholder link, no coverage yet
+        gap_notes: Notes explaining gaps if coverage is Partial or None
+
+    Returns:
+        Confirmation with traceability link details
+
+    WHY THIS APPROACH:
+        - Creates formal audit trail between requirements and implementation
+        - Supports compliance gap analysis reporting
+        - Validates both entities exist and belong to same program
+        - Audit logging for Part 11 compliance
+    """
+    import sqlite3
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Validate coverage_status
+        # ----------------------------------------------------------------
+        valid_coverage = ["Full", "Partial", "None"]
+        if coverage_status not in valid_coverage:
+            return (
+                f"Invalid coverage_status: '{coverage_status}'\n\n"
+                f"Valid values:\n"
+                f"  • Full - Story completely addresses the requirement\n"
+                f"  • Partial - Story partially addresses the requirement\n"
+                f"  • None - Placeholder link, requirement not yet covered"
+            )
+
+        # Warn if Partial/None without gap_notes
+        if coverage_status in ["Partial", "None"] and not gap_notes:
+            missing_notes_warning = True
+        else:
+            missing_notes_warning = False
+
+        # ----------------------------------------------------------------
+        # STEP 2: Connect to database
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # ----------------------------------------------------------------
+        # STEP 3: Validate requirement exists and get its program_id
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            SELECT r.requirement_id, r.title as req_title, r.program_id,
+                   p.name as program_name, p.prefix
+            FROM requirements r
+            JOIN programs p ON r.program_id = p.program_id
+            WHERE r.requirement_id = ?
+            """,
+            (requirement_id,)
+        )
+        req_row = cursor.fetchone()
+
+        if not req_row:
+            # Requirement not found - provide helpful suggestions
+            parts = requirement_id.split('-')
+            if len(parts) >= 2:
+                prefix = parts[0]
+                cursor.execute(
+                    "SELECT requirement_id, title FROM requirements WHERE requirement_id LIKE ? ORDER BY requirement_id LIMIT 5",
+                    (f"{prefix}-REQ-%",)
+                )
+                similar = cursor.fetchall()
+                if similar:
+                    similar_list = "\n".join(f"  • {r['requirement_id']}: {r['title'][:40]}" for r in similar)
+                    return (
+                        f"Requirement not found: '{requirement_id}'\n\n"
+                        f"Requirements in {prefix}:\n{similar_list}"
+                    )
+
+            return f"Requirement not found: '{requirement_id}'"
+
+        req_program_id = req_row['program_id']
+        req_title = req_row['req_title']
+        program_name = req_row['program_name']
+        prefix = req_row['prefix']
+
+        # ----------------------------------------------------------------
+        # STEP 4: Validate story exists and get its program_id
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            SELECT s.story_id, s.title as story_title, s.program_id
+            FROM user_stories s
+            WHERE s.story_id = ?
+            """,
+            (story_id,)
+        )
+        story_row = cursor.fetchone()
+
+        if not story_row:
+            # Story not found - provide helpful suggestions
+            parts = story_id.split('-')
+            if len(parts) >= 2:
+                prefix_part = parts[0]
+                cursor.execute(
+                    "SELECT story_id, title FROM user_stories WHERE story_id LIKE ? ORDER BY story_id LIMIT 5",
+                    (f"{prefix_part}-%",)
+                )
+                similar = cursor.fetchall()
+                if similar:
+                    similar_list = "\n".join(f"  • {s['story_id']}: {s['title'][:40]}" for s in similar)
+                    return (
+                        f"Story not found: '{story_id}'\n\n"
+                        f"Stories in {prefix_part}:\n{similar_list}"
+                    )
+
+            return f"Story not found: '{story_id}'"
+
+        story_program_id = story_row['program_id']
+        story_title = story_row['story_title']
+
+        # ----------------------------------------------------------------
+        # STEP 5: Validate both belong to the same program
+        # ----------------------------------------------------------------
+        if req_program_id != story_program_id:
+            return (
+                f"Program mismatch!\n\n"
+                f"Requirement '{requirement_id}' belongs to program: {program_name}\n"
+                f"Story '{story_id}' belongs to a different program.\n\n"
+                f"Both must belong to the same program for traceability."
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 6: Check if link already exists
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            SELECT trace_id, coverage_status FROM traceability
+            WHERE requirement_id = ? AND story_id = ?
+            """,
+            (requirement_id, story_id)
+        )
+        existing_link = cursor.fetchone()
+
+        if existing_link:
+            return (
+                f"Link already exists!\n\n"
+                f"Requirement '{requirement_id}' is already linked to story '{story_id}'\n"
+                f"Current coverage: {existing_link['coverage_status']}\n"
+                f"Trace ID: {existing_link['trace_id']}\n\n"
+                f"To update coverage, use a direct database update or create a new tool."
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 7: Insert the traceability link
+        # ----------------------------------------------------------------
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        cursor.execute(
+            """
+            INSERT INTO traceability (
+                program_id, requirement_id, story_id,
+                coverage_status, gap_notes,
+                created_date, updated_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                req_program_id,
+                requirement_id,
+                story_id,
+                coverage_status,
+                gap_notes,
+                now,
+                now
+            )
+        )
+
+        trace_id = cursor.lastrowid
+
+        # ----------------------------------------------------------------
+        # STEP 8: Log to audit_history for Part 11 compliance
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                'traceability',                     # record_type
+                str(trace_id),                      # record_id
+                'Created',                          # action
+                'link',                             # field_changed
+                None,                               # old_value
+                f'{requirement_id} -> {story_id}', # new_value
+                'MCP:link_requirement_to_story',    # changed_by
+                now,                                # changed_date
+                f'Traceability link created with {coverage_status} coverage'
+            )
+        )
+
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 9: Build success response
+        # ----------------------------------------------------------------
+        # Coverage indicator
+        coverage_indicators = {
+            "Full": "✓",
+            "Partial": "◐",
+            "None": "○"
+        }
+        indicator = coverage_indicators.get(coverage_status, "?")
+
+        result = f"""Traceability link created!
+
+{indicator} {requirement_id} → {story_id}
+
+Link Details:
+  Trace ID: {trace_id}
+  Program: {program_name} [{prefix}]
+  Coverage: {coverage_status}
+
+Requirement:
+  {requirement_id}: {req_title[:50]}{'...' if len(req_title) > 50 else ''}
+
+Story:
+  {story_id}: {story_title[:50]}{'...' if len(story_title) > 50 else ''}
+"""
+        if gap_notes:
+            result += f"""
+Gap Notes:
+  {gap_notes}
+"""
+
+        if missing_notes_warning:
+            result += f"""
+⚠ Warning: Coverage is '{coverage_status}' but no gap_notes provided.
+  Consider adding notes explaining what's missing or why coverage is incomplete.
+"""
+
+        result += f"""
+Next Steps:
+  • get_coverage_gaps(program_prefix="{prefix}") - View all coverage gaps
+  • Create additional links for other requirements/stories
+  • Add test cases to the story for full traceability
+"""
+        return result
+
+    except Exception as e:
+        return f"Error creating traceability link: {str(e)}"
+
+    finally:
+        if conn:
+            conn.close()
+
+
 # ============================================================
 # REQUIREMENTS TOOLKIT - USER STORY TOOLS
 # ============================================================
@@ -1454,6 +2203,559 @@ def get_story(story_id: str) -> str:
     finally:
         if db:
             db.close()
+
+
+@mcp.tool()
+def create_story(
+    program_prefix: str,
+    category: str,
+    title: str,
+    user_story: str,
+    acceptance_criteria: str,
+    priority: str = "Should Have",
+    status: str = "Draft",
+    role: Optional[str] = None,
+    internal_notes: Optional[str] = None
+) -> str:
+    """
+    Create a new user story for tracking requirements, acceptance criteria, and test coverage.
+
+    PURPOSE:
+        Creates a user story under an existing program. Stories track requirements
+        in a structured format with clear acceptance criteria for testing.
+
+    R EQUIVALENT:
+        Like creating a row in a data.frame, but with auto-generated IDs
+        and database persistence.
+
+    STORY ID FORMAT:
+        Auto-generated as {PREFIX}-{CATEGORY}-{NNN}
+        Example: P4M-AUTH-001, P4M-AUTH-002, P4M-DASH-001
+
+    Args:
+        program_prefix: Program prefix (e.g., "P4M", "PROP")
+        category: Story category (e.g., "AUTH", "DASH", "RECRUIT", "MSG")
+        title: Short descriptive title for the story
+        user_story: Full story in "As a [role], I want [feature], so that [benefit]" format
+        acceptance_criteria: Acceptance criteria (can be multi-line, use \\n for line breaks)
+        priority: MoSCoW priority - "Must Have", "Should Have", "Could Have", "Won't Have"
+        status: Workflow status (default: "Draft")
+        role: User role if not extractable from user_story
+        internal_notes: Internal team notes (not shared with client)
+
+    Returns:
+        Confirmation with generated story_id and link to view it
+
+    WHY THIS APPROACH:
+        - Auto-increments story number within prefix+category for unique IDs
+        - Validates program exists before creating
+        - Parses user_story to extract role if not provided
+        - Audit logging for FDA 21 CFR Part 11 compliance
+    """
+    # Import here to keep dependency local (matches pattern in other tools)
+    import sqlite3
+    import re
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Validate and normalize category
+        # Category should be uppercase for consistency in story IDs
+        # ----------------------------------------------------------------
+        category_upper = category.upper().strip()
+
+        # Validate category format (letters only, 2-10 chars)
+        if not re.match(r'^[A-Z]{2,10}$', category_upper):
+            return (
+                f"Invalid category format: '{category}'\n\n"
+                f"Category must be 2-10 letters (no numbers, spaces, or special characters).\n"
+                f"Common categories:\n"
+                f"  • AUTH - Authentication/Authorization\n"
+                f"  • DASH - Dashboard\n"
+                f"  • RECRUIT - Recruitment/Enrollment\n"
+                f"  • MSG - Messaging/Communications\n"
+                f"  • DATA - Data Management\n"
+                f"  • REPORT - Reporting\n"
+                f"  • ADMIN - Administration"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 2: Validate priority is a valid MoSCoW value
+        # ----------------------------------------------------------------
+        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have"]
+        if priority not in valid_priorities:
+            return (
+                f"Invalid priority: '{priority}'\n\n"
+                f"Priority must be one of (MoSCoW):\n"
+                f"  • Must Have - Critical requirement\n"
+                f"  • Should Have - Important but not critical\n"
+                f"  • Could Have - Nice to have\n"
+                f"  • Won't Have - Out of scope for now"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 3: Connect to requirements database
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # ----------------------------------------------------------------
+        # STEP 4: Validate program exists (lookup by prefix)
+        # ----------------------------------------------------------------
+        cursor.execute(
+            "SELECT program_id, name, prefix FROM programs WHERE UPPER(prefix) = ?",
+            (program_prefix.upper(),)
+        )
+        program_row = cursor.fetchone()
+
+        if not program_row:
+            # Program not found - show available programs to help user
+            cursor.execute(
+                "SELECT prefix, name FROM programs WHERE status = 'Active' ORDER BY prefix"
+            )
+            available = cursor.fetchall()
+
+            if available:
+                prog_list = "\n".join(f"  • [{row['prefix']}] {row['name']}" for row in available)
+                return (
+                    f"Program not found with prefix: '{program_prefix}'\n\n"
+                    f"Available programs:\n{prog_list}\n\n"
+                    f"Hint: Use the prefix (e.g., 'P4M'), not the full name."
+                )
+            else:
+                return (
+                    f"Program not found: '{program_prefix}'\n\n"
+                    f"No active programs exist. Create a program first with create_program()."
+                )
+
+        program_id = program_row['program_id']
+        program_name = program_row['name']
+        prefix = program_row['prefix']  # Use stored prefix for consistent casing
+
+        # ----------------------------------------------------------------
+        # STEP 5: Generate story_id by finding max existing number
+        # Format: {PREFIX}-{CATEGORY}-{NNN}
+        # Query: Find highest NNN for this prefix+category, add 1
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            SELECT story_id FROM user_stories
+            WHERE story_id LIKE ?
+            ORDER BY story_id DESC
+            LIMIT 1
+            """,
+            (f"{prefix}-{category_upper}-%",)
+        )
+        last_story = cursor.fetchone()
+
+        if last_story:
+            # Extract the number from the last story ID (e.g., "P4M-AUTH-005" -> 5)
+            last_id = last_story['story_id']
+            match = re.search(r'-(\d+)$', last_id)
+            if match:
+                next_num = int(match.group(1)) + 1
+            else:
+                next_num = 1
+        else:
+            next_num = 1
+
+        # Format with leading zeros (3 digits)
+        story_id = f"{prefix}-{category_upper}-{next_num:03d}"
+
+        # ----------------------------------------------------------------
+        # STEP 6: Try to extract role from user_story if not provided
+        # Looks for "As a [role]," pattern
+        # ----------------------------------------------------------------
+        extracted_role = role
+        if not extracted_role and user_story:
+            role_match = re.search(r'[Aa]s\s+(?:a|an)\s+([^,]+),', user_story)
+            if role_match:
+                extracted_role = role_match.group(1).strip()
+
+        # ----------------------------------------------------------------
+        # STEP 7: Insert the user story
+        # ----------------------------------------------------------------
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        cursor.execute(
+            """
+            INSERT INTO user_stories (
+                story_id, program_id, title, user_story, role,
+                acceptance_criteria, priority, category, status,
+                internal_notes, version, created_date, updated_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                story_id,
+                program_id,
+                title,
+                user_story,
+                extracted_role,
+                acceptance_criteria,
+                priority,
+                category_upper,
+                status,
+                internal_notes,
+                1,  # version starts at 1
+                now,
+                now
+            )
+        )
+
+        # ----------------------------------------------------------------
+        # STEP 8: Log to audit_history for Part 11 compliance
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                'user_story',                       # record_type
+                story_id,                           # record_id
+                'Created',                          # action
+                'user_story',                       # field_changed
+                None,                               # old_value (none for create)
+                title,                              # new_value
+                'MCP:create_story',                 # changed_by
+                now,                                # changed_date
+                f'New story created in {program_name} [{prefix}]'  # change_reason
+            )
+        )
+
+        # Commit both inserts together
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 9: Build success response
+        # ----------------------------------------------------------------
+        result = f"""Story created successfully!
+
+Story Details:
+  Story ID: {story_id}
+  Title: {title}
+  Program: {program_name} [{prefix}]
+  Category: {category_upper}
+  Priority: {priority}
+  Status: {status}
+"""
+        if extracted_role:
+            result += f"  Role: {extracted_role}\n"
+
+        result += f"""
+User Story:
+  {user_story}
+
+Acceptance Criteria:
+"""
+        # Format acceptance criteria with line numbers
+        for i, line in enumerate(acceptance_criteria.split('\n'), 1):
+            if line.strip():
+                result += f"  {i}. {line.strip()}\n"
+
+        result += f"""
+Next Steps:
+  • get_story(story_id="{story_id}") - View full story details
+  • list_stories(program_prefix="{prefix}") - View all stories in program
+  • Create test cases linked to this story
+"""
+        return result
+
+    except sqlite3.IntegrityError as e:
+        # Handle unique constraint violations
+        if "UNIQUE constraint" in str(e):
+            return (
+                f"Story ID conflict: '{story_id}' already exists.\n\n"
+                f"This shouldn't happen with auto-increment. Please report this bug."
+            )
+        return f"Database integrity error: {str(e)}"
+
+    except Exception as e:
+        return f"Error creating story: {str(e)}"
+
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def update_story(
+    story_id: str,
+    title: Optional[str] = None,
+    user_story: Optional[str] = None,
+    acceptance_criteria: Optional[str] = None,
+    status: Optional[str] = None,
+    priority: Optional[str] = None,
+    client_feedback: Optional[str] = None,
+    internal_notes: Optional[str] = None,
+    change_reason: Optional[str] = None
+) -> str:
+    """
+    Update an existing user story's content, status, or add feedback.
+
+    PURPOSE:
+        Modifies an existing user story. Only fields that are provided (not None)
+        will be updated. Each change is logged to the audit trail for compliance.
+
+    R EQUIVALENT:
+        Like dplyr::mutate() on a single row, but with version tracking
+        and audit logging.
+
+    Args:
+        story_id: Story ID to update (e.g., "P4M-AUTH-001")
+        title: Updated title (optional)
+        user_story: Updated story text (optional)
+        acceptance_criteria: Updated acceptance criteria (optional)
+        status: Workflow status - "Draft", "Internal Review", "Pending Client Review",
+                "Approved", "Needs Discussion", "Out of Scope"
+        priority: MoSCoW priority - "Must Have", "Should Have", "Could Have", "Won't Have"
+        client_feedback: Feedback from client review (optional)
+        internal_notes: Internal team notes (optional)
+        change_reason: Why this change was made - recorded in audit trail (optional)
+
+    Returns:
+        Confirmation with updated fields and new version number
+
+    WHY THIS APPROACH:
+        - Only updates provided fields (sparse update pattern)
+        - Auto-increments version on any change for tracking
+        - Special handling for "Approved" status (sets approved_date/approved_by)
+        - Per-field audit logging for regulatory compliance
+    """
+    import sqlite3
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Validate status if provided
+        # ----------------------------------------------------------------
+        valid_statuses = [
+            "Draft",
+            "Internal Review",
+            "Pending Client Review",
+            "Approved",
+            "Needs Discussion",
+            "Out of Scope"
+        ]
+        if status is not None and status not in valid_statuses:
+            status_list = "\n".join(f"  • {s}" for s in valid_statuses)
+            return (
+                f"Invalid status: '{status}'\n\n"
+                f"Valid statuses:\n{status_list}"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 2: Validate priority if provided
+        # ----------------------------------------------------------------
+        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have"]
+        if priority is not None and priority not in valid_priorities:
+            return (
+                f"Invalid priority: '{priority}'\n\n"
+                f"Priority must be one of (MoSCoW):\n"
+                f"  • Must Have - Critical requirement\n"
+                f"  • Should Have - Important but not critical\n"
+                f"  • Could Have - Nice to have\n"
+                f"  • Won't Have - Out of scope for now"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 3: Connect to database and fetch existing story
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT s.*, p.name as program_name, p.prefix
+            FROM user_stories s
+            JOIN programs p ON s.program_id = p.program_id
+            WHERE s.story_id = ?
+            """,
+            (story_id,)
+        )
+        existing = cursor.fetchone()
+
+        if not existing:
+            # Story not found - provide helpful error
+            # Try to extract prefix to suggest similar stories
+            parts = story_id.split('-')
+            if len(parts) >= 2:
+                prefix = parts[0]
+                cursor.execute(
+                    "SELECT story_id, title FROM user_stories WHERE story_id LIKE ? LIMIT 5",
+                    (f"{prefix}-%",)
+                )
+                similar = cursor.fetchall()
+                if similar:
+                    similar_list = "\n".join(f"  • {s['story_id']}: {s['title'][:40]}" for s in similar)
+                    return (
+                        f"Story not found: '{story_id}'\n\n"
+                        f"Similar stories in {prefix}:\n{similar_list}"
+                    )
+
+            return f"Story not found: '{story_id}'"
+
+        # Convert to dict for easier access
+        old_story = dict(existing)
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # ----------------------------------------------------------------
+        # STEP 4: Build update fields and track changes
+        # Only include fields that were provided (not None)
+        # ----------------------------------------------------------------
+        updates = {}
+        changes = []  # List of (field_name, old_value, new_value) for audit
+
+        # Check each optional field
+        if title is not None and title != old_story.get('title'):
+            updates['title'] = title
+            changes.append(('title', old_story.get('title'), title))
+
+        if user_story is not None and user_story != old_story.get('user_story'):
+            updates['user_story'] = user_story
+            changes.append(('user_story', old_story.get('user_story'), user_story))
+
+        if acceptance_criteria is not None and acceptance_criteria != old_story.get('acceptance_criteria'):
+            updates['acceptance_criteria'] = acceptance_criteria
+            changes.append(('acceptance_criteria', old_story.get('acceptance_criteria'), acceptance_criteria))
+
+        if status is not None and status != old_story.get('status'):
+            updates['status'] = status
+            changes.append(('status', old_story.get('status'), status))
+
+            # Special handling for Approved status
+            if status == "Approved":
+                updates['approved_date'] = now
+                updates['approved_by'] = 'MCP:update_story'
+                changes.append(('approved_date', old_story.get('approved_date'), now))
+
+        if priority is not None and priority != old_story.get('priority'):
+            updates['priority'] = priority
+            changes.append(('priority', old_story.get('priority'), priority))
+
+        if client_feedback is not None:
+            # For feedback, we append rather than replace (if existing)
+            old_feedback = old_story.get('client_feedback') or ''
+            if old_feedback:
+                new_feedback = f"{old_feedback}\n\n[{now}]\n{client_feedback}"
+            else:
+                new_feedback = f"[{now}]\n{client_feedback}"
+            updates['client_feedback'] = new_feedback
+            changes.append(('client_feedback', old_feedback, new_feedback))
+
+        if internal_notes is not None:
+            # For notes, we append rather than replace (if existing)
+            old_notes = old_story.get('internal_notes') or ''
+            if old_notes:
+                new_notes = f"{old_notes}\n\n[{now}]\n{internal_notes}"
+            else:
+                new_notes = f"[{now}]\n{internal_notes}"
+            updates['internal_notes'] = new_notes
+            changes.append(('internal_notes', old_notes, new_notes))
+
+        # ----------------------------------------------------------------
+        # STEP 5: Check if there are any changes to make
+        # ----------------------------------------------------------------
+        if not updates:
+            return (
+                f"No changes to make for {story_id}\n\n"
+                f"All provided values match the current values, or no update fields were provided.\n"
+                f"Current story:\n"
+                f"  Title: {old_story.get('title')}\n"
+                f"  Status: {old_story.get('status')}\n"
+                f"  Priority: {old_story.get('priority')}\n"
+                f"  Version: {old_story.get('version', 1)}"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 6: Always update version and updated_date when changes occur
+        # ----------------------------------------------------------------
+        new_version = (old_story.get('version') or 1) + 1
+        updates['version'] = new_version
+        updates['updated_date'] = now
+
+        # ----------------------------------------------------------------
+        # STEP 7: Build and execute UPDATE statement
+        # ----------------------------------------------------------------
+        set_clause = ", ".join(f"{field} = ?" for field in updates.keys())
+        values = list(updates.values()) + [story_id]
+
+        cursor.execute(
+            f"UPDATE user_stories SET {set_clause} WHERE story_id = ?",
+            values
+        )
+
+        # ----------------------------------------------------------------
+        # STEP 8: Log each change to audit_history
+        # ----------------------------------------------------------------
+        audit_reason = change_reason or "Story updated via MCP"
+
+        for field_name, old_value, new_value in changes:
+            # Truncate long values for audit log readability
+            old_display = str(old_value)[:200] if old_value else None
+            new_display = str(new_value)[:200] if new_value else None
+
+            cursor.execute(
+                """
+                INSERT INTO audit_history (
+                    record_type, record_id, action, field_changed,
+                    old_value, new_value, changed_by, changed_date, change_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    'user_story',
+                    story_id,
+                    'Updated',
+                    field_name,
+                    old_display,
+                    new_display,
+                    'MCP:update_story',
+                    now,
+                    audit_reason
+                )
+            )
+
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 9: Build success response
+        # ----------------------------------------------------------------
+        result = f"""Story updated successfully!
+
+Story: {story_id}
+Program: {old_story['program_name']} [{old_story['prefix']}]
+Version: {old_story.get('version', 1)} → {new_version}
+
+Changes made ({len(changes)} field(s)):
+"""
+        for field_name, old_val, new_val in changes:
+            # Format display based on field type
+            if field_name in ('client_feedback', 'internal_notes', 'user_story', 'acceptance_criteria'):
+                # For long text fields, just show that it was updated
+                result += f"  • {field_name}: (updated)\n"
+            else:
+                result += f"  • {field_name}: '{old_val}' → '{new_val}'\n"
+
+        if status == "Approved":
+            result += f"\n✓ Story marked as APPROVED at {now}\n"
+
+        result += f"""
+Next Steps:
+  • get_story(story_id="{story_id}") - View updated story
+  • get_approval_pipeline(program_prefix="{old_story['prefix']}") - View workflow status
+"""
+        return result
+
+    except Exception as e:
+        return f"Error updating story: {str(e)}"
+
+    finally:
+        if conn:
+            conn.close()
 
 
 @mcp.tool()
@@ -1605,6 +2907,525 @@ def get_test_summary(program_prefix: str) -> str:
     finally:
         if db:
             db.close()
+
+
+@mcp.tool()
+def create_test_case(
+    story_id: str,
+    title: str,
+    test_type: str,
+    test_steps: str,
+    expected_result: str,
+    preconditions: Optional[str] = None,
+    priority: str = "Should Have",
+    compliance_framework: Optional[str] = None
+) -> str:
+    """
+    Create a UAT test case linked to a user story.
+
+    PURPOSE:
+        Creates a test case that validates a user story's acceptance criteria.
+        Test cases track execution status and can be linked to compliance frameworks.
+
+    R EQUIVALENT:
+        Like adding a row to a test plan data.frame, with automatic ID generation
+        and linkage to the parent story.
+
+    TEST ID FORMAT:
+        Auto-generated as {STORY_ID}-TC{NN}
+        Example: P4M-AUTH-001-TC01, P4M-AUTH-001-TC02
+
+    Args:
+        story_id: Parent story ID (e.g., "P4M-AUTH-001")
+        title: Test case title (short description)
+        test_type: Type of test - "happy_path", "negative", "validation", "edge_case"
+        test_steps: Numbered test steps (can be multi-line)
+        expected_result: Expected outcome when test passes
+        preconditions: Setup required before running test (optional)
+        priority: MoSCoW priority (default: "Should Have")
+        compliance_framework: "Part11", "HIPAA", "SOC2", or None
+
+    Returns:
+        Confirmation with generated test_id
+
+    WHY THIS APPROACH:
+        - Links test to parent story for traceability
+        - Auto-increments test number within the story
+        - Supports compliance framework tagging
+        - Audit logging for Part 11 compliance
+    """
+    import sqlite3
+    import re
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Validate test_type
+        # ----------------------------------------------------------------
+        valid_test_types = ["happy_path", "negative", "validation", "edge_case"]
+        test_type_lower = test_type.lower().strip()
+
+        if test_type_lower not in valid_test_types:
+            type_list = "\n".join(f"  • {t}" for t in valid_test_types)
+            return (
+                f"Invalid test_type: '{test_type}'\n\n"
+                f"Valid test types:\n{type_list}\n\n"
+                f"Descriptions:\n"
+                f"  • happy_path - Normal successful scenario\n"
+                f"  • negative - Error handling, invalid inputs\n"
+                f"  • validation - Input/data validation rules\n"
+                f"  • edge_case - Boundary conditions, unusual scenarios"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 2: Validate priority
+        # ----------------------------------------------------------------
+        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have"]
+        if priority not in valid_priorities:
+            return (
+                f"Invalid priority: '{priority}'\n\n"
+                f"Priority must be one of (MoSCoW):\n"
+                f"  • Must Have - Critical test\n"
+                f"  • Should Have - Important but not critical\n"
+                f"  • Could Have - Nice to have\n"
+                f"  • Won't Have - Out of scope for now"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 3: Validate compliance_framework if provided
+        # ----------------------------------------------------------------
+        valid_frameworks = ["Part11", "HIPAA", "SOC2"]
+        if compliance_framework is not None:
+            # Normalize common variations
+            framework_normalized = compliance_framework.strip()
+            framework_upper = framework_normalized.upper().replace(" ", "").replace("-", "")
+
+            # Map common variations to standard names
+            framework_map = {
+                "PART11": "Part11",
+                "21CFRPART11": "Part11",
+                "CFR11": "Part11",
+                "HIPAA": "HIPAA",
+                "SOC2": "SOC2",
+                "SOCII": "SOC2",
+                "SOC": "SOC2"
+            }
+
+            if framework_upper in framework_map:
+                compliance_framework = framework_map[framework_upper]
+            elif framework_normalized not in valid_frameworks:
+                return (
+                    f"Invalid compliance_framework: '{compliance_framework}'\n\n"
+                    f"Valid frameworks:\n"
+                    f"  • Part11 - FDA 21 CFR Part 11\n"
+                    f"  • HIPAA - Health Insurance Portability and Accountability\n"
+                    f"  • SOC2 - Service Organization Control 2\n"
+                    f"  • None - No compliance requirement"
+                )
+
+        # ----------------------------------------------------------------
+        # STEP 4: Connect to database and validate parent story exists
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT s.story_id, s.title as story_title, s.program_id,
+                   p.name as program_name, p.prefix
+            FROM user_stories s
+            JOIN programs p ON s.program_id = p.program_id
+            WHERE s.story_id = ?
+            """,
+            (story_id,)
+        )
+        parent_story = cursor.fetchone()
+
+        if not parent_story:
+            # Story not found - provide helpful suggestions
+            parts = story_id.split('-')
+            if len(parts) >= 2:
+                prefix = parts[0]
+                cursor.execute(
+                    "SELECT story_id, title FROM user_stories WHERE story_id LIKE ? ORDER BY story_id LIMIT 5",
+                    (f"{prefix}-%",)
+                )
+                similar = cursor.fetchall()
+                if similar:
+                    similar_list = "\n".join(f"  • {s['story_id']}: {s['title'][:40]}" for s in similar)
+                    return (
+                        f"Parent story not found: '{story_id}'\n\n"
+                        f"Similar stories in {prefix}:\n{similar_list}\n\n"
+                        f"Hint: Use get_story() to verify the story exists."
+                    )
+
+            return f"Parent story not found: '{story_id}'"
+
+        program_id = parent_story['program_id']
+        program_name = parent_story['program_name']
+        prefix = parent_story['prefix']
+
+        # ----------------------------------------------------------------
+        # STEP 5: Generate test_id by finding max existing number
+        # Format: {STORY_ID}-TC{NN}
+        # Query: Find highest NN for this story, add 1
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            SELECT test_id FROM uat_test_cases
+            WHERE test_id LIKE ?
+            ORDER BY test_id DESC
+            LIMIT 1
+            """,
+            (f"{story_id}-TC%",)
+        )
+        last_test = cursor.fetchone()
+
+        if last_test:
+            # Extract the number from the last test ID (e.g., "P4M-AUTH-001-TC05" -> 5)
+            last_id = last_test['test_id']
+            match = re.search(r'-TC(\d+)$', last_id)
+            if match:
+                next_num = int(match.group(1)) + 1
+            else:
+                next_num = 1
+        else:
+            next_num = 1
+
+        # Format with leading zeros (2 digits)
+        test_id = f"{story_id}-TC{next_num:02d}"
+
+        # ----------------------------------------------------------------
+        # STEP 6: Insert the test case
+        # ----------------------------------------------------------------
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        cursor.execute(
+            """
+            INSERT INTO uat_test_cases (
+                test_id, story_id, program_id, title, test_type,
+                prerequisites, test_steps, expected_results,
+                priority, compliance_framework, test_status,
+                created_date, updated_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                test_id,
+                story_id,
+                program_id,
+                title,
+                test_type_lower,
+                preconditions,
+                test_steps,
+                expected_result,
+                priority,
+                compliance_framework,
+                "Not Run",  # Initial status
+                now,
+                now
+            )
+        )
+
+        # ----------------------------------------------------------------
+        # STEP 7: Log to audit_history for Part 11 compliance
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                'test_case',                        # record_type
+                test_id,                            # record_id
+                'Created',                          # action
+                'test_case',                        # field_changed
+                None,                               # old_value (none for create)
+                title,                              # new_value
+                'MCP:create_test_case',             # changed_by
+                now,                                # changed_date
+                f'New test case for story {story_id}'  # change_reason
+            )
+        )
+
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 8: Build success response
+        # ----------------------------------------------------------------
+        result = f"""Test case created successfully!
+
+Test Case Details:
+  Test ID: {test_id}
+  Title: {title}
+  Parent Story: {story_id} - {parent_story['story_title'][:40]}
+  Program: {program_name} [{prefix}]
+  Test Type: {test_type_lower}
+  Priority: {priority}
+  Status: Not Run
+"""
+        if compliance_framework:
+            result += f"  Compliance: {compliance_framework}\n"
+
+        if preconditions:
+            result += f"""
+Preconditions:
+  {preconditions}
+"""
+
+        result += f"""
+Test Steps:
+"""
+        for line in test_steps.split('\n'):
+            if line.strip():
+                result += f"  {line.strip()}\n"
+
+        result += f"""
+Expected Result:
+  {expected_result}
+
+Next Steps:
+  • list_test_cases(program_prefix="{prefix}") - View all test cases
+  • get_test_summary(program_prefix="{prefix}") - View test execution stats
+  • Create more test cases for this story with different test_types
+"""
+        return result
+
+    except sqlite3.IntegrityError as e:
+        if "UNIQUE constraint" in str(e):
+            return (
+                f"Test ID conflict: '{test_id}' already exists.\n\n"
+                f"This shouldn't happen with auto-increment. Please report this bug."
+            )
+        return f"Database integrity error: {str(e)}"
+
+    except Exception as e:
+        return f"Error creating test case: {str(e)}"
+
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def update_test_result(
+    test_id: str,
+    status: str,
+    tested_by: str,
+    notes: Optional[str] = None,
+    defect_id: Optional[str] = None
+) -> str:
+    """
+    Record the result of executing a test case.
+
+    PURPOSE:
+        Records test execution results including pass/fail status, who ran
+        the test, and any defects found. Essential for test coverage tracking
+        and compliance reporting.
+
+    R EQUIVALENT:
+        Like updating a row in a test results data.frame with execution data
+        and timestamp.
+
+    Args:
+        test_id: Test case ID (e.g., "P4M-AUTH-001-TC01")
+        status: Execution result - "Pass", "Fail", "Blocked", "Skipped"
+        tested_by: Name or ID of person who executed the test
+        notes: Execution notes or observations (optional)
+        defect_id: Link to defect/bug ticket if test failed (optional)
+
+    Returns:
+        Confirmation with updated test status and summary
+
+    WHY THIS APPROACH:
+        - Captures who ran the test and when for audit trail
+        - Links failed tests to defect tracking
+        - Per-field audit logging for Part 11 compliance
+    """
+    import sqlite3
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Validate status
+        # ----------------------------------------------------------------
+        valid_statuses = ["Pass", "Fail", "Blocked", "Skipped"]
+        if status not in valid_statuses:
+            status_list = "\n".join(f"  • {s}" for s in valid_statuses)
+            return (
+                f"Invalid status: '{status}'\n\n"
+                f"Valid statuses:\n{status_list}\n\n"
+                f"Descriptions:\n"
+                f"  • Pass - Test completed successfully\n"
+                f"  • Fail - Test found a defect\n"
+                f"  • Blocked - Cannot run due to environment/dependency issue\n"
+                f"  • Skipped - Intentionally not run (with justification)"
+            )
+
+        # Warn if Fail status without defect_id
+        if status == "Fail" and not defect_id:
+            # Don't block, just note it in the response later
+            missing_defect_warning = True
+        else:
+            missing_defect_warning = False
+
+        # ----------------------------------------------------------------
+        # STEP 2: Connect to database and fetch existing test case
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT t.*, s.title as story_title, p.name as program_name, p.prefix
+            FROM uat_test_cases t
+            JOIN user_stories s ON t.story_id = s.story_id
+            JOIN programs p ON t.program_id = p.program_id
+            WHERE t.test_id = ?
+            """,
+            (test_id,)
+        )
+        existing = cursor.fetchone()
+
+        if not existing:
+            # Test not found - provide helpful suggestions
+            parts = test_id.split('-')
+            if len(parts) >= 3:
+                # Try to find the parent story's tests
+                story_prefix = '-'.join(parts[:-1])  # e.g., "P4M-AUTH-001" from "P4M-AUTH-001-TC01"
+                cursor.execute(
+                    "SELECT test_id, title FROM uat_test_cases WHERE test_id LIKE ? ORDER BY test_id LIMIT 5",
+                    (f"{story_prefix}-%",)
+                )
+                similar = cursor.fetchall()
+                if similar:
+                    similar_list = "\n".join(f"  • {t['test_id']}: {t['title'][:40]}" for t in similar)
+                    return (
+                        f"Test case not found: '{test_id}'\n\n"
+                        f"Test cases for {story_prefix}:\n{similar_list}"
+                    )
+
+            return f"Test case not found: '{test_id}'"
+
+        # Convert to dict for easier access
+        old_test = dict(existing)
+        old_status = old_test.get('test_status', 'Not Run')
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # ----------------------------------------------------------------
+        # STEP 3: Build update fields
+        # ----------------------------------------------------------------
+        updates = {
+            'test_status': status,
+            'tested_by': tested_by,
+            'tested_date': now,
+            'updated_date': now
+        }
+
+        # Track changes for audit
+        changes = [('test_status', old_status, status)]
+
+        if notes is not None:
+            updates['execution_notes'] = notes
+            changes.append(('execution_notes', old_test.get('execution_notes'), notes))
+
+        if defect_id is not None:
+            updates['defect_id'] = defect_id
+            changes.append(('defect_id', old_test.get('defect_id'), defect_id))
+
+        # ----------------------------------------------------------------
+        # STEP 4: Execute UPDATE
+        # ----------------------------------------------------------------
+        set_clause = ", ".join(f"{field} = ?" for field in updates.keys())
+        values = list(updates.values()) + [test_id]
+
+        cursor.execute(
+            f"UPDATE uat_test_cases SET {set_clause} WHERE test_id = ?",
+            values
+        )
+
+        # ----------------------------------------------------------------
+        # STEP 5: Log to audit_history
+        # ----------------------------------------------------------------
+        for field_name, old_value, new_value in changes:
+            cursor.execute(
+                """
+                INSERT INTO audit_history (
+                    record_type, record_id, action, field_changed,
+                    old_value, new_value, changed_by, changed_date, change_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    'test_case',
+                    test_id,
+                    'Executed',
+                    field_name,
+                    str(old_value) if old_value else None,
+                    str(new_value) if new_value else None,
+                    f'MCP:update_test_result ({tested_by})',
+                    now,
+                    f'Test executed with result: {status}'
+                )
+            )
+
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 6: Build success response
+        # ----------------------------------------------------------------
+        # Determine status emoji/indicator
+        status_indicators = {
+            "Pass": "✓",
+            "Fail": "✗",
+            "Blocked": "⊘",
+            "Skipped": "—"
+        }
+        indicator = status_indicators.get(status, "?")
+
+        result = f"""Test result recorded!
+
+{indicator} {test_id}: {status}
+
+Test Details:
+  Title: {old_test['title']}
+  Parent Story: {old_test['story_id']} - {old_test['story_title'][:40]}
+  Program: {old_test['program_name']} [{old_test['prefix']}]
+  Test Type: {old_test.get('test_type', 'N/A')}
+
+Execution:
+  Previous Status: {old_status}
+  New Status: {status}
+  Tested By: {tested_by}
+  Tested Date: {now}
+"""
+        if notes:
+            result += f"  Notes: {notes[:100]}{'...' if len(notes) > 100 else ''}\n"
+
+        if defect_id:
+            result += f"  Defect ID: {defect_id}\n"
+
+        if missing_defect_warning:
+            result += f"""
+⚠ Warning: Test failed but no defect_id provided.
+  Consider linking to a defect ticket for tracking.
+"""
+
+        result += f"""
+Next Steps:
+  • get_test_summary(program_prefix="{old_test['prefix']}") - View overall test stats
+  • list_test_cases(program_prefix="{old_test['prefix']}", status="{status}") - View all {status} tests
+"""
+        return result
+
+    except Exception as e:
+        return f"Error updating test result: {str(e)}"
+
+    finally:
+        if conn:
+            conn.close()
 
 
 # ============================================================
