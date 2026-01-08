@@ -7543,11 +7543,6 @@ def generate_dashboard_data(
     """
     Generate dashboard JSON data for the clinic configuration dashboard.
 
-    This tool queries the client_product_database and generates a JSON file
-    containing users, training records, configurations, providers, and
-    optionally audit history. The output is designed for the static GitHub
-    Pages dashboard at propel-clinic-dashboard.
-
     Args:
         show_audit_trail: If True, includes audit_trail in output (default: False)
         output_path: Where to write JSON file (default: ~/projects/propel-clinic-dashboard/src/data/dashboard-data.json)
@@ -7562,16 +7557,13 @@ def generate_dashboard_data(
     # =========================================================================
     # SETUP
     # =========================================================================
-    # Use default path if not specified
     if output_path is None:
         output_path = DASHBOARD_DATA_PATH
     else:
         output_path = os.path.expanduser(output_path)
 
-    # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # Connect to database with Row factory for dict-like access
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
 
@@ -7581,8 +7573,6 @@ def generate_dashboard_data(
         # =====================================================================
         # QUERY 1: PROGRAMS LIST
         # =====================================================================
-        # Get all active programs with their prefix (used as ID in dashboard)
-        # and display name
         cursor.execute("""
             SELECT DISTINCT
                 prefix as id,
@@ -7597,9 +7587,6 @@ def generate_dashboard_data(
         # =====================================================================
         # QUERY 2: USERS WITH ACCESS
         # =====================================================================
-        # Join users with their access records to get program, clinic, role
-        # Note: user_access doesn't have last_access_date, so we use granted_date
-        # as a proxy. In production, you'd want to track actual login times.
         cursor.execute("""
             SELECT DISTINCT
                 u.name,
@@ -7619,78 +7606,117 @@ def generate_dashboard_data(
         users = [dict(row) for row in cursor.fetchall()]
 
         # =====================================================================
-        # QUERY 3: TRAINING RECORDS
+        # QUERY 3: CLINICS WITH CONFIGURATION STATUS
         # =====================================================================
-        # Get training status for each user. Calculate status based on
-        # expiration date:
-        # - Expired: expires_date < today
-        # - Due Soon: expires_date within 30 days
-        # - Current: expires_date > 30 days away
-        cursor.execute("""
-            SELECT DISTINCT
-                u.name,
-                u.email,
-                p.prefix as program,
-                ut.training_type,
-                ut.completed_date as completion_date,
-                ut.expires_date as expiration_date,
-                CASE
-                    WHEN ut.expires_date < date('now') THEN 'Expired'
-                    WHEN ut.expires_date < date('now', '+30 days') THEN 'Due Soon'
-                    ELSE 'Current'
-                END as status
-            FROM user_training ut
-            JOIN users u ON ut.user_id = u.user_id
-            JOIN user_access ua ON u.user_id = ua.user_id AND ua.is_active = 1
-            JOIN programs p ON ua.program_id = p.program_id
-            WHERE ut.completed_date IS NOT NULL
-            ORDER BY u.name, ut.training_type
-        """)
-        training = [dict(row) for row in cursor.fetchall()]
-
-        # =====================================================================
-        # QUERY 4: CONFIGURATIONS WITH INHERITANCE SOURCE
-        # =====================================================================
-        # Get all configuration values showing where they come from in the
-        # inheritance chain: Program Default → Clinic Override → Location Override
-        # The source is determined by which level has the config set:
-        # - Location Override: location_id is set
-        # - Clinic Override: clinic_id is set but not location_id
-        # - Program Default: only program_id is set
+        # Get all clinics and their configuration values to determine
+        # which are fully configured vs missing required fields.
+        # Required fields: clinic_phone, default_test
+        # Optional fields: default_specimen, optional_tests
         cursor.execute("""
             SELECT
                 p.prefix as program,
                 c.name as clinic,
-                l.name as location,
-                cv.config_key,
-                cv.value as config_value,
-                CASE
-                    WHEN cv.location_id IS NOT NULL THEN 'Location Override'
-                    WHEN cv.clinic_id IS NOT NULL THEN 'Clinic Override'
-                    ELSE 'Program Default'
-                END as source
-            FROM config_values cv
-            JOIN programs p ON cv.program_id = p.program_id
-            LEFT JOIN clinics c ON cv.clinic_id = c.clinic_id
-            LEFT JOIN locations l ON cv.location_id = l.location_id
+                c.clinic_id,
+                c.phone as clinic_phone
+            FROM clinics c
+            JOIN programs p ON c.program_id = p.program_id
             WHERE p.status = 'Active'
-            ORDER BY p.prefix, c.name, l.name, cv.config_key
+            ORDER BY p.prefix, c.name
         """)
-        configurations = [dict(row) for row in cursor.fetchall()]
+        clinic_rows = cursor.fetchall()
+
+        # Build configurations list with config values for each clinic
+        configurations = []
+        clinics_configured = []
+        config_requests_pending = []
+        missing_configurations = []
+
+        for clinic_row in clinic_rows:
+            clinic_data = dict(clinic_row)
+            clinic_id = clinic_data['clinic_id']
+            program = clinic_data['program']
+            clinic_name = clinic_data['clinic']
+
+            # Get config values for this clinic
+            cursor.execute("""
+                SELECT config_key, config_value as value
+                FROM config_values
+                WHERE clinic_id = ?
+            """, (clinic_id,))
+            config_rows = cursor.fetchall()
+            config_dict = {row['config_key']: row['value'] for row in config_rows}
+
+            # Extract specific config values
+            clinic_phone = clinic_data.get('clinic_phone')
+            default_test = config_dict.get('default_test')
+            default_specimen = config_dict.get('default_specimen')
+
+            # Parse optional_tests as JSON array if it exists
+            optional_tests_raw = config_dict.get('optional_tests')
+            optional_tests = []
+            if optional_tests_raw:
+                try:
+                    optional_tests = json.loads(optional_tests_raw)
+                except (json.JSONDecodeError, TypeError):
+                    # If not JSON, treat as single value
+                    optional_tests = [optional_tests_raw] if optional_tests_raw else []
+
+            # Determine configuration status
+            # config_submitted = True if any config values exist for this clinic
+            config_submitted = len(config_dict) > 0 or clinic_phone is not None
+
+            # Required fields for is_configured: clinic_phone and default_test
+            missing_fields = []
+            if not clinic_phone:
+                missing_fields.append('clinic_phone')
+            if not default_test:
+                missing_fields.append('default_test')
+
+            is_configured = len(missing_fields) == 0
+
+            # Build configuration entry
+            config_entry = {
+                "program": program,
+                "clinic": clinic_name,
+                "clinic_phone": clinic_phone,
+                "default_test": default_test,
+                "optional_tests": optional_tests,
+                "default_specimen": default_specimen,
+                "config_submitted": config_submitted,
+                "is_configured": is_configured,
+                "missing_fields": missing_fields
+            }
+            configurations.append(config_entry)
+
+            # Track onboarding status
+            if is_configured:
+                clinics_configured.append({
+                    "clinic": clinic_name,
+                    "program": program
+                })
+            elif config_submitted:
+                # Config was submitted but missing required fields
+                missing_configurations.append({
+                    "clinic": clinic_name,
+                    "program": program,
+                    "missing": missing_fields
+                })
+            else:
+                # No config submitted yet - request is pending
+                config_requests_pending.append({
+                    "clinic": clinic_name,
+                    "program": program
+                })
 
         # =====================================================================
-        # QUERY 5: PROVIDERS
+        # QUERY 4: PROVIDERS (SIMPLIFIED)
         # =====================================================================
-        # Get all active providers. Providers are linked to locations, so we
-        # need to join through locations to get clinic and program info.
         cursor.execute("""
             SELECT
                 prov.name as name,
                 prov.npi,
                 p.prefix as program,
-                c.name as clinic,
-                l.name as location,
-                prov.specialty
+                c.name as clinic
             FROM providers prov
             JOIN locations l ON prov.location_id = l.location_id
             JOIN clinics c ON l.clinic_id = c.clinic_id
@@ -7702,10 +7728,8 @@ def generate_dashboard_data(
         providers = [dict(row) for row in cursor.fetchall()]
 
         # =====================================================================
-        # QUERY 6: AUDIT TRAIL (CONDITIONAL)
+        # QUERY 5: AUDIT TRAIL (CONDITIONAL)
         # =====================================================================
-        # Only query audit history if show_audit_trail is True.
-        # Limits to the specified number of days and max 500 records.
         audit_trail = []
         if show_audit_trail:
             cursor.execute("""
@@ -7726,39 +7750,34 @@ def generate_dashboard_data(
         # =====================================================================
         # CALCULATE SUMMARY STATISTICS
         # =====================================================================
-        # Aggregate metrics for the dashboard summary cards
         total_users = len(users)
         active_users = len([u for u in users if u.get('status') == 'Active'])
-
-        # Training compliance: count users with at least one 'Current' training
-        # and divide by total users
-        users_with_current_training = set()
-        for t in training:
-            if t.get('status') == 'Current':
-                users_with_current_training.add(t.get('email'))
-        training_compliant = len(users_with_current_training)
-        training_compliance_pct = round(
-            (training_compliant / total_users * 100) if total_users > 0 else 0,
-            1
-        )
-
-        # Count unique clinics and total providers
-        total_clinics = len(set(u.get('clinic') for u in users if u.get('clinic')))
-        total_providers = len(providers)
+        total_clinics = len(configurations)
+        num_configured = len(clinics_configured)
+        num_pending = len(config_requests_pending)
+        num_missing = len(missing_configurations)
 
         summary = {
             "total_users": total_users,
             "active_users": active_users,
-            "training_compliant": training_compliant,
-            "training_compliance_pct": training_compliance_pct,
             "total_clinics": total_clinics,
-            "total_providers": total_providers
+            "clinics_configured": num_configured,
+            "config_requests_pending": num_pending,
+            "clinics_missing_configs": num_missing
+        }
+
+        # =====================================================================
+        # BUILD ONBOARDING STATUS
+        # =====================================================================
+        onboarding_status = {
+            "clinics_configured": clinics_configured,
+            "config_requests_pending": config_requests_pending,
+            "missing_configurations": missing_configurations
         }
 
         # =====================================================================
         # BUILD OUTPUT STRUCTURE
         # =====================================================================
-        # Assemble the final JSON structure matching the dashboard's expected format
         generated_at = datetime.now().isoformat() + "Z"
 
         output = {
@@ -7767,23 +7786,21 @@ def generate_dashboard_data(
             "summary": summary,
             "programs": programs,
             "users": users,
-            "training": training,
             "configurations": configurations,
             "providers": providers,
+            "onboarding_status": onboarding_status,
             "audit_trail": audit_trail
         }
 
         # =====================================================================
         # WRITE JSON FILE
         # =====================================================================
-        # Write with indent=2 for human-readable output
         with open(output_path, 'w') as f:
             json.dump(output, f, indent=2, default=str)
 
         # =====================================================================
         # LOG AUDIT ENTRY
         # =====================================================================
-        # Record that dashboard data was generated
         cursor.execute("""
             INSERT INTO audit_history (
                 record_type, record_id, action,
@@ -7797,14 +7814,14 @@ def generate_dashboard_data(
             json.dumps(summary),
             "MCP:generate_dashboard_data",
             generated_at,
-            f"Users: {total_users}, Clinics: {total_clinics}, Providers: {total_providers}"
+            f"Users: {total_users}, Clinics: {total_clinics}, Configured: {num_configured}"
         ))
         conn.commit()
 
         # =====================================================================
         # BUILD RETURN MESSAGE
         # =====================================================================
-        audit_status = f"Included ({len(audit_trail)} entries, last {days_of_audit} days)" if show_audit_trail else "Excluded (set show_audit_trail=True to include)"
+        audit_status = f"Included ({len(audit_trail)} entries)" if show_audit_trail else "Excluded"
 
         return f"""Dashboard data generated successfully!
 
@@ -7813,17 +7830,19 @@ Generated: {generated_at}
 
 Summary:
   Users: {total_users} ({active_users} active)
-  Training Compliance: {training_compliance_pct}%
-  Clinics: {total_clinics}
-  Providers: {total_providers}
+  Clinics: {total_clinics} total
+    - Configured: {num_configured}
+    - Pending: {num_pending}
+    - Missing configs: {num_missing}
+  Providers: {len(providers)}
   Audit Trail: {audit_status}
 
 Data sections:
   - programs: {len(programs)} programs
   - users: {len(users)} user access records
-  - training: {len(training)} training records
-  - configurations: {len(configurations)} config values
+  - configurations: {len(configurations)} clinic configs
   - providers: {len(providers)} providers
+  - onboarding_status: tracked
   - audit_trail: {len(audit_trail)} entries
 
 Next steps:
@@ -7839,7 +7858,6 @@ Next steps:
         return f"Error generating dashboard data: {str(e)}"
 
     finally:
-        # Always close the database connection
         conn.close()
 
 
