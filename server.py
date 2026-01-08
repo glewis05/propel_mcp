@@ -31,9 +31,11 @@ DASHBOARD DATA GENERATION:
 import os
 import sys
 import csv
+import logging
 import importlib.util
 from datetime import datetime, date, timedelta
 from typing import Optional
+from logging.handlers import RotatingFileHandler
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -41,6 +43,60 @@ from openpyxl.utils import get_column_letter
 
 # MCP library
 from mcp.server.fastmcp import FastMCP
+
+# ============================================================
+# LOGGING CONFIGURATION
+# ============================================================
+# Structured logging for audit trail and debugging.
+# Logs are written to a rotating file (max 5MB, 3 backups) for compliance.
+#
+# Log levels used:
+#   - INFO: Successful operations, tool invocations
+#   - WARNING: Non-critical issues, missing optional data
+#   - ERROR: Failed operations, exceptions
+#   - DEBUG: Detailed execution info (disabled by default)
+
+LOG_DIR = os.environ.get("PROPEL_LOG_DIR", os.path.expanduser("~/projects/logs"))
+LOG_FILE = os.path.join(LOG_DIR, "propel_mcp.log")
+LOG_LEVEL = os.environ.get("PROPEL_LOG_LEVEL", "INFO").upper()
+
+# Ensure log directory exists
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Create logger
+logger = logging.getLogger("propel_mcp")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+# Prevent duplicate handlers if module reloaded
+if not logger.handlers:
+    # File handler with rotation (5MB max, keep 3 backups)
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,  # 5MB
+        backupCount=3,
+        encoding="utf-8"
+    )
+    file_handler.setLevel(logging.DEBUG)
+
+    # Console handler for errors only (doesn't clutter MCP output)
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.ERROR)
+
+    # Format: timestamp | level | message
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+logger.info("=" * 60)
+logger.info("Propel MCP Server starting")
+logger.info(f"Log file: {LOG_FILE}")
+logger.info(f"Log level: {LOG_LEVEL}")
 
 # Import from configurations_toolkit (installed as editable package)
 from configurations_toolkit import (
@@ -201,6 +257,7 @@ def hello_propel() -> str:
     """
     Test function to verify MCP server is working.
     """
+    logger.info("hello_propel() called - connection test")
     return "Hello from Propel Health MCP Server! Connection successful."
 
 
@@ -225,6 +282,7 @@ def list_users(
     Returns:
         Formatted list of users with their status and access count
     """
+    logger.info(f"list_users() called - program={program}, status={status}, clinic={clinic}")
     manager = None
     try:
         manager = get_access_manager()
@@ -379,6 +437,7 @@ def list_users(
             return result
 
     except Exception as e:
+        logger.error(f"list_users() failed: {str(e)}", exc_info=True)
         return f"Error listing users: {str(e)}"
     finally:
         if manager:
@@ -2641,6 +2700,8 @@ def create_story(
         - Parses user_story to extract role if not provided
         - Audit logging for FDA 21 CFR Part 11 compliance
     """
+    logger.info(f"create_story() called - program={program_prefix}, category={category}, title={title[:50]}...")
+
     # Import here to keep dependency local (matches pattern in other tools)
     import sqlite3
     import re
@@ -2867,6 +2928,7 @@ Next Steps:
         # Explicit rollback for compliance audit trail clarity
         if conn:
             conn.rollback()
+        logger.error(f"create_story() failed: {str(e)}", exc_info=True)
         return f"Error creating story: {str(e)}"
 
     finally:
@@ -7590,6 +7652,8 @@ def generate_dashboard_data(
     Returns:
         Confirmation message with file path and summary stats
     """
+    logger.info(f"generate_dashboard_data() called - audit={show_audit_trail}, days={days_of_audit}")
+
     import json
     import sqlite3
 
@@ -7913,6 +7977,7 @@ Next steps:
         return f"Database error: {str(e)}\n\nMake sure the database exists at: {DB_PATH}"
 
     except Exception as e:
+        logger.error(f"generate_dashboard_data() failed: {str(e)}", exc_info=True)
         return f"Error generating dashboard data: {str(e)}"
 
     finally:
