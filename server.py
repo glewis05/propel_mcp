@@ -17,6 +17,12 @@ REQUIREMENTS TOOLKIT:
 - User Stories: list_stories, get_story, create_story, update_story, get_approval_pipeline
 - Test Cases: list_test_cases, get_test_summary, create_test_case, update_test_result
 - Reporting: get_program_health, get_client_tree, search_stories, get_coverage_gaps
+
+ONBOARDING FORM TOOLKIT:
+- Question Management: list_form_questions, add_form_question, update_form_question, remove_form_question, reorder_form_questions
+
+DASHBOARD DATA GENERATION:
+- generate_dashboard_data: Generate JSON for clinic configuration dashboard (GitHub Pages)
 """
 
 # ============================================================
@@ -101,6 +107,75 @@ NOTION_DASHBOARD_PAGE_ID = "2dab5d1d-1631-81bb-8eeb-c4f4397de747"
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
+
+
+def validate_choice(value: str, valid_options: list, field_name: str, descriptions: dict = None) -> Optional[str]:
+    """
+    Validate that a value is one of the valid options.
+
+    Args:
+        value: The value to validate
+        valid_options: List of valid option values
+        field_name: Name of the field for error message
+        descriptions: Optional dict mapping option values to descriptions
+
+    Returns:
+        Error message string if invalid, None if valid
+    """
+    if value not in valid_options:
+        error = f"Invalid {field_name}: '{value}'\n\nValid {field_name}s:\n"
+        for opt in valid_options:
+            desc = descriptions.get(opt, "") if descriptions else ""
+            if desc:
+                error += f"  • {opt} - {desc}\n"
+            else:
+                error += f"  • {opt}\n"
+        return error.rstrip()
+    return None
+
+
+def validate_optional_choice(value: Optional[str], valid_options: list, field_name: str,
+                             descriptions: dict = None) -> Optional[str]:
+    """
+    Validate an optional field - only validates if value is not None.
+
+    Returns:
+        Error message string if invalid, None if valid or not provided
+    """
+    if value is None:
+        return None
+    return validate_choice(value, valid_options, field_name, descriptions)
+
+
+def log_audit(cursor, record_type: str, record_id: str, action: str,
+              field_changed: str, old_value, new_value, changed_by: str,
+              changed_date: str, change_reason: str) -> None:
+    """
+    Insert an audit history record.
+
+    Args:
+        cursor: Database cursor
+        record_type: Type of record (client, story, test, etc.)
+        record_id: ID of the record being audited
+        action: Action performed (Created, Updated, Deleted)
+        field_changed: Name of field changed or record type for creates
+        old_value: Previous value (None for creates)
+        new_value: New value (usually JSON for creates/deletes)
+        changed_by: Who made the change (e.g., 'MCP:tool_name')
+        changed_date: Timestamp of the change
+        change_reason: Description of why the change was made
+    """
+    cursor.execute(
+        """
+        INSERT INTO audit_history (
+            record_type, record_id, action, field_changed,
+            old_value, new_value, changed_by, changed_date, change_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (record_type, record_id, action, field_changed, old_value,
+         new_value, changed_by, changed_date, change_reason)
+    )
+
 
 def get_access_manager() -> AccessManager:
     """Create AccessManager instance with configured DB path."""
@@ -1325,6 +1400,314 @@ def get_program_by_prefix(prefix: str) -> str:
 
 
 @mcp.tool()
+def create_client(
+    client_name: str,
+    status: str = "Active",
+    short_name: Optional[str] = None,
+    client_type: Optional[str] = None,
+    description: Optional[str] = None,
+    primary_contact_name: Optional[str] = None,
+    primary_contact_email: Optional[str] = None,
+    primary_contact_phone: Optional[str] = None,
+    contract_reference: Optional[str] = None,
+    contract_start_date: Optional[str] = None,
+    contract_end_date: Optional[str] = None,
+    source_document: Optional[str] = None
+) -> str:
+    """
+    Create a new client organization in the requirements database.
+
+    PURPOSE:
+        Creates a top-level client record. Clients are the root of the hierarchy:
+        Client → Program → Story → Test Case. Each client can have multiple
+        programs, and all requirements traceability flows from the client.
+
+    R EQUIVALENT:
+        Like adding a row to a clients data.frame, with auto-generated UUID
+        and schema validation. Similar to tibble::add_row() with constraints.
+
+    Args:
+        client_name: Full client name (e.g., "Providence Health & Services", "Propel Health")
+        status: "Active" or "Inactive" (default: "Active")
+        short_name: Abbreviated name for display (e.g., "Providence", "Propel")
+        client_type: "External" (customer) or "Internal" (Propel Health internal)
+        description: Description of the client or relationship
+        primary_contact_name: Main point of contact
+        primary_contact_email: Contact email
+        primary_contact_phone: Contact phone
+        contract_reference: Contract or agreement reference (e.g., "Providence PSA 2026")
+        contract_start_date: Contract start date (YYYY-MM-DD format)
+        contract_end_date: Contract end date (YYYY-MM-DD format)
+        source_document: Source document for requirements (e.g., "Exhibit E - KPIs")
+
+    Returns:
+        Confirmation with client_id, name, and next steps
+
+    WHY THIS APPROACH:
+        - Case-insensitive uniqueness check prevents duplicate clients
+        - UUID generation ensures globally unique identifiers
+        - Self-healing schema: adds missing columns if they don't exist
+        - Comprehensive audit logging for Part 11 compliance
+        - Stores all metadata needed for contract and contact tracking
+
+    Example (minimal - internal):
+        create_client(
+            client_name="Propel Health",
+            client_type="Internal",
+            description="Platform-wide features and internal capabilities"
+        )
+
+    Example (full - external customer):
+        create_client(
+            client_name="Providence Health & Services",
+            short_name="Providence",
+            client_type="External",
+            description="Health system partner - breast cancer prevention programs",
+            primary_contact_name="Kim Smith",
+            primary_contact_email="kim.smith@providence.org",
+            contract_reference="Providence PSA 2026",
+            contract_start_date="2026-01-01",
+            contract_end_date="2026-12-31",
+            source_document="Exhibit E - Key Performance Indicators"
+        )
+    """
+    import sqlite3
+    import uuid
+    import json
+    import re
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Validate status
+        # ----------------------------------------------------------------
+        status_descriptions = {
+            "Active": "Client is currently active",
+            "Inactive": "Client relationship is paused or ended"
+        }
+        if error := validate_choice(status, list(status_descriptions.keys()), "status", status_descriptions):
+            return error
+
+        # ----------------------------------------------------------------
+        # STEP 2: Validate client_type if provided
+        # ----------------------------------------------------------------
+        client_type_descriptions = {
+            "External": "Customer organization",
+            "Internal": "Propel Health internal project"
+        }
+        if error := validate_optional_choice(client_type, list(client_type_descriptions.keys()),
+                                              "client_type", client_type_descriptions):
+            return error
+
+        # ----------------------------------------------------------------
+        # STEP 3: Validate date formats if provided
+        # ----------------------------------------------------------------
+        date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+        if contract_start_date is not None:
+            if not date_pattern.match(contract_start_date):
+                return (
+                    f"Invalid contract_start_date format: '{contract_start_date}'\n\n"
+                    f"Please use YYYY-MM-DD format (e.g., '2026-01-01')"
+                )
+
+        if contract_end_date is not None:
+            if not date_pattern.match(contract_end_date):
+                return (
+                    f"Invalid contract_end_date format: '{contract_end_date}'\n\n"
+                    f"Please use YYYY-MM-DD format (e.g., '2026-12-31')"
+                )
+
+        # ----------------------------------------------------------------
+        # STEP 4: Validate email format if provided
+        # ----------------------------------------------------------------
+        if primary_contact_email is not None:
+            email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+            if not email_pattern.match(primary_contact_email):
+                return (
+                    f"Invalid email format: '{primary_contact_email}'\n\n"
+                    f"Please provide a valid email address."
+                )
+
+        # ----------------------------------------------------------------
+        # STEP 5: Connect to database
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # ----------------------------------------------------------------
+        # STEP 6: Self-healing schema - add missing columns if needed
+        # This ensures the tool works even if the schema hasn't been updated
+        # ----------------------------------------------------------------
+        additional_columns = [
+            ("short_name", "TEXT"),
+            ("client_type", "TEXT"),
+            ("primary_contact_name", "TEXT"),
+            ("primary_contact_email", "TEXT"),
+            ("primary_contact_phone", "TEXT"),
+            ("contract_reference", "TEXT"),
+            ("contract_start_date", "TEXT"),
+            ("contract_end_date", "TEXT"),
+            ("source_document", "TEXT")
+        ]
+
+        # Get existing columns
+        cursor.execute("PRAGMA table_info(clients)")
+        existing_columns = {row['name'] for row in cursor.fetchall()}
+
+        # Add missing columns
+        for col_name, col_type in additional_columns:
+            if col_name not in existing_columns:
+                cursor.execute(f"ALTER TABLE clients ADD COLUMN {col_name} {col_type}")
+
+        # ----------------------------------------------------------------
+        # STEP 7: Check for duplicate client name (case-insensitive)
+        # ----------------------------------------------------------------
+        cursor.execute(
+            "SELECT client_id, name FROM clients WHERE LOWER(name) = LOWER(?)",
+            (client_name,)
+        )
+        existing = cursor.fetchone()
+
+        if existing:
+            return (
+                f"Client already exists: '{existing['name']}'\n\n"
+                f"Client ID: {existing['client_id']}\n\n"
+                f"If you need to update this client, use update_client() instead.\n"
+                f"If this is a different client, please use a unique name."
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 8: Generate client_id and prepare data
+        # ----------------------------------------------------------------
+        client_id = str(uuid.uuid4())
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # ----------------------------------------------------------------
+        # STEP 9: Insert the client record
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            INSERT INTO clients (
+                client_id, name, short_name, client_type, description, status,
+                primary_contact_name, primary_contact_email, primary_contact_phone,
+                contract_reference, contract_start_date, contract_end_date,
+                source_document, created_date, updated_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                client_id,
+                client_name,
+                short_name,
+                client_type,
+                description,
+                status,
+                primary_contact_name,
+                primary_contact_email,
+                primary_contact_phone,
+                contract_reference,
+                contract_start_date,
+                contract_end_date,
+                source_document,
+                now,
+                now
+            )
+        )
+
+        # ----------------------------------------------------------------
+        # STEP 10: Log to audit_history for Part 11 compliance
+        # ----------------------------------------------------------------
+        # Create a JSON snapshot of all provided values for the audit trail
+        audit_data = {
+            'client_id': client_id,
+            'name': client_name,
+            'short_name': short_name,
+            'client_type': client_type,
+            'description': description,
+            'status': status,
+            'primary_contact_name': primary_contact_name,
+            'primary_contact_email': primary_contact_email,
+            'primary_contact_phone': primary_contact_phone,
+            'contract_reference': contract_reference,
+            'contract_start_date': contract_start_date,
+            'contract_end_date': contract_end_date,
+            'source_document': source_document
+        }
+        # Remove None values for cleaner audit log
+        audit_data = {k: v for k, v in audit_data.items() if v is not None}
+
+        log_audit(
+            cursor,
+            record_type='client',
+            record_id=client_id,
+            action='Created',
+            field_changed='client',
+            old_value=None,
+            new_value=json.dumps(audit_data),
+            changed_by='MCP:create_client',
+            changed_date=now,
+            change_reason=f'New client created: {client_name}'
+        )
+
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 11: Build success response
+        # ----------------------------------------------------------------
+        display_name = short_name or client_name
+        result = f"""Client created successfully!
+
+Client Details:
+  Client ID: {client_id}
+  Name: {client_name}
+"""
+        if short_name:
+            result += f"  Short Name: {short_name}\n"
+        if client_type:
+            result += f"  Type: {client_type}\n"
+        result += f"  Status: {status}\n"
+        if description:
+            result += f"  Description: {description[:80]}{'...' if len(description) > 80 else ''}\n"
+
+        if primary_contact_name or primary_contact_email:
+            result += "\nContact Information:\n"
+            if primary_contact_name:
+                result += f"  Contact: {primary_contact_name}\n"
+            if primary_contact_email:
+                result += f"  Email: {primary_contact_email}\n"
+            if primary_contact_phone:
+                result += f"  Phone: {primary_contact_phone}\n"
+
+        if contract_reference or contract_start_date:
+            result += "\nContract Information:\n"
+            if contract_reference:
+                result += f"  Reference: {contract_reference}\n"
+            if contract_start_date:
+                result += f"  Start Date: {contract_start_date}\n"
+            if contract_end_date:
+                result += f"  End Date: {contract_end_date}\n"
+            if source_document:
+                result += f"  Source Document: {source_document}\n"
+
+        result += f"""
+Created At: {now}
+
+Next Steps:
+  • create_program(client_name="{display_name}", prefix="XXX", program_name="...") - Add a program
+  • get_client_tree() - View client/program hierarchy
+"""
+        return result
+
+    except Exception as e:
+        return f"Error creating client: {str(e)}"
+
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
 def create_program(
     client_name: str,
     prefix: str,
@@ -2282,16 +2665,14 @@ def create_story(
         # ----------------------------------------------------------------
         # STEP 2: Validate priority is a valid MoSCoW value
         # ----------------------------------------------------------------
-        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have"]
-        if priority not in valid_priorities:
-            return (
-                f"Invalid priority: '{priority}'\n\n"
-                f"Priority must be one of (MoSCoW):\n"
-                f"  • Must Have - Critical requirement\n"
-                f"  • Should Have - Important but not critical\n"
-                f"  • Could Have - Nice to have\n"
-                f"  • Won't Have - Out of scope for now"
-            )
+        priority_descriptions = {
+            "Must Have": "Critical requirement",
+            "Should Have": "Important but not critical",
+            "Could Have": "Nice to have",
+            "Won't Have": "Out of scope for now"
+        }
+        if error := validate_choice(priority, list(priority_descriptions.keys()), "priority", priority_descriptions):
+            return error
 
         # ----------------------------------------------------------------
         # STEP 3: Connect to requirements database
@@ -3422,6 +3803,541 @@ Next Steps:
 
     except Exception as e:
         return f"Error updating test result: {str(e)}"
+
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def delete_test_case(
+    test_id: str,
+    reason: str
+) -> str:
+    """
+    Delete a test case from the database with full audit trail.
+
+    PURPOSE:
+        Permanently removes a test case that is no longer needed (out of scope,
+        duplicate, or superseded). The full test case data is captured in the
+        audit trail before deletion for compliance.
+
+    R EQUIVALENT:
+        Like dplyr::filter(!test_id == id) but with audit logging and
+        validation. The deleted record is preserved in audit_history.
+
+    Args:
+        test_id: Test case ID to delete (e.g., "P4M-CONFIG-001-TC02")
+        reason: Reason for deletion - recorded in audit trail for compliance
+
+    Returns:
+        Confirmation with deleted test_id, parent story, and timestamp
+
+    WHY THIS APPROACH:
+        - Hard delete (not soft delete) since test cases can be recreated if needed
+        - Full record snapshot captured in audit_history before deletion
+        - Reason field ensures audit trail explains why the deletion occurred
+        - Part 11 compliant audit trail
+
+    Example:
+        delete_test_case(
+            test_id="P4M-CONFIG-001-TC02",
+            reason="Out of scope - patient assessment moved to future story"
+        )
+    """
+    import sqlite3
+    import json
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Connect to database and fetch existing test case
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT t.*, s.title as story_title, p.name as program_name, p.prefix
+            FROM uat_test_cases t
+            JOIN user_stories s ON t.story_id = s.story_id
+            JOIN programs p ON t.program_id = p.program_id
+            WHERE t.test_id = ?
+            """,
+            (test_id,)
+        )
+        existing = cursor.fetchone()
+
+        if not existing:
+            # Test not found - provide helpful suggestions
+            parts = test_id.split('-')
+            if len(parts) >= 3:
+                # Try to find similar test cases
+                story_prefix = '-'.join(parts[:-1])  # e.g., "P4M-CONFIG-001" from "P4M-CONFIG-001-TC02"
+                cursor.execute(
+                    "SELECT test_id, title FROM uat_test_cases WHERE test_id LIKE ? ORDER BY test_id LIMIT 5",
+                    (f"{story_prefix}-%",)
+                )
+                similar = cursor.fetchall()
+                if similar:
+                    similar_list = "\n".join(f"  • {t['test_id']}: {t['title'][:40]}" for t in similar)
+                    return (
+                        f"Test case not found: '{test_id}'\n\n"
+                        f"Test cases for {story_prefix}:\n{similar_list}"
+                    )
+
+            return f"Test case not found: '{test_id}'"
+
+        # Convert to dict for easier access and JSON serialization
+        test_data = dict(existing)
+        story_id = test_data['story_id']
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # ----------------------------------------------------------------
+        # STEP 2: Prepare audit record with full test case data
+        # Remove non-serializable or redundant joined fields
+        # ----------------------------------------------------------------
+        audit_record = {
+            'test_id': test_data.get('test_id'),
+            'story_id': test_data.get('story_id'),
+            'program_id': test_data.get('program_id'),
+            'title': test_data.get('title'),
+            'test_type': test_data.get('test_type'),
+            'prerequisites': test_data.get('prerequisites'),
+            'test_steps': test_data.get('test_steps'),
+            'expected_results': test_data.get('expected_results'),
+            'priority': test_data.get('priority'),
+            'compliance_framework': test_data.get('compliance_framework'),
+            'test_status': test_data.get('test_status'),
+            'tested_by': test_data.get('tested_by'),
+            'tested_date': test_data.get('tested_date'),
+            'execution_notes': test_data.get('execution_notes'),
+            'defect_id': test_data.get('defect_id'),
+            'created_date': test_data.get('created_date'),
+            'updated_date': test_data.get('updated_date')
+        }
+
+        # ----------------------------------------------------------------
+        # STEP 3: Log deletion to audit_history BEFORE deleting
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                'test_case',                    # record_type
+                test_id,                        # record_id
+                'Deleted',                      # action
+                'record',                       # field_changed
+                json.dumps(audit_record),       # old_value (full record)
+                None,                           # new_value (null for delete)
+                'MCP:delete_test_case',         # changed_by
+                now,                            # changed_date
+                reason                          # change_reason
+            )
+        )
+
+        # ----------------------------------------------------------------
+        # STEP 4: Delete the test case
+        # ----------------------------------------------------------------
+        cursor.execute(
+            "DELETE FROM uat_test_cases WHERE test_id = ?",
+            (test_id,)
+        )
+
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 5: Build success response
+        # ----------------------------------------------------------------
+        result = f"""Test case deleted successfully!
+
+Deleted Test Case:
+  Test ID: {test_id}
+  Title: {test_data['title']}
+  Parent Story: {story_id} - {test_data['story_title'][:40]}
+  Program: {test_data['program_name']} [{test_data['prefix']}]
+  Previous Status: {test_data.get('test_status', 'Not Run')}
+
+Deletion Details:
+  Reason: {reason}
+  Deleted At: {now}
+  Deleted By: MCP:delete_test_case
+
+Audit Trail:
+  Full test case record has been preserved in audit_history.
+  The deletion is traceable for compliance purposes.
+
+Next Steps:
+  • list_test_cases(story_id="{story_id}") - View remaining test cases
+  • create_test_case(...) - Create a replacement test case if needed
+"""
+        return result
+
+    except Exception as e:
+        return f"Error deleting test case: {str(e)}"
+
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def update_test_case(
+    test_id: str,
+    title: Optional[str] = None,
+    test_type: Optional[str] = None,
+    test_steps: Optional[str] = None,
+    expected_result: Optional[str] = None,
+    preconditions: Optional[str] = None,
+    priority: Optional[str] = None,
+    compliance_framework: Optional[str] = None,
+    story_id: Optional[str] = None,
+    change_reason: Optional[str] = None
+) -> str:
+    """
+    Update test case content (NOT execution results — use update_test_result for that).
+
+    PURPOSE:
+        Modifies test case definition: title, steps, expected results, etc.
+        Only provided fields are updated (sparse update pattern).
+        Each change is logged to the audit trail for compliance.
+
+    R EQUIVALENT:
+        Like dplyr::mutate() on a single row with coalesce() for optional fields.
+        Only non-NULL parameters trigger updates.
+
+    Args:
+        test_id: Test case ID to update (e.g., "P4M-CONFIG-001-TC05")
+        title: Updated test case title (optional)
+        test_type: Type of test - "happy_path", "negative", "validation", "edge_case" (optional)
+        test_steps: Updated test steps (optional)
+        expected_result: Updated expected result (optional)
+        preconditions: Updated preconditions/prerequisites (optional)
+        priority: MoSCoW priority - "Must Have", "Should Have", "Could Have", "Won't Have" (optional)
+        compliance_framework: "Part11", "HIPAA", "SOC2", or None (optional)
+        story_id: Reassign to different parent story (must be same program) (optional)
+        change_reason: Why this change was made - recorded in audit trail (optional)
+
+    Returns:
+        Confirmation with list of updated fields showing old → new values
+
+    WHY THIS APPROACH:
+        - Sparse update: Only updates fields that are explicitly provided
+        - Distinguishes from update_test_result which records EXECUTION outcomes
+        - This tool is for changing WHAT the test does, not HOW it performed
+        - Cross-program reassignment is blocked to maintain data integrity
+        - Per-field audit logging for Part 11 compliance
+
+    Example:
+        update_test_case(
+            test_id="P4M-CONFIG-001-TC05",
+            title="TC Enabled Clinic Clinical Summary Functions Correctly",
+            expected_result="Clinical summary generates with TC score, lifetime risk %, TC recommendations",
+            change_reason="Narrowed scope to clinical summary only per story update"
+        )
+    """
+    import sqlite3
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Validate test_type if provided
+        # ----------------------------------------------------------------
+        valid_test_types = ["happy_path", "negative", "validation", "edge_case"]
+        if test_type is not None:
+            test_type_lower = test_type.lower().strip()
+            if test_type_lower not in valid_test_types:
+                type_list = "\n".join(f"  • {t}" for t in valid_test_types)
+                return (
+                    f"Invalid test_type: '{test_type}'\n\n"
+                    f"Valid test types:\n{type_list}\n\n"
+                    f"Descriptions:\n"
+                    f"  • happy_path - Normal successful scenario\n"
+                    f"  • negative - Error handling, invalid inputs\n"
+                    f"  • validation - Input/data validation rules\n"
+                    f"  • edge_case - Boundary conditions, unusual scenarios"
+                )
+            test_type = test_type_lower  # Normalize to lowercase
+
+        # ----------------------------------------------------------------
+        # STEP 2: Validate priority if provided
+        # ----------------------------------------------------------------
+        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have"]
+        if priority is not None and priority not in valid_priorities:
+            return (
+                f"Invalid priority: '{priority}'\n\n"
+                f"Priority must be one of (MoSCoW):\n"
+                f"  • Must Have - Critical test\n"
+                f"  • Should Have - Important but not critical\n"
+                f"  • Could Have - Nice to have\n"
+                f"  • Won't Have - Out of scope for now"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 3: Validate compliance_framework if provided
+        # ----------------------------------------------------------------
+        valid_frameworks = ["Part11", "HIPAA", "SOC2"]
+        if compliance_framework is not None:
+            # Normalize common variations
+            framework_normalized = compliance_framework.strip()
+            framework_upper = framework_normalized.upper().replace(" ", "").replace("-", "")
+
+            # Map common variations to standard names
+            framework_map = {
+                "PART11": "Part11",
+                "21CFRPART11": "Part11",
+                "CFR11": "Part11",
+                "HIPAA": "HIPAA",
+                "SOC2": "SOC2",
+                "SOCII": "SOC2",
+                "SOC": "SOC2",
+                "NONE": None  # Allow clearing the framework
+            }
+
+            if framework_upper in framework_map:
+                compliance_framework = framework_map[framework_upper]
+            elif framework_normalized not in valid_frameworks:
+                return (
+                    f"Invalid compliance_framework: '{compliance_framework}'\n\n"
+                    f"Valid frameworks:\n"
+                    f"  • Part11 - FDA 21 CFR Part 11\n"
+                    f"  • HIPAA - Health Insurance Portability and Accountability\n"
+                    f"  • SOC2 - Service Organization Control 2\n"
+                    f"  • None - No compliance requirement (or use 'NONE' to clear)"
+                )
+
+        # ----------------------------------------------------------------
+        # STEP 4: Connect to database and fetch existing test case
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT t.*, s.title as story_title, p.name as program_name, p.prefix, p.program_id as parent_program_id
+            FROM uat_test_cases t
+            JOIN user_stories s ON t.story_id = s.story_id
+            JOIN programs p ON t.program_id = p.program_id
+            WHERE t.test_id = ?
+            """,
+            (test_id,)
+        )
+        existing = cursor.fetchone()
+
+        if not existing:
+            # Test not found - provide helpful suggestions
+            parts = test_id.split('-')
+            if len(parts) >= 3:
+                story_prefix = '-'.join(parts[:-1])
+                cursor.execute(
+                    "SELECT test_id, title FROM uat_test_cases WHERE test_id LIKE ? ORDER BY test_id LIMIT 5",
+                    (f"{story_prefix}-%",)
+                )
+                similar = cursor.fetchall()
+                if similar:
+                    similar_list = "\n".join(f"  • {t['test_id']}: {t['title'][:40]}" for t in similar)
+                    return (
+                        f"Test case not found: '{test_id}'\n\n"
+                        f"Test cases for {story_prefix}:\n{similar_list}"
+                    )
+
+            return f"Test case not found: '{test_id}'"
+
+        # Convert to dict for easier access
+        old_test = dict(existing)
+        current_program_id = old_test['program_id']
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # ----------------------------------------------------------------
+        # STEP 5: Validate story_id reassignment if provided
+        # ----------------------------------------------------------------
+        new_program_id = None
+        if story_id is not None:
+            # Validate new story exists
+            cursor.execute(
+                """
+                SELECT s.story_id, s.title, s.program_id, p.prefix
+                FROM user_stories s
+                JOIN programs p ON s.program_id = p.program_id
+                WHERE s.story_id = ?
+                """,
+                (story_id,)
+            )
+            new_story = cursor.fetchone()
+
+            if not new_story:
+                return (
+                    f"New parent story not found: '{story_id}'\n\n"
+                    f"Please verify the story_id exists before reassigning."
+                )
+
+            new_program_id = new_story['program_id']
+
+            # Cross-program check: parse program prefix from test_id
+            # Test ID format: {STORY_ID}-TC{NN} where STORY_ID = {PREFIX}-{CATEGORY}-{NUM}
+            # e.g., "P4M-CONFIG-001-TC02" -> program prefix is "P4M"
+            test_parts = test_id.split('-')
+            if len(test_parts) >= 1:
+                test_program_prefix = test_parts[0]
+                new_story_prefix = new_story['prefix']
+
+                if test_program_prefix.upper() != new_story_prefix.upper():
+                    return (
+                        f"Cross-program reassignment not allowed!\n\n"
+                        f"Test case {test_id} belongs to program '{test_program_prefix}'\n"
+                        f"but the new story {story_id} belongs to program '{new_story_prefix}'.\n\n"
+                        f"Test cases cannot be moved between programs.\n"
+                        f"If needed, delete this test case and create a new one in the target program."
+                    )
+
+        # ----------------------------------------------------------------
+        # STEP 6: Build update fields and track changes
+        # Only include fields that were provided (not None)
+        # ----------------------------------------------------------------
+        updates = {}
+        changes = []  # List of (field_name, old_value, new_value) for audit
+
+        # Check each optional field
+        if title is not None and title != old_test.get('title'):
+            updates['title'] = title
+            changes.append(('title', old_test.get('title'), title))
+
+        if test_type is not None and test_type != old_test.get('test_type'):
+            updates['test_type'] = test_type
+            changes.append(('test_type', old_test.get('test_type'), test_type))
+
+        if test_steps is not None and test_steps != old_test.get('test_steps'):
+            updates['test_steps'] = test_steps
+            changes.append(('test_steps', old_test.get('test_steps'), test_steps))
+
+        if expected_result is not None and expected_result != old_test.get('expected_results'):
+            updates['expected_results'] = expected_result
+            changes.append(('expected_results', old_test.get('expected_results'), expected_result))
+
+        if preconditions is not None and preconditions != old_test.get('prerequisites'):
+            updates['prerequisites'] = preconditions
+            changes.append(('prerequisites', old_test.get('prerequisites'), preconditions))
+
+        if priority is not None and priority != old_test.get('priority'):
+            updates['priority'] = priority
+            changes.append(('priority', old_test.get('priority'), priority))
+
+        if compliance_framework is not None:
+            # Handle clearing framework (set to None) vs updating
+            old_framework = old_test.get('compliance_framework')
+            if compliance_framework != old_framework:
+                updates['compliance_framework'] = compliance_framework
+                changes.append(('compliance_framework', old_framework, compliance_framework))
+
+        if story_id is not None and story_id != old_test.get('story_id'):
+            updates['story_id'] = story_id
+            if new_program_id:
+                updates['program_id'] = new_program_id
+            changes.append(('story_id', old_test.get('story_id'), story_id))
+
+        # ----------------------------------------------------------------
+        # STEP 7: Check if there are any changes to make
+        # ----------------------------------------------------------------
+        if not updates:
+            return (
+                f"No changes to make for {test_id}\n\n"
+                f"All provided values match the current values, or no update fields were provided.\n"
+                f"Current test case:\n"
+                f"  Title: {old_test.get('title')}\n"
+                f"  Test Type: {old_test.get('test_type')}\n"
+                f"  Priority: {old_test.get('priority')}\n"
+                f"  Parent Story: {old_test.get('story_id')}"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 8: Always update updated_date when changes occur
+        # ----------------------------------------------------------------
+        updates['updated_date'] = now
+
+        # ----------------------------------------------------------------
+        # STEP 9: Build and execute UPDATE statement
+        # ----------------------------------------------------------------
+        set_clause = ", ".join(f"{field} = ?" for field in updates.keys())
+        values = list(updates.values()) + [test_id]
+
+        cursor.execute(
+            f"UPDATE uat_test_cases SET {set_clause} WHERE test_id = ?",
+            values
+        )
+
+        # ----------------------------------------------------------------
+        # STEP 10: Log each change to audit_history
+        # ----------------------------------------------------------------
+        audit_reason = change_reason or "Test case updated via MCP"
+
+        for field_name, old_value, new_value in changes:
+            # Truncate long values for audit log readability
+            old_display = str(old_value)[:500] if old_value else None
+            new_display = str(new_value)[:500] if new_value else None
+
+            cursor.execute(
+                """
+                INSERT INTO audit_history (
+                    record_type, record_id, action, field_changed,
+                    old_value, new_value, changed_by, changed_date, change_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    'test_case',
+                    test_id,
+                    'Updated',
+                    field_name,
+                    old_display,
+                    new_display,
+                    'MCP:update_test_case',
+                    now,
+                    audit_reason
+                )
+            )
+
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 11: Build success response
+        # ----------------------------------------------------------------
+        result = f"""Test case updated successfully!
+
+Test Case: {test_id}
+Parent Story: {old_test['story_id']} - {old_test['story_title'][:40]}
+Program: {old_test['program_name']} [{old_test['prefix']}]
+
+Changes made ({len(changes)} field(s)):
+"""
+        for field_name, old_val, new_val in changes:
+            # Format display based on field type
+            if field_name in ('test_steps', 'expected_results', 'prerequisites'):
+                # For long text fields, just show that it was updated
+                result += f"  • {field_name}: (updated)\n"
+            else:
+                old_str = str(old_val)[:40] if old_val else '(none)'
+                new_str = str(new_val)[:40] if new_val else '(none)'
+                result += f"  • {field_name}: '{old_str}' → '{new_str}'\n"
+
+        if change_reason:
+            result += f"\nChange Reason: {change_reason}\n"
+
+        result += f"""
+Updated At: {now}
+
+Next Steps:
+  • list_test_cases(story_id="{updates.get('story_id', old_test['story_id'])}") - View test cases
+  • update_test_result(test_id="{test_id}", ...) - Record execution results
+"""
+        return result
+
+    except Exception as e:
+        return f"Error updating test case: {str(e)}"
 
     finally:
         if conn:
@@ -5958,6 +6874,973 @@ Ticket #: {context['ticket_number']}
         return "Error: docxtpl not installed. Run: pip install docxtpl --break-system-packages"
     except Exception as e:
         return f"Error generating audit memo: {str(e)}"
+
+
+# ============================================================
+# FORM DEFINITION MANAGEMENT TOOLS
+# ============================================================
+# Tools for managing the onboarding form questions in form-definition.json
+
+# Path to form definition file
+FORM_DEF_PATH = os.path.expanduser("~/projects/propel-onboarding-form/src/data/form-definition.json")
+
+
+def _log_form_audit(
+    action: str,
+    entity_type: str,
+    entity_id: str,
+    details: str,
+    old_value: str = None,
+    new_value: str = None
+):
+    """Log form definition changes to audit_history table."""
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO audit_history (
+                timestamp, action, entity_type, entity_id,
+                field_name, old_value, new_value, changed_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now().isoformat(),
+            action,
+            entity_type,
+            entity_id,
+            details,
+            old_value,
+            new_value,
+            "MCP:form_admin"
+        ))
+
+        conn.commit()
+    except Exception as e:
+        print(f"Audit log warning: {e}")
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def list_form_questions(
+    step_id: str = None,
+    show_details: bool = False
+) -> str:
+    """
+    List questions in the onboarding form.
+
+    Args:
+        step_id: Optional step ID to filter (e.g., "clinic_info"). If None, shows all steps.
+        show_details: If True, show full question properties. If False, show summary only.
+
+    Returns:
+        Formatted list of questions organized by step
+
+    Example:
+        list_form_questions()  # All steps, summary view
+        list_form_questions(step_id="lab_config", show_details=True)  # One step, full details
+    """
+    import json
+
+    try:
+        with open(FORM_DEF_PATH, 'r') as f:
+            form_def = json.load(f)
+    except FileNotFoundError:
+        return "Error: form-definition.json not found. Is the repo cloned?"
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON in form-definition.json: {e}"
+
+    output = []
+    output.append(f"Form: {form_def.get('title', 'Unknown')}")
+    output.append(f"Version: {form_def.get('version', 'Unknown')}")
+    output.append("=" * 60)
+
+    for step in form_def.get('steps', []):
+        # Filter by step_id if provided
+        if step_id and step.get('step_id') != step_id:
+            continue
+
+        output.append(f"\nStep {step.get('order', '?')}: {step.get('title', 'Unknown')}")
+        output.append(f"   ID: {step.get('step_id', 'Unknown')}")
+
+        if step.get('repeatable'):
+            output.append(f"   Repeatable (min: {step.get('repeatable_config', {}).get('min_items', 0)}, max: {step.get('repeatable_config', {}).get('max_items', 'unlimited')})")
+
+        if step.get('is_review_step'):
+            output.append("   Review/Download step (no questions)")
+            continue
+
+        questions = step.get('questions', [])
+        output.append(f"   Questions: {len(questions)}")
+
+        for q in questions:
+            req = "*" if q.get('required') else ""
+            q_type = q.get('type', 'unknown')
+
+            if show_details:
+                output.append(f"\n   [{q.get('question_id')}] {q.get('label', 'No label')}{req}")
+                output.append(f"      Type: {q_type}")
+                if q.get('options_ref'):
+                    output.append(f"      Options: ref:{q.get('options_ref')}")
+                if q.get('show_when'):
+                    sw = q.get('show_when')
+                    output.append(f"      Conditional: {sw.get('question_id')} {sw.get('operator')} {sw.get('value')}")
+                if q.get('help_text'):
+                    help_preview = q.get('help_text')[:50] + "..." if len(q.get('help_text', '')) > 50 else q.get('help_text')
+                    output.append(f"      Help: {help_preview}")
+                if q.get('placeholder'):
+                    output.append(f"      Placeholder: {q.get('placeholder')}")
+                if q.get('pattern'):
+                    output.append(f"      Pattern: {q.get('pattern')}")
+            else:
+                output.append(f"   - {q.get('question_id')}: {q.get('label', 'No label')}{req} ({q_type})")
+
+    if step_id and not any(s.get('step_id') == step_id for s in form_def.get('steps', [])):
+        return f"Error: Step '{step_id}' not found. Use list_form_questions() to see available steps."
+
+    return "\n".join(output)
+
+
+@mcp.tool()
+def add_form_question(
+    step_id: str,
+    question_id: str,
+    question_type: str,
+    label: str,
+    required: bool = False,
+    options_ref: str = None,
+    help_text: str = None,
+    placeholder: str = None,
+    pattern: str = None,
+    max_length: int = None,
+    show_when_question: str = None,
+    show_when_operator: str = None,
+    show_when_value: str = None,
+    insert_after: str = None
+) -> str:
+    """
+    Add a new question to a step in the onboarding form.
+
+    Args:
+        step_id: Step to add question to (e.g., "clinic_info", "lab_config")
+        question_id: Unique ID for the question (e.g., "clinic_fax")
+        question_type: Type of question: text, textarea, select, radio, checkbox,
+                       address, contact_group, stakeholder_group, select_with_alternates
+        label: Display label for the question
+        required: Whether the field is required (default: False)
+        options_ref: Reference to options in reference-data.json (for select/radio types)
+        help_text: Help text displayed below the field
+        placeholder: Placeholder text for text inputs
+        pattern: Regex pattern for validation (e.g., "^[0-9]{10}$" for NPI)
+        max_length: Maximum character length for text fields
+        show_when_question: Question ID that controls visibility (conditional field)
+        show_when_operator: Operator for condition: "equals", "in", "not_equals"
+        show_when_value: Value(s) that trigger showing this field
+        insert_after: Question ID to insert after. If None, adds to end of step.
+
+    Returns:
+        Confirmation message with the added question details
+
+    Example:
+        add_form_question(
+            step_id="clinic_info",
+            question_id="clinic_fax",
+            question_type="text",
+            label="Clinic Fax Number",
+            required=False,
+            placeholder="406-555-1234",
+            insert_after="clinic_phone"
+        )
+    """
+    import json
+
+    # Load current form definition
+    try:
+        with open(FORM_DEF_PATH, 'r') as f:
+            form_def = json.load(f)
+    except FileNotFoundError:
+        return "Error: form-definition.json not found."
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON: {e}"
+
+    # Find the step
+    step = None
+    for s in form_def.get('steps', []):
+        if s.get('step_id') == step_id:
+            step = s
+            break
+
+    if not step:
+        available = [s.get('step_id') for s in form_def.get('steps', [])]
+        return f"Error: Step '{step_id}' not found. Available steps: {', '.join(available)}"
+
+    # Check for duplicate question_id across ALL steps
+    for s in form_def.get('steps', []):
+        for q in s.get('questions', []):
+            if q.get('question_id') == question_id:
+                return f"Error: question_id '{question_id}' already exists in step '{s.get('step_id')}'"
+
+    # Build the question object
+    new_question = {
+        "question_id": question_id,
+        "type": question_type,
+        "label": label,
+        "required": required
+    }
+
+    # Add optional fields
+    if options_ref:
+        new_question["options_ref"] = options_ref
+    if help_text:
+        new_question["help_text"] = help_text
+    if placeholder:
+        new_question["placeholder"] = placeholder
+    if pattern:
+        new_question["pattern"] = pattern
+    if max_length:
+        new_question["max_length"] = max_length
+
+    # Add conditional visibility
+    if show_when_question and show_when_operator and show_when_value:
+        # Parse value - could be a list for "in" operator
+        value = show_when_value
+        if show_when_operator == "in" and "," in show_when_value:
+            value = [v.strip() for v in show_when_value.split(",")]
+
+        new_question["show_when"] = {
+            "question_id": show_when_question,
+            "operator": show_when_operator,
+            "value": value
+        }
+
+    # Ensure questions list exists
+    if 'questions' not in step:
+        step['questions'] = []
+
+    # Insert at position
+    if insert_after:
+        # Find the index of insert_after question
+        insert_idx = None
+        for idx, q in enumerate(step['questions']):
+            if q.get('question_id') == insert_after:
+                insert_idx = idx + 1
+                break
+
+        if insert_idx is None:
+            return f"Error: insert_after question '{insert_after}' not found in step '{step_id}'"
+
+        step['questions'].insert(insert_idx, new_question)
+        position_msg = f"after '{insert_after}'"
+    else:
+        step['questions'].append(new_question)
+        position_msg = "at end of step"
+
+    # Save the updated form definition
+    with open(FORM_DEF_PATH, 'w') as f:
+        json.dump(form_def, f, indent=2)
+
+    # Audit log
+    _log_form_audit(
+        action="ADD_QUESTION",
+        entity_type="form_question",
+        entity_id=question_id,
+        details=f"Added to step '{step_id}' {position_msg}",
+        new_value=json.dumps(new_question)
+    )
+
+    return f"""Question added successfully!
+
+Step: {step_id}
+Question ID: {question_id}
+Label: {label}
+Type: {question_type}
+Required: {required}
+Position: {position_msg}
+
+Next steps:
+  - Run list_form_questions(step_id="{step_id}") to verify
+  - Push changes: cd ~/projects/propel-onboarding-form && git add . && git commit -m "Add {question_id} question" && git push
+"""
+
+
+@mcp.tool()
+def update_form_question(
+    question_id: str,
+    label: str = None,
+    required: bool = None,
+    help_text: str = None,
+    placeholder: str = None,
+    pattern: str = None,
+    max_length: int = None,
+    options_ref: str = None,
+    show_when_question: str = None,
+    show_when_operator: str = None,
+    show_when_value: str = None,
+    clear_show_when: bool = False
+) -> str:
+    """
+    Update an existing question's properties. Only provided fields are updated.
+
+    Args:
+        question_id: ID of question to update
+        label: New display label
+        required: Change required status
+        help_text: New help text (use empty string "" to clear)
+        placeholder: New placeholder text
+        pattern: New regex validation pattern
+        max_length: New max length
+        options_ref: New options reference
+        show_when_question: Question ID for conditional visibility
+        show_when_operator: Operator for condition
+        show_when_value: Value(s) for condition
+        clear_show_when: If True, removes conditional visibility
+
+    Returns:
+        Confirmation with old and new values
+
+    Example:
+        update_form_question(
+            question_id="clinic_name",
+            label="Primary Clinic Name",
+            help_text="Enter the official clinic name as it appears on your license"
+        )
+    """
+    import json
+
+    with open(FORM_DEF_PATH, 'r') as f:
+        form_def = json.load(f)
+
+    # Find the question
+    found_step = None
+    found_question = None
+    for step in form_def.get('steps', []):
+        for q in step.get('questions', []):
+            if q.get('question_id') == question_id:
+                found_step = step
+                found_question = q
+                break
+        if found_question:
+            break
+
+    if not found_question:
+        return f"Error: Question '{question_id}' not found in any step."
+
+    # Track changes
+    changes = []
+    old_values = {}
+
+    # Update provided fields
+    if label is not None:
+        old_values['label'] = found_question.get('label')
+        found_question['label'] = label
+        changes.append(f"label: '{old_values['label']}' -> '{label}'")
+
+    if required is not None:
+        old_values['required'] = found_question.get('required')
+        found_question['required'] = required
+        changes.append(f"required: {old_values['required']} -> {required}")
+
+    if help_text is not None:
+        old_values['help_text'] = found_question.get('help_text')
+        if help_text == "":
+            found_question.pop('help_text', None)
+            changes.append("help_text: removed")
+        else:
+            found_question['help_text'] = help_text
+            changes.append("help_text: updated")
+
+    if placeholder is not None:
+        old_values['placeholder'] = found_question.get('placeholder')
+        found_question['placeholder'] = placeholder
+        changes.append(f"placeholder: '{old_values['placeholder']}' -> '{placeholder}'")
+
+    if pattern is not None:
+        old_values['pattern'] = found_question.get('pattern')
+        found_question['pattern'] = pattern
+        changes.append(f"pattern: '{old_values['pattern']}' -> '{pattern}'")
+
+    if max_length is not None:
+        old_values['max_length'] = found_question.get('max_length')
+        found_question['max_length'] = max_length
+        changes.append(f"max_length: {old_values['max_length']} -> {max_length}")
+
+    if options_ref is not None:
+        old_values['options_ref'] = found_question.get('options_ref')
+        found_question['options_ref'] = options_ref
+        changes.append(f"options_ref: '{old_values['options_ref']}' -> '{options_ref}'")
+
+    if clear_show_when:
+        if 'show_when' in found_question:
+            old_values['show_when'] = found_question.pop('show_when')
+            changes.append("show_when: removed (question now always visible)")
+    elif show_when_question and show_when_operator and show_when_value:
+        old_values['show_when'] = found_question.get('show_when')
+        value = show_when_value
+        if show_when_operator == "in" and "," in show_when_value:
+            value = [v.strip() for v in show_when_value.split(",")]
+        found_question['show_when'] = {
+            "question_id": show_when_question,
+            "operator": show_when_operator,
+            "value": value
+        }
+        changes.append(f"show_when: updated to depend on '{show_when_question}'")
+
+    if not changes:
+        return "No changes provided. Specify at least one field to update."
+
+    # Save
+    with open(FORM_DEF_PATH, 'w') as f:
+        json.dump(form_def, f, indent=2)
+
+    # Audit log
+    _log_form_audit(
+        action="UPDATE_QUESTION",
+        entity_type="form_question",
+        entity_id=question_id,
+        details=f"Updated in step '{found_step.get('step_id')}'",
+        old_value=json.dumps(old_values),
+        new_value=json.dumps({k: found_question.get(k) for k in old_values.keys()})
+    )
+
+    changes_formatted = "\n  - ".join(changes)
+    return f"""Question updated successfully!
+
+Question ID: {question_id}
+Step: {found_step.get('step_id')}
+
+Changes:
+  - {changes_formatted}
+
+Next steps:
+  - Run list_form_questions(step_id="{found_step.get('step_id')}", show_details=True) to verify
+  - Push changes to GitHub
+"""
+
+
+@mcp.tool()
+def remove_form_question(
+    question_id: str,
+    reason: str
+) -> str:
+    """
+    Remove a question from the onboarding form.
+
+    Args:
+        question_id: ID of question to remove
+        reason: Reason for removal (required for audit trail)
+
+    Returns:
+        Confirmation with removed question details
+
+    Example:
+        remove_form_question(
+            question_id="clinic_fax",
+            reason="Fax numbers no longer collected - moved to optional notes"
+        )
+    """
+    import json
+
+    with open(FORM_DEF_PATH, 'r') as f:
+        form_def = json.load(f)
+
+    # Find and remove the question
+    found_step = None
+    removed_question = None
+    for step in form_def.get('steps', []):
+        for idx, q in enumerate(step.get('questions', [])):
+            if q.get('question_id') == question_id:
+                found_step = step
+                removed_question = step['questions'].pop(idx)
+                break
+        if removed_question:
+            break
+
+    if not removed_question:
+        return f"Error: Question '{question_id}' not found in any step."
+
+    # Check if any other questions depend on this one (show_when)
+    dependencies = []
+    for step in form_def.get('steps', []):
+        for q in step.get('questions', []):
+            show_when = q.get('show_when', {})
+            if show_when.get('question_id') == question_id:
+                dependencies.append(f"{q.get('question_id')} (in {step.get('step_id')})")
+
+    if dependencies:
+        # Re-add the question since we can't remove it
+        found_step['questions'].append(removed_question)
+        deps_formatted = "\n  - ".join(dependencies)
+        return f"""Error: Cannot remove '{question_id}' - other questions depend on it:
+
+Dependent questions:
+  - {deps_formatted}
+
+Remove or update the dependent questions first, then try again."""
+
+    # Save
+    with open(FORM_DEF_PATH, 'w') as f:
+        json.dump(form_def, f, indent=2)
+
+    # Audit log
+    _log_form_audit(
+        action="REMOVE_QUESTION",
+        entity_type="form_question",
+        entity_id=question_id,
+        details=f"Removed from step '{found_step.get('step_id')}'. Reason: {reason}",
+        old_value=json.dumps(removed_question)
+    )
+
+    return f"""Question removed successfully!
+
+Question ID: {question_id}
+Label: {removed_question.get('label')}
+Step: {found_step.get('step_id')}
+Reason: {reason}
+
+The full question definition has been saved to the audit log.
+
+Next steps:
+  - Push changes to GitHub
+"""
+
+
+@mcp.tool()
+def reorder_form_questions(
+    step_id: str,
+    question_id: str,
+    move_to: str,
+    target_question_id: str = None
+) -> str:
+    """
+    Reorder questions within a step.
+
+    Args:
+        step_id: Step containing the question
+        question_id: Question to move
+        move_to: Where to move: "first", "last", "before", "after"
+        target_question_id: Required if move_to is "before" or "after"
+
+    Returns:
+        Confirmation with new question order
+
+    Example:
+        reorder_form_questions(
+            step_id="clinic_info",
+            question_id="clinic_phone",
+            move_to="after",
+            target_question_id="clinic_name"
+        )
+    """
+    import json
+
+    with open(FORM_DEF_PATH, 'r') as f:
+        form_def = json.load(f)
+
+    # Find the step
+    step = None
+    for s in form_def.get('steps', []):
+        if s.get('step_id') == step_id:
+            step = s
+            break
+
+    if not step:
+        return f"Error: Step '{step_id}' not found."
+
+    questions = step.get('questions', [])
+
+    # Find the question to move
+    move_idx = None
+    for idx, q in enumerate(questions):
+        if q.get('question_id') == question_id:
+            move_idx = idx
+            break
+
+    if move_idx is None:
+        return f"Error: Question '{question_id}' not found in step '{step_id}'."
+
+    # Remove the question from current position
+    question_to_move = questions.pop(move_idx)
+
+    # Determine new position
+    if move_to == "first":
+        new_idx = 0
+    elif move_to == "last":
+        new_idx = len(questions)
+    elif move_to in ("before", "after"):
+        if not target_question_id:
+            questions.insert(move_idx, question_to_move)  # restore
+            return f"Error: target_question_id required when move_to is '{move_to}'"
+
+        target_idx = None
+        for idx, q in enumerate(questions):
+            if q.get('question_id') == target_question_id:
+                target_idx = idx
+                break
+
+        if target_idx is None:
+            questions.insert(move_idx, question_to_move)  # restore
+            return f"Error: Target question '{target_question_id}' not found in step '{step_id}'."
+
+        new_idx = target_idx if move_to == "before" else target_idx + 1
+    else:
+        questions.insert(move_idx, question_to_move)  # restore
+        return f"Error: Invalid move_to value '{move_to}'. Use: first, last, before, after"
+
+    # Insert at new position
+    questions.insert(new_idx, question_to_move)
+
+    # Save
+    with open(FORM_DEF_PATH, 'w') as f:
+        json.dump(form_def, f, indent=2)
+
+    # Build new order display
+    new_order = [q.get('question_id') for q in questions]
+    order_formatted = "\n  ".join([f"{i+1}. {qid}" for i, qid in enumerate(new_order)])
+
+    # Audit log
+    _log_form_audit(
+        action="REORDER_QUESTION",
+        entity_type="form_question",
+        entity_id=question_id,
+        details=f"Moved to position {new_idx + 1} in step '{step_id}'"
+    )
+
+    target_msg = f" {target_question_id}" if target_question_id else ""
+    return f"""Question reordered successfully!
+
+Step: {step_id}
+Moved: {question_id}
+Position: {move_to}{target_msg}
+
+New order:
+  {order_formatted}
+
+Next steps:
+  - Push changes to GitHub
+"""
+
+
+# ============================================================
+# DASHBOARD DATA GENERATION TOOLS
+# ============================================================
+# Tools for generating static JSON data files for the clinic dashboard
+# Dashboard location: ~/projects/propel-clinic-dashboard/
+
+# Default output path for dashboard data
+DASHBOARD_DATA_PATH = os.path.expanduser(
+    "~/projects/propel-clinic-dashboard/src/data/dashboard-data.json"
+)
+
+
+@mcp.tool()
+def generate_dashboard_data(
+    show_audit_trail: bool = False,
+    output_path: str = None,
+    days_of_audit: int = 30
+) -> str:
+    """
+    Generate dashboard JSON data for the clinic configuration dashboard.
+
+    This tool queries the client_product_database and generates a JSON file
+    containing users, training records, configurations, providers, and
+    optionally audit history. The output is designed for the static GitHub
+    Pages dashboard at propel-clinic-dashboard.
+
+    Args:
+        show_audit_trail: If True, includes audit_trail in output (default: False)
+        output_path: Where to write JSON file (default: ~/projects/propel-clinic-dashboard/src/data/dashboard-data.json)
+        days_of_audit: How many days of audit history to include (default: 30)
+
+    Returns:
+        Confirmation message with file path and summary stats
+    """
+    import json
+    import sqlite3
+
+    # =========================================================================
+    # SETUP
+    # =========================================================================
+    # Use default path if not specified
+    if output_path is None:
+        output_path = DASHBOARD_DATA_PATH
+    else:
+        output_path = os.path.expanduser(output_path)
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # Connect to database with Row factory for dict-like access
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        cursor = conn.cursor()
+
+        # =====================================================================
+        # QUERY 1: PROGRAMS LIST
+        # =====================================================================
+        # Get all active programs with their prefix (used as ID in dashboard)
+        # and display name
+        cursor.execute("""
+            SELECT DISTINCT
+                prefix as id,
+                name as name
+            FROM programs
+            WHERE status = 'Active'
+              AND prefix IS NOT NULL
+            ORDER BY name
+        """)
+        programs = [dict(row) for row in cursor.fetchall()]
+
+        # =====================================================================
+        # QUERY 2: USERS WITH ACCESS
+        # =====================================================================
+        # Join users with their access records to get program, clinic, role
+        # Note: user_access doesn't have last_access_date, so we use granted_date
+        # as a proxy. In production, you'd want to track actual login times.
+        cursor.execute("""
+            SELECT DISTINCT
+                u.name,
+                u.email,
+                p.prefix as program,
+                c.name as clinic,
+                ua.role,
+                u.status,
+                ua.granted_date as last_access
+            FROM users u
+            JOIN user_access ua ON u.user_id = ua.user_id
+            JOIN clinics c ON ua.clinic_id = c.clinic_id
+            JOIN programs p ON ua.program_id = p.program_id
+            WHERE ua.is_active = 1
+            ORDER BY u.name
+        """)
+        users = [dict(row) for row in cursor.fetchall()]
+
+        # =====================================================================
+        # QUERY 3: TRAINING RECORDS
+        # =====================================================================
+        # Get training status for each user. Calculate status based on
+        # expiration date:
+        # - Expired: expires_date < today
+        # - Due Soon: expires_date within 30 days
+        # - Current: expires_date > 30 days away
+        cursor.execute("""
+            SELECT DISTINCT
+                u.name,
+                u.email,
+                p.prefix as program,
+                ut.training_type,
+                ut.completed_date as completion_date,
+                ut.expires_date as expiration_date,
+                CASE
+                    WHEN ut.expires_date < date('now') THEN 'Expired'
+                    WHEN ut.expires_date < date('now', '+30 days') THEN 'Due Soon'
+                    ELSE 'Current'
+                END as status
+            FROM user_training ut
+            JOIN users u ON ut.user_id = u.user_id
+            JOIN user_access ua ON u.user_id = ua.user_id AND ua.is_active = 1
+            JOIN programs p ON ua.program_id = p.program_id
+            WHERE ut.completed_date IS NOT NULL
+            ORDER BY u.name, ut.training_type
+        """)
+        training = [dict(row) for row in cursor.fetchall()]
+
+        # =====================================================================
+        # QUERY 4: CONFIGURATIONS WITH INHERITANCE SOURCE
+        # =====================================================================
+        # Get all configuration values showing where they come from in the
+        # inheritance chain: Program Default → Clinic Override → Location Override
+        # The source is determined by which level has the config set:
+        # - Location Override: location_id is set
+        # - Clinic Override: clinic_id is set but not location_id
+        # - Program Default: only program_id is set
+        cursor.execute("""
+            SELECT
+                p.prefix as program,
+                c.name as clinic,
+                l.name as location,
+                cv.config_key,
+                cv.value as config_value,
+                CASE
+                    WHEN cv.location_id IS NOT NULL THEN 'Location Override'
+                    WHEN cv.clinic_id IS NOT NULL THEN 'Clinic Override'
+                    ELSE 'Program Default'
+                END as source
+            FROM config_values cv
+            JOIN programs p ON cv.program_id = p.program_id
+            LEFT JOIN clinics c ON cv.clinic_id = c.clinic_id
+            LEFT JOIN locations l ON cv.location_id = l.location_id
+            WHERE p.status = 'Active'
+            ORDER BY p.prefix, c.name, l.name, cv.config_key
+        """)
+        configurations = [dict(row) for row in cursor.fetchall()]
+
+        # =====================================================================
+        # QUERY 5: PROVIDERS
+        # =====================================================================
+        # Get all active providers. Providers are linked to locations, so we
+        # need to join through locations to get clinic and program info.
+        cursor.execute("""
+            SELECT
+                prov.name as name,
+                prov.npi,
+                p.prefix as program,
+                c.name as clinic,
+                l.name as location,
+                prov.specialty
+            FROM providers prov
+            JOIN locations l ON prov.location_id = l.location_id
+            JOIN clinics c ON l.clinic_id = c.clinic_id
+            JOIN programs p ON c.program_id = p.program_id
+            WHERE prov.is_active = 1
+              AND p.status = 'Active'
+            ORDER BY prov.name
+        """)
+        providers = [dict(row) for row in cursor.fetchall()]
+
+        # =====================================================================
+        # QUERY 6: AUDIT TRAIL (CONDITIONAL)
+        # =====================================================================
+        # Only query audit history if show_audit_trail is True.
+        # Limits to the specified number of days and max 500 records.
+        audit_trail = []
+        if show_audit_trail:
+            cursor.execute("""
+                SELECT
+                    changed_date as timestamp,
+                    action,
+                    record_type as entity_type,
+                    record_id as entity_id,
+                    changed_by,
+                    change_reason as details
+                FROM audit_history
+                WHERE changed_date >= date('now', '-' || ? || ' days')
+                ORDER BY changed_date DESC
+                LIMIT 500
+            """, (days_of_audit,))
+            audit_trail = [dict(row) for row in cursor.fetchall()]
+
+        # =====================================================================
+        # CALCULATE SUMMARY STATISTICS
+        # =====================================================================
+        # Aggregate metrics for the dashboard summary cards
+        total_users = len(users)
+        active_users = len([u for u in users if u.get('status') == 'Active'])
+
+        # Training compliance: count users with at least one 'Current' training
+        # and divide by total users
+        users_with_current_training = set()
+        for t in training:
+            if t.get('status') == 'Current':
+                users_with_current_training.add(t.get('email'))
+        training_compliant = len(users_with_current_training)
+        training_compliance_pct = round(
+            (training_compliant / total_users * 100) if total_users > 0 else 0,
+            1
+        )
+
+        # Count unique clinics and total providers
+        total_clinics = len(set(u.get('clinic') for u in users if u.get('clinic')))
+        total_providers = len(providers)
+
+        summary = {
+            "total_users": total_users,
+            "active_users": active_users,
+            "training_compliant": training_compliant,
+            "training_compliance_pct": training_compliance_pct,
+            "total_clinics": total_clinics,
+            "total_providers": total_providers
+        }
+
+        # =====================================================================
+        # BUILD OUTPUT STRUCTURE
+        # =====================================================================
+        # Assemble the final JSON structure matching the dashboard's expected format
+        generated_at = datetime.now().isoformat() + "Z"
+
+        output = {
+            "generated_at": generated_at,
+            "show_audit_trail": show_audit_trail,
+            "summary": summary,
+            "programs": programs,
+            "users": users,
+            "training": training,
+            "configurations": configurations,
+            "providers": providers,
+            "audit_trail": audit_trail
+        }
+
+        # =====================================================================
+        # WRITE JSON FILE
+        # =====================================================================
+        # Write with indent=2 for human-readable output
+        with open(output_path, 'w') as f:
+            json.dump(output, f, indent=2, default=str)
+
+        # =====================================================================
+        # LOG AUDIT ENTRY
+        # =====================================================================
+        # Record that dashboard data was generated
+        cursor.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "dashboard_data",
+            "dashboard-data.json",
+            "Generated",
+            None,
+            json.dumps(summary),
+            "MCP:generate_dashboard_data",
+            generated_at,
+            f"Users: {total_users}, Clinics: {total_clinics}, Providers: {total_providers}"
+        ))
+        conn.commit()
+
+        # =====================================================================
+        # BUILD RETURN MESSAGE
+        # =====================================================================
+        audit_status = f"Included ({len(audit_trail)} entries, last {days_of_audit} days)" if show_audit_trail else "Excluded (set show_audit_trail=True to include)"
+
+        return f"""Dashboard data generated successfully!
+
+File: {output_path}
+Generated: {generated_at}
+
+Summary:
+  Users: {total_users} ({active_users} active)
+  Training Compliance: {training_compliance_pct}%
+  Clinics: {total_clinics}
+  Providers: {total_providers}
+  Audit Trail: {audit_status}
+
+Data sections:
+  - programs: {len(programs)} programs
+  - users: {len(users)} user access records
+  - training: {len(training)} training records
+  - configurations: {len(configurations)} config values
+  - providers: {len(providers)} providers
+  - audit_trail: {len(audit_trail)} entries
+
+Next steps:
+  1. Review the generated JSON file
+  2. Push to GitHub Pages: cd ~/projects/propel-clinic-dashboard && git add -A && git commit -m "Update dashboard data" && git push
+  3. Dashboard will update automatically at your GitHub Pages URL
+"""
+
+    except sqlite3.Error as e:
+        return f"Database error: {str(e)}\n\nMake sure the database exists at: {DB_PATH}"
+
+    except Exception as e:
+        return f"Error generating dashboard data: {str(e)}"
+
+    finally:
+        # Always close the database connection
+        conn.close()
 
 
 # ============================================================
