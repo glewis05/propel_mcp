@@ -7533,6 +7533,15 @@ DASHBOARD_DATA_PATH = os.path.expanduser(
     "~/projects/propel-clinic-dashboard/src/data/dashboard-data.json"
 )
 
+# Required configuration fields for a clinic to be considered "configured"
+# A clinic is fully configured only when ALL of these fields have values
+REQUIRED_CONFIG_FIELDS = [
+    "clinic_phone",        # Clinic's helpdesk phone number
+    "default_test",        # Default genetic test panel
+    "default_specimen",    # Default specimen type (Blood, Saliva, etc.)
+    "ordering_provider_npi"  # At least one ordering provider NPI
+]
+
 
 @mcp.tool()
 def generate_dashboard_data(
@@ -7661,16 +7670,34 @@ def generate_dashboard_data(
                     # If not JSON, treat as single value
                     optional_tests = [optional_tests_raw] if optional_tests_raw else []
 
+            # Check if clinic has at least one ordering provider
+            # Query providers linked to this clinic through locations
+            cursor.execute("""
+                SELECT prov.npi
+                FROM providers prov
+                JOIN locations l ON prov.location_id = l.location_id
+                WHERE l.clinic_id = ? AND prov.is_active = 1
+                LIMIT 1
+            """, (clinic_id,))
+            provider_row = cursor.fetchone()
+            has_ordering_provider = provider_row is not None
+            ordering_provider_npi = provider_row['npi'] if provider_row else None
+
             # Determine configuration status
             # config_submitted = True if any config values exist for this clinic
             config_submitted = len(config_dict) > 0 or clinic_phone is not None
 
-            # Required fields for is_configured: clinic_phone and default_test
+            # Check all required fields from REQUIRED_CONFIG_FIELDS
+            # A clinic is only "configured" when ALL required fields have values
             missing_fields = []
             if not clinic_phone:
                 missing_fields.append('clinic_phone')
             if not default_test:
                 missing_fields.append('default_test')
+            if not default_specimen:
+                missing_fields.append('default_specimen')
+            if not has_ordering_provider:
+                missing_fields.append('ordering_provider_npi')
 
             is_configured = len(missing_fields) == 0
 
@@ -7682,6 +7709,7 @@ def generate_dashboard_data(
                 "default_test": default_test,
                 "optional_tests": optional_tests,
                 "default_specimen": default_specimen,
+                "ordering_provider_npi": ordering_provider_npi,
                 "config_submitted": config_submitted,
                 "is_configured": is_configured,
                 "missing_fields": missing_fields
