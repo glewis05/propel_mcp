@@ -2164,6 +2164,9 @@ Traceability:
         return result
 
     except sqlite3.IntegrityError as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
         if "UNIQUE constraint" in str(e):
             return (
                 f"Requirement ID conflict: '{requirement_id}' already exists.\n\n"
@@ -2172,6 +2175,9 @@ Traceability:
         return f"Database integrity error: {str(e)}"
 
     except Exception as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
         return f"Error creating requirement: {str(e)}"
 
     finally:
@@ -2846,6 +2852,9 @@ Next Steps:
         return result
 
     except sqlite3.IntegrityError as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
         # Handle unique constraint violations
         if "UNIQUE constraint" in str(e):
             return (
@@ -2855,6 +2864,9 @@ Next Steps:
         return f"Database integrity error: {str(e)}"
 
     except Exception as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
         return f"Error creating story: {str(e)}"
 
     finally:
@@ -3132,6 +3144,9 @@ Next Steps:
         return result
 
     except Exception as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
         return f"Error updating story: {str(e)}"
 
     finally:
@@ -3575,6 +3590,9 @@ Next Steps:
         return result
 
     except sqlite3.IntegrityError as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
         if "UNIQUE constraint" in str(e):
             return (
                 f"Test ID conflict: '{test_id}' already exists.\n\n"
@@ -3583,6 +3601,9 @@ Next Steps:
         return f"Database integrity error: {str(e)}"
 
     except Exception as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
         return f"Error creating test case: {str(e)}"
 
     finally:
@@ -3802,6 +3823,9 @@ Next Steps:
         return result
 
     except Exception as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
         return f"Error updating test result: {str(e)}"
 
     finally:
@@ -3979,6 +4003,9 @@ Next Steps:
         return result
 
     except Exception as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
         return f"Error deleting test case: {str(e)}"
 
     finally:
@@ -4337,6 +4364,9 @@ Next Steps:
         return result
 
     except Exception as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
         return f"Error updating test case: {str(e)}"
 
     finally:
@@ -4586,7 +4616,7 @@ def _create_review_status_excel(rows: list, output_dir: str, filename: str) -> s
                     cell_value = ws.cell(row=row, column=col).value
                     if cell_value:
                         max_length = max(max_length, len(str(cell_value)))
-                except:
+                except (TypeError, AttributeError):
                     pass
             ws.column_dimensions[column_letter].width = min(max_length + 2, 40)
 
@@ -4668,7 +4698,7 @@ def _create_terminated_audit_excel(rows: list, output_dir: str, filename: str, v
                     cell_value = ws.cell(row=row, column=col).value
                     if cell_value:
                         max_length = max(max_length, len(str(cell_value)))
-                except:
+                except (TypeError, AttributeError):
                     pass
             ws.column_dimensions[column_letter].width = min(max_length + 2, 40)
 
@@ -6797,7 +6827,7 @@ def generate_audit_memo(
             try:
                 dt = datetime.strptime(date_str, '%Y-%m-%d')
                 return dt.strftime('%B %d, %Y')
-            except:
+            except (ValueError, TypeError):
                 return date_str
 
         # Prepare context
