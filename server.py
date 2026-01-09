@@ -18,6 +18,14 @@ REQUIREMENTS TOOLKIT:
 - Test Cases: list_test_cases, get_test_summary, create_test_case, update_test_result
 - Reporting: get_program_health, get_client_tree, search_stories, get_coverage_gaps
 
+UAT CYCLE MANAGEMENT:
+- Cycle Management: create_uat_cycle, get_uat_cycle, list_uat_cycles, update_uat_cycle_status
+- Test Assignment: assign_test_case, bulk_assign_by_profile
+- Test Execution: update_test_execution
+- Gate Management: update_pre_uat_gate
+- Reporting: get_cycle_dashboard, get_tester_workload
+- Decisions: record_go_nogo_decision
+
 ONBOARDING FORM TOOLKIT:
 - Question Management: list_form_questions, add_form_question, update_form_question, remove_form_question, reorder_form_questions
 
@@ -9347,6 +9355,1350 @@ Next steps:
     except Exception as e:
         logger.error(f"import_onboarding_json() error: {e}", exc_info=True)
         return f"Error: {str(e)}"
+
+
+# ============================================================
+# REQUIREMENTS TOOLKIT - UAT CYCLE MANAGEMENT
+# ============================================================
+# These tools support the UAT process including cycle creation,
+# test assignment, execution tracking, and reporting.
+
+
+@mcp.tool()
+def create_uat_cycle(
+    program_prefix: str,
+    name: str,
+    uat_type: str,
+    description: str = None,
+    target_launch_date: str = None,
+    clinical_pm: str = None,
+    clinical_pm_email: str = None
+) -> str:
+    """
+    Create a new UAT cycle for a program.
+
+    Args:
+        program_prefix: Program prefix (e.g., "PROP", "GRX")
+        name: Cycle name (e.g., "NCCN Q4 2025", "GenoRx e-Consent v1")
+        uat_type: Type of UAT - 'feature', 'rule_validation', or 'regression'
+        description: Optional description
+        target_launch_date: Target launch date (YYYY-MM-DD)
+        clinical_pm: Clinical PM name
+        clinical_pm_email: Clinical PM email
+
+    Returns:
+        Created cycle details
+
+    Example:
+        create_uat_cycle("PROP", "NCCN Q4 2025", "rule_validation",
+                        target_launch_date="2025-01-15", clinical_pm="Jane Smith")
+    """
+    logger.info(f"create_uat_cycle() called - program={program_prefix}, name={name}")
+
+    # Validate uat_type
+    valid_types = ['feature', 'rule_validation', 'regression']
+    if uat_type not in valid_types:
+        return f"Error: Invalid uat_type '{uat_type}'. Valid types: {', '.join(valid_types)}"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Resolve program
+        cursor = conn.execute(
+            "SELECT program_id, name, prefix FROM programs WHERE UPPER(prefix) = UPPER(?)",
+            (program_prefix,)
+        )
+        program = cursor.fetchone()
+        if not program:
+            return f"Error: Program not found with prefix '{program_prefix}'"
+
+        # Generate cycle_id
+        cycle_id = f"UAT-{program['prefix']}-{str(uuid.uuid4())[:8].upper()}"
+
+        # Insert cycle
+        conn.execute("""
+            INSERT INTO uat_cycles (
+                cycle_id, program_id, name, description, uat_type,
+                target_launch_date, clinical_pm, clinical_pm_email,
+                status, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'planning', 'MCP:create_uat_cycle')
+        """, (
+            cycle_id, program['program_id'], name, description, uat_type,
+            target_launch_date, clinical_pm, clinical_pm_email
+        ))
+
+        # Create default pre-UAT gate items based on uat_type
+        gate_items = []
+        if uat_type == 'rule_validation':
+            gate_items = [
+                ('feature_deployment', 1, 'NCCN rules deployed to QA environment', 1),
+                ('feature_deployment', 2, 'All rule IDs verified in system', 1),
+                ('critical_path', 1, 'Patient registration flow tested', 1),
+                ('critical_path', 2, 'Test profiles created and validated', 1),
+                ('environment', 1, 'QA environment stable and accessible', 1),
+                ('blocker_check', 1, 'No critical defects in backlog', 1),
+                ('sign_off', 1, 'Clinical PM approval for test start', 1),
+            ]
+        elif uat_type == 'feature':
+            gate_items = [
+                ('feature_deployment', 1, 'Feature deployed to QA environment', 1),
+                ('feature_deployment', 2, 'Feature flags configured correctly', 1),
+                ('critical_path', 1, 'Core happy path verified', 1),
+                ('environment', 1, 'QA environment stable and accessible', 1),
+                ('blocker_check', 1, 'No critical defects blocking feature', 1),
+                ('sign_off', 1, 'Product Owner approval for test start', 1),
+            ]
+        else:  # regression
+            gate_items = [
+                ('feature_deployment', 1, 'Release candidate deployed to QA', 1),
+                ('critical_path', 1, 'Smoke tests passing', 1),
+                ('environment', 1, 'QA environment mirrors production', 1),
+                ('blocker_check', 1, 'No P0/P1 defects open', 1),
+                ('sign_off', 1, 'Release Manager approval', 1),
+            ]
+
+        for category, seq, item_text, is_required in gate_items:
+            conn.execute("""
+                INSERT INTO pre_uat_gate_items (cycle_id, category, sequence, item_text, is_required)
+                VALUES (?, ?, ?, ?, ?)
+            """, (cycle_id, category, seq, item_text, is_required))
+
+        conn.commit()
+
+        logger.info(f"create_uat_cycle() SUCCESS - created {cycle_id}")
+
+        result = f"""✓ UAT Cycle created successfully!
+
+Cycle ID: {cycle_id}
+Program: {program['name']} [{program['prefix']}]
+Name: {name}
+Type: {uat_type}
+Status: planning
+"""
+        if target_launch_date:
+            result += f"Target Launch: {target_launch_date}\n"
+        if clinical_pm:
+            result += f"Clinical PM: {clinical_pm}\n"
+
+        result += f"""
+Pre-UAT Gate Items: {len(gate_items)} items created
+
+Next Steps:
+  • get_uat_cycle("{cycle_id}") - View cycle details
+  • assign_test_case(test_id, "{cycle_id}", ...) - Assign tests to cycle
+  • bulk_assign_by_profile("{cycle_id}", profile_id, tester) - Bulk assign
+"""
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"create_uat_cycle() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"create_uat_cycle() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def get_uat_cycle(cycle_id: str) -> str:
+    """
+    Get detailed information about a UAT cycle.
+
+    Args:
+        cycle_id: The cycle ID (e.g., "UAT-PROP-12345678")
+
+    Returns:
+        Cycle details including status, dates, and test summary
+
+    Example:
+        get_uat_cycle("UAT-PROP-12345678")
+    """
+    logger.info(f"get_uat_cycle() called - cycle_id={cycle_id}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get cycle with program info
+        cursor = conn.execute("""
+            SELECT c.*, p.name as program_name, p.prefix as program_prefix
+            FROM uat_cycles c
+            JOIN programs p ON c.program_id = p.program_id
+            WHERE c.cycle_id = ?
+        """, (cycle_id,))
+        cycle = cursor.fetchone()
+
+        if not cycle:
+            return f"Error: UAT cycle not found with ID '{cycle_id}'"
+
+        cycle = dict(cycle)
+
+        # Get test case summary
+        cursor = conn.execute("""
+            SELECT
+                test_status,
+                COUNT(*) as count
+            FROM uat_test_cases
+            WHERE uat_cycle_id = ?
+            GROUP BY test_status
+        """, (cycle_id,))
+        test_summary = {row['test_status']: row['count'] for row in cursor.fetchall()}
+        total_tests = sum(test_summary.values())
+
+        # Get pre-UAT gate status
+        cursor = conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(is_complete) as completed,
+                SUM(CASE WHEN is_required = 1 AND is_complete = 0 THEN 1 ELSE 0 END) as required_pending
+            FROM pre_uat_gate_items
+            WHERE cycle_id = ?
+        """, (cycle_id,))
+        gate_status = dict(cursor.fetchone())
+
+        # Get tester assignments
+        cursor = conn.execute("""
+            SELECT assigned_to, COUNT(*) as count
+            FROM uat_test_cases
+            WHERE uat_cycle_id = ? AND assigned_to IS NOT NULL
+            GROUP BY assigned_to
+        """, (cycle_id,))
+        testers = {row['assigned_to']: row['count'] for row in cursor.fetchall()}
+
+        # Build response
+        result = f"""UAT Cycle Details
+================
+
+Cycle ID: {cycle['cycle_id']}
+Program: {cycle['program_name']} [{cycle['program_prefix']}]
+Name: {cycle['name']}
+Type: {cycle['uat_type']}
+Status: {cycle['status'].upper()}
+"""
+        if cycle['description']:
+            result += f"Description: {cycle['description']}\n"
+        if cycle['target_launch_date']:
+            result += f"Target Launch: {cycle['target_launch_date']}\n"
+        if cycle['clinical_pm']:
+            result += f"Clinical PM: {cycle['clinical_pm']}"
+            if cycle['clinical_pm_email']:
+                result += f" ({cycle['clinical_pm_email']})"
+            result += "\n"
+
+        # Phase dates
+        phase_dates = []
+        if cycle['kickoff_date']:
+            phase_dates.append(f"Kickoff: {cycle['kickoff_date']}")
+        if cycle['testing_start']:
+            phase_dates.append(f"Testing: {cycle['testing_start']} to {cycle['testing_end'] or 'TBD'}")
+        if cycle['review_date']:
+            phase_dates.append(f"Review: {cycle['review_date']}")
+        if cycle['go_nogo_date']:
+            phase_dates.append(f"Go/No-Go: {cycle['go_nogo_date']}")
+
+        if phase_dates:
+            result += "\nPhase Dates:\n"
+            for pd in phase_dates:
+                result += f"  • {pd}\n"
+
+        # Pre-UAT Gate
+        result += f"""
+Pre-UAT Gate:
+  Items: {gate_status['completed'] or 0}/{gate_status['total'] or 0} complete
+  Required Pending: {gate_status['required_pending'] or 0}
+  Gate Passed: {'Yes' if cycle['pre_uat_gate_passed'] else 'No'}
+"""
+
+        # Test summary
+        result += f"""
+Test Cases: {total_tests} total
+"""
+        if test_summary:
+            for status, count in sorted(test_summary.items()):
+                pct = round(100 * count / total_tests) if total_tests > 0 else 0
+                result += f"  • {status}: {count} ({pct}%)\n"
+
+        # Testers
+        if testers:
+            result += "\nAssigned Testers:\n"
+            for tester, count in sorted(testers.items()):
+                result += f"  • {tester}: {count} tests\n"
+
+        # Go/No-Go decision
+        if cycle['go_nogo_decision']:
+            result += f"""
+Go/No-Go Decision: {cycle['go_nogo_decision'].upper()}
+  Signed by: {cycle['go_nogo_signed_by']}
+  Date: {cycle['go_nogo_signed_date']}
+"""
+            if cycle['go_nogo_notes']:
+                result += f"  Notes: {cycle['go_nogo_notes']}\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"get_uat_cycle() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"get_uat_cycle() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def list_uat_cycles(
+    program_prefix: str = None,
+    status: str = None
+) -> str:
+    """
+    List UAT cycles, optionally filtered by program and/or status.
+
+    Args:
+        program_prefix: Filter by program prefix (e.g., "PROP")
+        status: Filter by status (planning, validation, kickoff, testing, review, retesting, decision, complete, cancelled)
+
+    Returns:
+        List of UAT cycles
+
+    Example:
+        list_uat_cycles("PROP")
+        list_uat_cycles(status="testing")
+    """
+    logger.info(f"list_uat_cycles() called - program={program_prefix}, status={status}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        query = """
+            SELECT c.*, p.name as program_name, p.prefix as program_prefix,
+                   (SELECT COUNT(*) FROM uat_test_cases WHERE uat_cycle_id = c.cycle_id) as test_count
+            FROM uat_cycles c
+            JOIN programs p ON c.program_id = p.program_id
+            WHERE 1=1
+        """
+        params = []
+
+        if program_prefix:
+            query += " AND UPPER(p.prefix) = UPPER(?)"
+            params.append(program_prefix)
+
+        if status:
+            query += " AND c.status = ?"
+            params.append(status)
+
+        query += " ORDER BY c.created_at DESC"
+
+        cursor = conn.execute(query, params)
+        cycles = cursor.fetchall()
+
+        if not cycles:
+            filters = []
+            if program_prefix:
+                filters.append(f"program={program_prefix}")
+            if status:
+                filters.append(f"status={status}")
+            filter_str = f" (filters: {', '.join(filters)})" if filters else ""
+            return f"No UAT cycles found{filter_str}."
+
+        result = f"UAT Cycles ({len(cycles)} found)\n"
+        result += "=" * 40 + "\n\n"
+
+        for cycle in cycles:
+            status_icon = {
+                'planning': '📋',
+                'validation': '🔍',
+                'kickoff': '🚀',
+                'testing': '🧪',
+                'review': '📊',
+                'retesting': '🔄',
+                'decision': '⚖️',
+                'complete': '✅',
+                'cancelled': '❌'
+            }.get(cycle['status'], '•')
+
+            result += f"{status_icon} [{cycle['cycle_id']}]\n"
+            result += f"   {cycle['name']} ({cycle['program_prefix']})\n"
+            result += f"   Type: {cycle['uat_type']} | Status: {cycle['status']}\n"
+            result += f"   Tests: {cycle['test_count']}"
+            if cycle['target_launch_date']:
+                result += f" | Launch: {cycle['target_launch_date']}"
+            result += "\n\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"list_uat_cycles() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"list_uat_cycles() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def assign_test_case(
+    test_id: str,
+    cycle_id: str,
+    assigned_to: str,
+    assignment_type: str = "primary",
+    profile_id: str = None,
+    platform: str = None,
+    persona: str = None,
+    target_rule: str = None,
+    patient_conditions: str = None
+) -> str:
+    """
+    Assign a test case to a tester within a UAT cycle.
+
+    Args:
+        test_id: Test case ID to assign
+        cycle_id: UAT cycle ID
+        assigned_to: Tester name or email
+        assignment_type: 'primary', 'secondary', or 'cross_check'
+        profile_id: NCCN profile ID if applicable
+        platform: Testing platform (e.g., "iOS", "Android", "Web")
+        persona: Tester persona (e.g., "Patient", "Provider", "Admin")
+        target_rule: Target NCCN rule being validated
+        patient_conditions: Patient conditions for the test (JSON or comma-separated)
+
+    Returns:
+        Assignment confirmation
+
+    Example:
+        assign_test_case("PROP-AUTH-001-TC01", "UAT-PROP-12345678", "john.doe@example.com",
+                        profile_id="NCCN-PROF-001", platform="iOS", persona="Patient")
+    """
+    logger.info(f"assign_test_case() called - test={test_id}, cycle={cycle_id}, tester={assigned_to}")
+
+    # Validate assignment_type
+    valid_types = ['primary', 'secondary', 'cross_check']
+    if assignment_type not in valid_types:
+        return f"Error: Invalid assignment_type '{assignment_type}'. Valid types: {', '.join(valid_types)}"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Verify cycle exists
+        cursor = conn.execute("SELECT cycle_id, status FROM uat_cycles WHERE cycle_id = ?", (cycle_id,))
+        cycle = cursor.fetchone()
+        if not cycle:
+            return f"Error: UAT cycle not found with ID '{cycle_id}'"
+
+        # Verify test case exists
+        cursor = conn.execute("SELECT test_id, title, uat_cycle_id FROM uat_test_cases WHERE test_id = ?", (test_id,))
+        test = cursor.fetchone()
+        if not test:
+            return f"Error: Test case not found with ID '{test_id}'"
+
+        # Update test case assignment
+        conn.execute("""
+            UPDATE uat_test_cases SET
+                uat_cycle_id = ?,
+                assigned_to = ?,
+                assignment_type = ?,
+                profile_id = COALESCE(?, profile_id),
+                platform = COALESCE(?, platform),
+                persona = COALESCE(?, persona),
+                target_rule = COALESCE(?, target_rule),
+                patient_conditions = COALESCE(?, patient_conditions),
+                updated_date = CURRENT_TIMESTAMP
+            WHERE test_id = ?
+        """, (
+            cycle_id, assigned_to, assignment_type,
+            profile_id, platform, persona, target_rule, patient_conditions,
+            test_id
+        ))
+
+        conn.commit()
+
+        logger.info(f"assign_test_case() SUCCESS - {test_id} assigned to {assigned_to}")
+
+        result = f"""✓ Test case assigned successfully!
+
+Test: {test_id}
+  "{test['title'][:60]}{'...' if len(test['title']) > 60 else ''}"
+
+Assigned to: {assigned_to}
+Assignment Type: {assignment_type}
+Cycle: {cycle_id}
+"""
+        if profile_id:
+            result += f"Profile: {profile_id}\n"
+        if platform:
+            result += f"Platform: {platform}\n"
+        if persona:
+            result += f"Persona: {persona}\n"
+        if target_rule:
+            result += f"Target Rule: {target_rule}\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"assign_test_case() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"assign_test_case() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def update_test_execution(
+    test_id: str,
+    status: str,
+    tested_by: str,
+    execution_notes: str = None,
+    defect_id: str = None,
+    defect_description: str = None,
+    dev_status: str = None,
+    dev_notes: str = None
+) -> str:
+    """
+    Update test execution results.
+
+    Args:
+        test_id: Test case ID
+        status: New status - 'Pass', 'Fail', 'Blocked', 'Skipped', 'Not Run'
+        tested_by: Who executed the test
+        execution_notes: Notes from test execution
+        defect_id: Defect/bug ID if test failed
+        defect_description: Description of the defect
+        dev_status: Dev response status ('acknowledged', 'investigating', 'fixed', 'wont_fix')
+        dev_notes: Developer notes
+
+    Returns:
+        Update confirmation
+
+    Example:
+        update_test_execution("PROP-AUTH-001-TC01", "Fail", "john.doe@example.com",
+                             execution_notes="Login button unresponsive",
+                             defect_id="BUG-123")
+    """
+    logger.info(f"update_test_execution() called - test={test_id}, status={status}")
+
+    # Validate status
+    valid_statuses = ['Pass', 'Fail', 'Blocked', 'Skipped', 'Not Run']
+    if status not in valid_statuses:
+        return f"Error: Invalid status '{status}'. Valid statuses: {', '.join(valid_statuses)}"
+
+    # Validate dev_status if provided
+    if dev_status:
+        valid_dev = ['acknowledged', 'investigating', 'fixed', 'wont_fix']
+        if dev_status not in valid_dev:
+            return f"Error: Invalid dev_status '{dev_status}'. Valid: {', '.join(valid_dev)}"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Verify test case exists and get current state
+        cursor = conn.execute(
+            "SELECT test_id, title, test_status, uat_cycle_id FROM uat_test_cases WHERE test_id = ?",
+            (test_id,)
+        )
+        test = cursor.fetchone()
+        if not test:
+            return f"Error: Test case not found with ID '{test_id}'"
+
+        old_status = test['test_status']
+
+        # Update test case
+        conn.execute("""
+            UPDATE uat_test_cases SET
+                test_status = ?,
+                tested_by = ?,
+                tested_date = CURRENT_TIMESTAMP,
+                execution_notes = COALESCE(?, execution_notes),
+                defect_id = COALESCE(?, defect_id),
+                defect_description = COALESCE(?, defect_description),
+                dev_status = COALESCE(?, dev_status),
+                dev_notes = COALESCE(?, dev_notes),
+                updated_date = CURRENT_TIMESTAMP
+            WHERE test_id = ?
+        """, (
+            status, tested_by, execution_notes,
+            defect_id, defect_description, dev_status, dev_notes,
+            test_id
+        ))
+
+        # Log to audit history
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        conn.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            'uat_test_case', test_id, 'Test Executed', 'test_status',
+            old_status, status, f'MCP:update_test_execution:{tested_by}',
+            now, execution_notes or f'Status changed to {status}'
+        ))
+
+        conn.commit()
+
+        logger.info(f"update_test_execution() SUCCESS - {test_id} now {status}")
+
+        status_icon = {'Pass': '✅', 'Fail': '❌', 'Blocked': '🚧', 'Skipped': '⏭️', 'Not Run': '⚪'}.get(status, '•')
+
+        result = f"""{status_icon} Test execution recorded!
+
+Test: {test_id}
+  "{test['title'][:60]}{'...' if len(test['title']) > 60 else ''}"
+
+Status: {old_status} → {status}
+Tested by: {tested_by}
+Tested date: {now}
+"""
+        if execution_notes:
+            result += f"\nNotes: {execution_notes}\n"
+        if defect_id:
+            result += f"\nDefect: {defect_id}"
+            if defect_description:
+                result += f"\n  {defect_description}"
+            result += "\n"
+        if dev_status:
+            result += f"\nDev Status: {dev_status}\n"
+            if dev_notes:
+                result += f"Dev Notes: {dev_notes}\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"update_test_execution() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"update_test_execution() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def bulk_assign_by_profile(
+    cycle_id: str,
+    profile_id: str,
+    assigned_to: str,
+    assignment_type: str = "primary",
+    platform: str = None
+) -> str:
+    """
+    Bulk assign all test cases for a profile to a tester.
+
+    Args:
+        cycle_id: UAT cycle ID
+        profile_id: Profile ID to match
+        assigned_to: Tester name or email
+        assignment_type: 'primary', 'secondary', or 'cross_check'
+        platform: Testing platform
+
+    Returns:
+        Summary of assignments made
+
+    Example:
+        bulk_assign_by_profile("UAT-PROP-12345678", "NCCN-PROF-001", "jane.doe@example.com")
+    """
+    logger.info(f"bulk_assign_by_profile() called - cycle={cycle_id}, profile={profile_id}, tester={assigned_to}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Verify cycle exists
+        cursor = conn.execute("SELECT cycle_id, name FROM uat_cycles WHERE cycle_id = ?", (cycle_id,))
+        cycle = cursor.fetchone()
+        if not cycle:
+            return f"Error: UAT cycle not found with ID '{cycle_id}'"
+
+        # Find test cases with matching profile_id
+        cursor = conn.execute("""
+            SELECT test_id, title FROM uat_test_cases
+            WHERE profile_id = ? AND (uat_cycle_id IS NULL OR uat_cycle_id = ?)
+        """, (profile_id, cycle_id))
+        tests = cursor.fetchall()
+
+        if not tests:
+            return f"No test cases found with profile_id '{profile_id}' for cycle '{cycle_id}'"
+
+        # Update all matching test cases
+        conn.execute("""
+            UPDATE uat_test_cases SET
+                uat_cycle_id = ?,
+                assigned_to = ?,
+                assignment_type = ?,
+                platform = COALESCE(?, platform),
+                updated_date = CURRENT_TIMESTAMP
+            WHERE profile_id = ? AND (uat_cycle_id IS NULL OR uat_cycle_id = ?)
+        """, (cycle_id, assigned_to, assignment_type, platform, profile_id, cycle_id))
+
+        conn.commit()
+
+        logger.info(f"bulk_assign_by_profile() SUCCESS - {len(tests)} tests assigned to {assigned_to}")
+
+        result = f"""✓ Bulk assignment complete!
+
+Profile: {profile_id}
+Cycle: {cycle['name']} ({cycle_id})
+Assigned to: {assigned_to}
+Assignment Type: {assignment_type}
+Tests Assigned: {len(tests)}
+"""
+        if platform:
+            result += f"Platform: {platform}\n"
+
+        result += "\nTest Cases:\n"
+        for test in tests[:10]:
+            result += f"  • {test['test_id']}: {test['title'][:50]}...\n"
+        if len(tests) > 10:
+            result += f"  ... and {len(tests) - 10} more\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"bulk_assign_by_profile() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"bulk_assign_by_profile() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def update_uat_cycle_status(
+    cycle_id: str,
+    status: str,
+    phase_date: str = None,
+    notes: str = None
+) -> str:
+    """
+    Update UAT cycle status and phase dates.
+
+    Args:
+        cycle_id: UAT cycle ID
+        status: New status (planning, validation, kickoff, testing, review, retesting, decision, complete, cancelled)
+        phase_date: Date for the phase transition (YYYY-MM-DD), defaults to today
+        notes: Optional notes about the status change
+
+    Returns:
+        Status update confirmation
+
+    Example:
+        update_uat_cycle_status("UAT-PROP-12345678", "testing", "2025-01-15")
+    """
+    logger.info(f"update_uat_cycle_status() called - cycle={cycle_id}, status={status}")
+
+    valid_statuses = ['planning', 'validation', 'kickoff', 'testing', 'review', 'retesting', 'decision', 'complete', 'cancelled']
+    if status not in valid_statuses:
+        return f"Error: Invalid status '{status}'. Valid statuses: {', '.join(valid_statuses)}"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get current cycle
+        cursor = conn.execute("SELECT * FROM uat_cycles WHERE cycle_id = ?", (cycle_id,))
+        cycle = cursor.fetchone()
+        if not cycle:
+            return f"Error: UAT cycle not found with ID '{cycle_id}'"
+
+        old_status = cycle['status']
+        phase_date = phase_date or date.today().isoformat()
+
+        # Map status to phase date column
+        date_column_map = {
+            'validation': 'validation_start',
+            'kickoff': 'kickoff_date',
+            'testing': 'testing_start',
+            'review': 'review_date',
+            'retesting': 'retest_start',
+            'decision': 'go_nogo_date',
+        }
+
+        # Update status and phase date
+        update_sql = "UPDATE uat_cycles SET status = ?, updated_at = CURRENT_TIMESTAMP, updated_by = 'MCP:update_uat_cycle_status'"
+        params = [status]
+
+        if status in date_column_map:
+            date_col = date_column_map[status]
+            update_sql += f", {date_col} = ?"
+            params.append(phase_date)
+
+        # Handle end dates for previous phase
+        if status == 'testing' and old_status == 'validation':
+            update_sql += ", validation_end = ?"
+            params.append(phase_date)
+        elif status == 'review' and old_status == 'testing':
+            update_sql += ", testing_end = ?"
+            params.append(phase_date)
+        elif status == 'decision' and old_status == 'retesting':
+            update_sql += ", retest_end = ?"
+            params.append(phase_date)
+
+        update_sql += " WHERE cycle_id = ?"
+        params.append(cycle_id)
+
+        conn.execute(update_sql, params)
+
+        # Log to audit
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        conn.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            'uat_cycle', cycle_id, 'Status Changed', 'status',
+            old_status, status, 'MCP:update_uat_cycle_status',
+            now, notes or f'Status changed to {status}'
+        ))
+
+        conn.commit()
+
+        logger.info(f"update_uat_cycle_status() SUCCESS - {cycle_id} now {status}")
+
+        status_icon = {
+            'planning': '📋', 'validation': '🔍', 'kickoff': '🚀',
+            'testing': '🧪', 'review': '📊', 'retesting': '🔄',
+            'decision': '⚖️', 'complete': '✅', 'cancelled': '❌'
+        }.get(status, '•')
+
+        return f"""{status_icon} UAT Cycle status updated!
+
+Cycle: {cycle_id}
+  {cycle['name']}
+
+Status: {old_status} → {status}
+Date: {phase_date}
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"update_uat_cycle_status() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"update_uat_cycle_status() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def update_pre_uat_gate(
+    cycle_id: str,
+    item_id: int = None,
+    category: str = None,
+    is_complete: bool = None,
+    completed_by: str = None,
+    notes: str = None,
+    sign_off: bool = False,
+    signed_by: str = None
+) -> str:
+    """
+    Update pre-UAT gate items or sign off on the gate.
+
+    Args:
+        cycle_id: UAT cycle ID
+        item_id: Specific gate item ID to update
+        category: Update all items in a category
+        is_complete: Mark item(s) as complete/incomplete
+        completed_by: Who completed the item
+        notes: Notes about completion
+        sign_off: If True, attempt to sign off on the entire gate
+        signed_by: Who is signing off (required if sign_off=True)
+
+    Returns:
+        Gate update confirmation
+
+    Example:
+        # Complete a specific item
+        update_pre_uat_gate("UAT-PROP-12345678", item_id=1, is_complete=True, completed_by="john@example.com")
+
+        # Sign off on the gate
+        update_pre_uat_gate("UAT-PROP-12345678", sign_off=True, signed_by="jane@example.com")
+    """
+    logger.info(f"update_pre_uat_gate() called - cycle={cycle_id}, item={item_id}, sign_off={sign_off}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Verify cycle exists
+        cursor = conn.execute("SELECT * FROM uat_cycles WHERE cycle_id = ?", (cycle_id,))
+        cycle = cursor.fetchone()
+        if not cycle:
+            return f"Error: UAT cycle not found with ID '{cycle_id}'"
+
+        if sign_off:
+            # Check if all required items are complete
+            cursor = conn.execute("""
+                SELECT COUNT(*) as pending FROM pre_uat_gate_items
+                WHERE cycle_id = ? AND is_required = 1 AND is_complete = 0
+            """, (cycle_id,))
+            pending = cursor.fetchone()['pending']
+
+            if pending > 0:
+                return f"Error: Cannot sign off - {pending} required gate item(s) still pending"
+
+            if not signed_by:
+                return "Error: signed_by is required when sign_off=True"
+
+            # Sign off on the gate
+            conn.execute("""
+                UPDATE uat_cycles SET
+                    pre_uat_gate_passed = 1,
+                    pre_uat_gate_signed_by = ?,
+                    pre_uat_gate_signed_date = DATE('now'),
+                    pre_uat_gate_notes = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE cycle_id = ?
+            """, (signed_by, notes, cycle_id))
+
+            conn.commit()
+
+            return f"""✓ Pre-UAT Gate SIGNED OFF!
+
+Cycle: {cycle_id}
+  {cycle['name']}
+
+Signed by: {signed_by}
+Date: {date.today().isoformat()}
+
+The UAT cycle is now cleared to proceed to testing.
+"""
+
+        elif item_id is not None:
+            # Update specific item
+            if is_complete is None:
+                return "Error: is_complete is required when updating an item"
+
+            completed_date = date.today().isoformat() if is_complete else None
+
+            conn.execute("""
+                UPDATE pre_uat_gate_items SET
+                    is_complete = ?,
+                    completed_by = ?,
+                    completed_date = ?,
+                    notes = COALESCE(?, notes)
+                WHERE item_id = ? AND cycle_id = ?
+            """, (1 if is_complete else 0, completed_by, completed_date, notes, item_id, cycle_id))
+
+            conn.commit()
+
+            return f"✓ Gate item {item_id} {'completed' if is_complete else 'marked incomplete'}"
+
+        elif category:
+            # Update all items in category
+            if is_complete is None:
+                return "Error: is_complete is required when updating a category"
+
+            completed_date = date.today().isoformat() if is_complete else None
+
+            cursor = conn.execute("""
+                UPDATE pre_uat_gate_items SET
+                    is_complete = ?,
+                    completed_by = ?,
+                    completed_date = ?
+                WHERE cycle_id = ? AND category = ?
+            """, (1 if is_complete else 0, completed_by, completed_date, cycle_id, category))
+
+            return f"✓ {cursor.rowcount} gate items in '{category}' {'completed' if is_complete else 'marked incomplete'}"
+
+        else:
+            # Show gate status
+            cursor = conn.execute("""
+                SELECT * FROM pre_uat_gate_items
+                WHERE cycle_id = ?
+                ORDER BY category, sequence
+            """, (cycle_id,))
+            items = cursor.fetchall()
+
+            result = f"""Pre-UAT Gate Status for {cycle_id}
+{'=' * 40}
+
+"""
+            current_category = None
+            for item in items:
+                if item['category'] != current_category:
+                    current_category = item['category']
+                    result += f"\n{current_category.upper().replace('_', ' ')}:\n"
+
+                icon = '✓' if item['is_complete'] else ('*' if item['is_required'] else '○')
+                result += f"  [{icon}] {item['item_text']}"
+                if item['is_complete'] and item['completed_by']:
+                    result += f" (by {item['completed_by']})"
+                result += "\n"
+
+            result += f"\nGate Passed: {'Yes' if cycle['pre_uat_gate_passed'] else 'No'}\n"
+            if cycle['pre_uat_gate_signed_by']:
+                result += f"Signed by: {cycle['pre_uat_gate_signed_by']} on {cycle['pre_uat_gate_signed_date']}\n"
+
+            return result
+
+    except sqlite3.Error as e:
+        logger.error(f"update_pre_uat_gate() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"update_pre_uat_gate() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def get_cycle_dashboard(cycle_id: str) -> str:
+    """
+    Get a comprehensive dashboard view of UAT cycle progress.
+
+    Args:
+        cycle_id: UAT cycle ID
+
+    Returns:
+        Dashboard with test progress, tester workload, and key metrics
+
+    Example:
+        get_cycle_dashboard("UAT-PROP-12345678")
+    """
+    logger.info(f"get_cycle_dashboard() called - cycle={cycle_id}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Use the v_uat_cycle_summary view
+        cursor = conn.execute("""
+            SELECT * FROM v_uat_cycle_summary WHERE cycle_id = ?
+        """, (cycle_id,))
+        summary = cursor.fetchone()
+
+        if not summary:
+            return f"Error: UAT cycle not found with ID '{cycle_id}'"
+
+        summary = dict(summary)
+
+        # Get tester progress from view
+        cursor = conn.execute("""
+            SELECT * FROM v_uat_tester_progress WHERE cycle_id = ?
+            ORDER BY completion_pct DESC
+        """, (cycle_id,))
+        tester_progress = cursor.fetchall()
+
+        # Get tests needing retest
+        cursor = conn.execute("""
+            SELECT * FROM v_retest_queue WHERE cycle_id = ?
+        """, (cycle_id,))
+        retest_queue = cursor.fetchall()
+
+        # Build dashboard
+        result = f"""
+╔══════════════════════════════════════════════════════════════╗
+║  UAT CYCLE DASHBOARD                                          ║
+╠══════════════════════════════════════════════════════════════╣
+║  {summary['name'][:55]:<55} ║
+║  {summary['program_prefix']} | {summary['uat_type']:<20} | Status: {summary['status']:<12} ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+        if summary['days_to_launch']:
+            if summary['days_to_launch'] > 0:
+                result += f"⏰ {summary['days_to_launch']} days until target launch\n"
+            elif summary['days_to_launch'] == 0:
+                result += "⚠️  TARGET LAUNCH DATE IS TODAY\n"
+            else:
+                result += f"🚨 {abs(summary['days_to_launch'])} days PAST target launch date\n"
+
+        # Test Progress
+        total = summary['total_tests'] or 0
+        passed = summary['passed'] or 0
+        failed = summary['failed'] or 0
+        blocked = summary['blocked'] or 0
+        not_run = summary['not_run'] or 0
+
+        result += f"""
+TEST PROGRESS
+─────────────────────────────────────────
+Total Tests: {total}
+
+"""
+        if total > 0:
+            pass_pct = round(100 * passed / total)
+            fail_pct = round(100 * failed / total)
+            blocked_pct = round(100 * blocked / total)
+            not_run_pct = round(100 * not_run / total)
+
+            # Progress bar
+            bar_width = 40
+            pass_bar = int(bar_width * passed / total)
+            fail_bar = int(bar_width * failed / total)
+            blocked_bar = int(bar_width * blocked / total)
+            not_run_bar = bar_width - pass_bar - fail_bar - blocked_bar
+
+            result += f"[{'█' * pass_bar}{'░' * fail_bar}{'▒' * blocked_bar}{'·' * not_run_bar}]\n\n"
+
+            result += f"  ✅ Passed:   {passed:>4} ({pass_pct}%)\n"
+            result += f"  ❌ Failed:   {failed:>4} ({fail_pct}%)\n"
+            result += f"  🚧 Blocked:  {blocked:>4} ({blocked_pct}%)\n"
+            result += f"  ⚪ Not Run:  {not_run:>4} ({not_run_pct}%)\n"
+
+        # Tester Progress
+        if tester_progress:
+            result += f"""
+TESTER PROGRESS
+─────────────────────────────────────────
+"""
+            for tp in tester_progress:
+                tp = dict(tp)
+                pct = tp['completion_pct'] or 0
+                bar = '█' * int(pct / 5) + '·' * (20 - int(pct / 5))
+                result += f"  {tp['assigned_to'][:20]:<20} [{bar}] {pct:>3}%\n"
+                result += f"    {tp['passed'] or 0}✓ {tp['failed'] or 0}✗ {tp['not_run'] or 0}○\n"
+
+        # Retest Queue
+        if retest_queue:
+            result += f"""
+RETEST QUEUE ({len(retest_queue)} tests)
+─────────────────────────────────────────
+"""
+            for rt in retest_queue[:5]:
+                rt = dict(rt)
+                result += f"  • {rt['test_id']}: {rt['title'][:40]}...\n"
+                result += f"    Status: {rt['retest_status']} | Defect: {rt['defect_id'] or 'N/A'}\n"
+            if len(retest_queue) > 5:
+                result += f"  ... and {len(retest_queue) - 5} more\n"
+
+        # Gate Status
+        result += f"""
+PRE-UAT GATE
+─────────────────────────────────────────
+  Gate Passed: {'✓ Yes' if summary.get('pre_uat_gate_passed') else '○ No'}
+"""
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"get_cycle_dashboard() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"get_cycle_dashboard() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def get_tester_workload(
+    cycle_id: str = None,
+    tester: str = None
+) -> str:
+    """
+    Get tester workload and progress across UAT cycles.
+
+    Args:
+        cycle_id: Filter by specific cycle
+        tester: Filter by specific tester
+
+    Returns:
+        Tester workload summary
+
+    Example:
+        get_tester_workload("UAT-PROP-12345678")
+        get_tester_workload(tester="john.doe@example.com")
+    """
+    logger.info(f"get_tester_workload() called - cycle={cycle_id}, tester={tester}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        query = "SELECT * FROM v_uat_tester_progress WHERE 1=1"
+        params = []
+
+        if cycle_id:
+            query += " AND cycle_id = ?"
+            params.append(cycle_id)
+        if tester:
+            query += " AND assigned_to = ?"
+            params.append(tester)
+
+        query += " ORDER BY cycle_name, completion_pct DESC"
+
+        cursor = conn.execute(query, params)
+        results = cursor.fetchall()
+
+        if not results:
+            filters = []
+            if cycle_id:
+                filters.append(f"cycle={cycle_id}")
+            if tester:
+                filters.append(f"tester={tester}")
+            filter_str = f" (filters: {', '.join(filters)})" if filters else ""
+            return f"No tester workload data found{filter_str}."
+
+        result = "TESTER WORKLOAD REPORT\n"
+        result += "=" * 60 + "\n\n"
+
+        current_cycle = None
+        for row in results:
+            row = dict(row)
+
+            if row['cycle_name'] != current_cycle:
+                current_cycle = row['cycle_name']
+                result += f"\n{current_cycle} ({row['cycle_id']})\n"
+                result += "-" * 50 + "\n"
+
+            pct = row['completion_pct'] or 0
+            bar = '█' * int(pct / 5) + '·' * (20 - int(pct / 5))
+
+            result += f"\n{row['assigned_to']}\n"
+            result += f"  Progress: [{bar}] {pct}%\n"
+            result += f"  Tests: {row['total_tests']} total\n"
+            result += f"    ✅ Passed: {row['passed'] or 0}\n"
+            result += f"    ❌ Failed: {row['failed'] or 0}\n"
+            result += f"    🚧 Blocked: {row['blocked'] or 0}\n"
+            result += f"    ⚪ Not Run: {row['not_run'] or 0}\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"get_tester_workload() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"get_tester_workload() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def record_go_nogo_decision(
+    cycle_id: str,
+    decision: str,
+    signed_by: str,
+    notes: str = None
+) -> str:
+    """
+    Record the Go/No-Go decision for a UAT cycle.
+
+    Args:
+        cycle_id: UAT cycle ID
+        decision: Decision - 'go', 'conditional_go', or 'no_go'
+        signed_by: Who made the decision
+        notes: Decision notes/conditions
+
+    Returns:
+        Decision confirmation
+
+    Example:
+        record_go_nogo_decision("UAT-PROP-12345678", "go", "jane.smith@example.com",
+                               notes="All critical tests passed")
+    """
+    logger.info(f"record_go_nogo_decision() called - cycle={cycle_id}, decision={decision}")
+
+    valid_decisions = ['go', 'conditional_go', 'no_go']
+    if decision not in valid_decisions:
+        return f"Error: Invalid decision '{decision}'. Valid: {', '.join(valid_decisions)}"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get cycle
+        cursor = conn.execute("SELECT * FROM uat_cycles WHERE cycle_id = ?", (cycle_id,))
+        cycle = cursor.fetchone()
+        if not cycle:
+            return f"Error: UAT cycle not found with ID '{cycle_id}'"
+
+        # Check if gate passed (recommended but not required)
+        warning = ""
+        if not cycle['pre_uat_gate_passed']:
+            warning = "\n⚠️  Warning: Pre-UAT gate has not been signed off!\n"
+
+        # Record decision
+        conn.execute("""
+            UPDATE uat_cycles SET
+                go_nogo_decision = ?,
+                go_nogo_signed_by = ?,
+                go_nogo_signed_date = DATE('now'),
+                go_nogo_notes = ?,
+                status = CASE WHEN ? = 'go' THEN 'complete' ELSE status END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE cycle_id = ?
+        """, (decision, signed_by, notes, decision, cycle_id))
+
+        # Log to audit
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        conn.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            'uat_cycle', cycle_id, 'Go/No-Go Decision', 'go_nogo_decision',
+            None, decision, f'MCP:record_go_nogo_decision:{signed_by}',
+            now, notes or f'Decision: {decision}'
+        ))
+
+        conn.commit()
+
+        decision_icon = {'go': '✅', 'conditional_go': '⚠️', 'no_go': '❌'}.get(decision, '•')
+        decision_text = {'go': 'GO', 'conditional_go': 'CONDITIONAL GO', 'no_go': 'NO-GO'}.get(decision)
+
+        result = f"""
+╔══════════════════════════════════════════════════════════════╗
+║  {decision_icon} GO/NO-GO DECISION RECORDED                              ║
+╠══════════════════════════════════════════════════════════════╣
+║  Decision: {decision_text:<48} ║
+║  Cycle: {cycle_id:<50} ║
+║  Signed by: {signed_by:<46} ║
+║  Date: {date.today().isoformat():<51} ║
+╚══════════════════════════════════════════════════════════════╝
+{warning}"""
+        if notes:
+            result += f"\nNotes:\n  {notes}\n"
+
+        if decision == 'go':
+            result += "\n✅ UAT cycle marked as COMPLETE. Ready for production launch!\n"
+        elif decision == 'conditional_go':
+            result += "\n⚠️  Conditional approval - review notes for required conditions.\n"
+        else:
+            result += "\n❌ Launch blocked. Address issues and re-evaluate.\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"record_go_nogo_decision() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"record_go_nogo_decision() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
 
 
 # ============================================================
