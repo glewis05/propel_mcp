@@ -7985,6 +7985,1371 @@ Next steps:
 
 
 # ============================================================
+# CLINIC MANAGEMENT TOOLS
+# ============================================================
+# Tools for creating, updating, and managing clinics, providers,
+# configurations, and importing onboarding data.
+#
+# All tools support preview_only mode (default=True) for safe testing.
+
+import uuid
+import json as json_lib
+
+
+def fuzzy_match_clinic(conn, search_term: str, program_id: str = None):
+    """
+    Find clinics matching a search term (fuzzy match on name, code, or epic_id).
+
+    Args:
+        conn: Database connection
+        search_term: Clinic name, code, or ID to search for
+        program_id: Optional program_id to narrow search
+
+    Returns:
+        List of matching clinic rows (dict format)
+    """
+    search_lower = search_term.lower().strip()
+
+    query = """
+        SELECT c.*, p.name as program_name, p.prefix as program_prefix
+        FROM clinics c
+        JOIN programs p ON c.program_id = p.program_id
+        WHERE (
+            LOWER(c.name) LIKE ?
+            OR LOWER(c.code) LIKE ?
+            OR c.clinic_id = ?
+            OR c.epic_id = ?
+        )
+    """
+    params = [f"%{search_lower}%", f"%{search_lower}%", search_term, search_term]
+
+    if program_id:
+        query += " AND c.program_id = ?"
+        params.append(program_id)
+
+    cursor = conn.execute(query, params)
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def resolve_program_id_by_prefix(conn, prefix: str) -> str:
+    """
+    Get program_id from prefix (P4M, PR4M, GRX).
+
+    Args:
+        conn: Database connection
+        prefix: Program prefix
+
+    Returns:
+        program_id string
+
+    Raises:
+        ValueError if program not found
+    """
+    cursor = conn.execute(
+        "SELECT program_id FROM programs WHERE UPPER(prefix) = ?",
+        (prefix.upper(),)
+    )
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError(f"Program not found with prefix: {prefix}")
+    return row['program_id']
+
+
+def get_nested_value(data: dict, path: str):
+    """
+    Get nested dict value by dot-notation path.
+
+    Example: get_nested_value(data, 'lab_config.default_sample_type')
+
+    Args:
+        data: Dictionary to traverse
+        path: Dot-separated path (e.g., 'a.b.0.c')
+
+    Returns:
+        Value at path, or None if not found
+    """
+    keys = path.split('.')
+    value = data
+    for key in keys:
+        if isinstance(value, dict):
+            value = value.get(key)
+        elif isinstance(value, list) and key.isdigit():
+            idx = int(key)
+            value = value[idx] if idx < len(value) else None
+        else:
+            return None
+        if value is None:
+            return None
+    return value
+
+
+@mcp.tool()
+def list_clinics(
+    program: Optional[str] = None,
+    status: Optional[str] = None,
+    include_config_status: bool = True
+) -> str:
+    """
+    List all clinics with their key information.
+
+    Args:
+        program: Filter by program prefix (P4M, PR4M, GRX)
+        status: Filter by status (Active, Inactive, Onboarding)
+        include_config_status: Include configuration completeness info
+
+    Returns:
+        Formatted list of clinics grouped by program
+
+    Example:
+        list_clinics()                    # All clinics
+        list_clinics(program="P4M")       # Only P4M clinics
+        list_clinics(status="Active")     # Only active clinics
+    """
+    logger.info(f"list_clinics() called - program={program}, status={status}")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Build query
+        query = """
+            SELECT
+                c.*,
+                p.name as program_name,
+                p.prefix as program_prefix,
+                (SELECT COUNT(*) FROM providers pr
+                 JOIN locations l ON pr.location_id = l.location_id
+                 WHERE l.clinic_id = c.clinic_id AND pr.is_active = 1) as provider_count,
+                (SELECT COUNT(*) FROM config_values cv
+                 WHERE cv.clinic_id = c.clinic_id) as config_count
+            FROM clinics c
+            JOIN programs p ON c.program_id = p.program_id
+            WHERE 1=1
+        """
+        params = []
+
+        if program:
+            query += " AND UPPER(p.prefix) = ?"
+            params.append(program.upper())
+
+        if status:
+            query += " AND c.status = ?"
+            params.append(status)
+
+        query += " ORDER BY p.prefix, c.name"
+
+        cursor = conn.execute(query, params)
+        clinics = cursor.fetchall()
+
+        if not clinics:
+            return "No clinics found matching the criteria."
+
+        # Group by program
+        by_program = {}
+        for clinic in clinics:
+            prefix = clinic['program_prefix']
+            if prefix not in by_program:
+                by_program[prefix] = {
+                    'name': clinic['program_name'],
+                    'clinics': []
+                }
+            by_program[prefix]['clinics'].append(clinic)
+
+        # Format output
+        lines = [f"Clinics ({len(clinics)} total)", "=" * 40, ""]
+
+        for prefix, data in sorted(by_program.items()):
+            lines.append(f"{prefix} - {data['name']} ({len(data['clinics'])} clinics):")
+
+            for c in data['clinics']:
+                epic_str = f"(EPIC: {c['epic_id']})" if c['epic_id'] else "(no EPIC ID)"
+                status_str = c['status'] or 'Unknown'
+                phone_str = c['phone'] or '(no phone)'
+                provider_str = f"Providers: {c['provider_count']}"
+
+                # Config status
+                config_status = "✓" if c['config_submitted_at'] else "○"
+                if c['config_count'] > 0:
+                    config_str = f"Config: {config_status} ({c['config_count']} values)"
+                else:
+                    config_str = "Config: ✗ Not configured"
+
+                lines.append(f"  • {c['name']} {epic_str} - {status_str}")
+                lines.append(f"    Phone: {phone_str} | {provider_str} | {config_str}")
+
+            lines.append("")
+
+        conn.close()
+        return "\n".join(lines)
+
+    except sqlite3.Error as e:
+        logger.error(f"list_clinics() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"list_clinics() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def create_clinic(
+    clinic_name: str,
+    program: str,
+    epic_id: str = None,
+    code: str = None,
+    address_street: str = None,
+    address_city: str = None,
+    address_state: str = None,
+    address_zip: str = None,
+    phone: str = None,
+    hours_of_operation: str = None,
+    preview_only: bool = True
+) -> str:
+    """
+    Create a new clinic in the database.
+
+    Args:
+        clinic_name: Full name of the clinic (e.g., "Franz Clinic")
+        program: Program prefix (P4M, PR4M, GRX)
+        epic_id: Clinic's EPIC system identifier
+        code: Short code for the clinic (e.g., "FRANZ")
+        address_street: Street address
+        address_city: City
+        address_state: State (2-letter code)
+        address_zip: ZIP code
+        phone: Main clinic phone number
+        hours_of_operation: Operating hours (e.g., "08:00 - 17:00")
+        preview_only: If True (default), shows what WOULD happen without making changes
+
+    Returns:
+        Confirmation with clinic_id or preview summary
+
+    Example:
+        create_clinic(
+            clinic_name="Franz Clinic",
+            program="P4M",
+            epic_id="12345",
+            phone="555-123-4567",
+            preview_only=False
+        )
+    """
+    logger.info(f"create_clinic() called - name={clinic_name}, program={program}, preview={preview_only}")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # 1. Validate program exists
+        try:
+            program_id = resolve_program_id_by_prefix(conn, program)
+        except ValueError as e:
+            conn.close()
+            return str(e)
+
+        # Get program info for display
+        cursor = conn.execute(
+            "SELECT name, prefix FROM programs WHERE program_id = ?",
+            (program_id,)
+        )
+        program_info = cursor.fetchone()
+
+        # 2. Check for existing clinic with similar name or same EPIC ID
+        similar = fuzzy_match_clinic(conn, clinic_name, program_id)
+
+        # Also check for exact EPIC ID match
+        if epic_id:
+            cursor = conn.execute(
+                "SELECT * FROM clinics WHERE epic_id = ?",
+                (epic_id,)
+            )
+            epic_match = cursor.fetchone()
+            if epic_match and dict(epic_match) not in similar:
+                similar.append(dict(epic_match))
+
+        # 3. If similar clinics found, return warning
+        if similar:
+            lines = ["⚠️  POTENTIAL DUPLICATES FOUND", ""]
+            for s in similar:
+                lines.append(f"  • {s['name']} (ID: {s['clinic_id'][:8]}...)")
+                if s.get('epic_id'):
+                    lines.append(f"    EPIC ID: {s['epic_id']}")
+            lines.extend([
+                "",
+                "If this is intentional, you can still create the clinic.",
+                "Otherwise, use update_clinic() to modify the existing record."
+            ])
+            # Don't block, just warn
+
+        # 4. Generate clinic ID
+        clinic_id = str(uuid.uuid4())
+
+        # Auto-generate code if not provided
+        if not code:
+            # Take first 4-6 letters of clinic name
+            code = ''.join(c for c in clinic_name.upper() if c.isalpha())[:6]
+
+        # Format address
+        address_parts = []
+        if address_street:
+            address_parts.append(address_street)
+        if address_city or address_state or address_zip:
+            city_state_zip = f"{address_city or ''}, {address_state or ''} {address_zip or ''}".strip(', ')
+            address_parts.append(city_state_zip)
+        address_display = ", ".join(address_parts) if address_parts else "(not provided)"
+
+        # 5. Preview mode
+        if preview_only:
+            lines = [
+                "=== CREATE CLINIC PREVIEW ===",
+                "",
+                f"Clinic: {clinic_name}",
+                f"Code: {code}",
+                f"Program: {program} ({program_info['name']})",
+                f"EPIC ID: {epic_id or '(not provided)'}",
+                f"Address: {address_display}",
+                f"Phone: {phone or '(not provided)'}",
+                f"Hours: {hours_of_operation or '(not provided)'}",
+                ""
+            ]
+
+            if similar:
+                lines.extend(["⚠️  Similar clinics exist (see above)", ""])
+
+            lines.extend([
+                "To create this clinic, run:",
+                f'  create_clinic("{clinic_name}", "{program}", preview_only=False, ...)'
+            ])
+
+            conn.close()
+            return "\n".join(lines)
+
+        # 6. Execute INSERT
+        cursor = conn.execute("""
+            INSERT INTO clinics (
+                clinic_id, program_id, name, code, status,
+                epic_id, address_street, address_city, address_state, address_zip,
+                phone, hours_of_operation, created_by
+            ) VALUES (?, ?, ?, ?, 'Onboarding', ?, ?, ?, ?, ?, ?, ?, 'MCP:create_clinic')
+        """, (
+            clinic_id, program_id, clinic_name, code,
+            epic_id, address_street, address_city, address_state, address_zip,
+            phone, hours_of_operation
+        ))
+
+        # Log to audit
+        log_audit(
+            cursor, 'clinic', clinic_id, 'Created', 'clinic',
+            None, clinic_name, 'MCP:create_clinic',
+            datetime.now().isoformat(), f"Created clinic {clinic_name} for {program}"
+        )
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"create_clinic() SUCCESS - created {clinic_id}")
+
+        return f"""✓ Clinic created successfully!
+
+Clinic ID: {clinic_id}
+Name: {clinic_name}
+Code: {code}
+Program: {program}
+Status: Onboarding
+
+Next steps:
+  • Set configurations: set_clinic_config("{clinic_name}", "{program}", "helpdesk_phone", "555-999-9999")
+  • Add providers: create_provider("{clinic_name}", "{program}", "Dr. Jane Smith", "1234567890")
+  • Or import full config: import_onboarding_json("~/imports/file.json", "{program}")
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"create_clinic() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"create_clinic() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def update_clinic(
+    clinic: str,
+    program: str = None,
+    clinic_name: str = None,
+    epic_id: str = None,
+    code: str = None,
+    address_street: str = None,
+    address_city: str = None,
+    address_state: str = None,
+    address_zip: str = None,
+    phone: str = None,
+    hours_of_operation: str = None,
+    status: str = None,
+    preview_only: bool = True
+) -> str:
+    """
+    Update an existing clinic's information.
+
+    Args:
+        clinic: Clinic name, code, or ID to update (fuzzy match supported)
+        program: Program prefix to help identify clinic if name is ambiguous
+        clinic_name: Updated clinic name
+        epic_id: Updated EPIC ID
+        code: Updated clinic code
+        address_street: Updated street address
+        address_city: Updated city
+        address_state: Updated state
+        address_zip: Updated ZIP
+        phone: Updated phone
+        hours_of_operation: Updated hours
+        status: Updated status (Active, Inactive, Onboarding, Archived)
+        preview_only: If True (default), shows what WOULD change
+
+    Returns:
+        Summary of changes (preview or committed)
+
+    Example:
+        update_clinic("Franz", "P4M", phone="555-999-8888", preview_only=False)
+    """
+    logger.info(f"update_clinic() called - clinic={clinic}, program={program}, preview={preview_only}")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Resolve program_id if provided
+        program_id = None
+        if program:
+            try:
+                program_id = resolve_program_id_by_prefix(conn, program)
+            except ValueError as e:
+                conn.close()
+                return str(e)
+
+        # Find clinic
+        matches = fuzzy_match_clinic(conn, clinic, program_id)
+
+        if not matches:
+            conn.close()
+            return f"Clinic not found: {clinic}" + (f" in program {program}" if program else "")
+
+        if len(matches) > 1:
+            lines = ["Multiple clinics found. Please be more specific:", ""]
+            for m in matches:
+                lines.append(f"  • {m['name']} ({m['program_prefix']}) - ID: {m['clinic_id'][:8]}...")
+            lines.extend(["", "Specify the program parameter to narrow down."])
+            conn.close()
+            return "\n".join(lines)
+
+        current = matches[0]
+
+        # Build update dict with only provided (non-None) values
+        updates = {}
+        field_labels = {
+            'name': 'Clinic Name',
+            'epic_id': 'EPIC ID',
+            'code': 'Code',
+            'address_street': 'Street',
+            'address_city': 'City',
+            'address_state': 'State',
+            'address_zip': 'ZIP',
+            'phone': 'Phone',
+            'hours_of_operation': 'Hours',
+            'status': 'Status'
+        }
+
+        if clinic_name is not None:
+            updates['name'] = clinic_name
+        if epic_id is not None:
+            updates['epic_id'] = epic_id
+        if code is not None:
+            updates['code'] = code
+        if address_street is not None:
+            updates['address_street'] = address_street
+        if address_city is not None:
+            updates['address_city'] = address_city
+        if address_state is not None:
+            updates['address_state'] = address_state
+        if address_zip is not None:
+            updates['address_zip'] = address_zip
+        if phone is not None:
+            updates['phone'] = phone
+        if hours_of_operation is not None:
+            updates['hours_of_operation'] = hours_of_operation
+        if status is not None:
+            # Validate status
+            valid_statuses = ['Active', 'Inactive', 'Onboarding', 'Archived']
+            if status not in valid_statuses:
+                conn.close()
+                return f"Invalid status: {status}. Valid values: {', '.join(valid_statuses)}"
+            updates['status'] = status
+
+        if not updates:
+            conn.close()
+            return "No changes specified. Provide at least one field to update."
+
+        # Preview mode
+        if preview_only:
+            lines = [
+                "=== UPDATE CLINIC PREVIEW ===",
+                "",
+                f"Clinic: {current['name']} (ID: {current['clinic_id'][:8]}...)",
+                f"Program: {current['program_prefix']}",
+                "",
+                "Changes:"
+            ]
+
+            for field, new_val in updates.items():
+                old_val = current.get(field) or "(not set)"
+                label = field_labels.get(field, field)
+                lines.append(f'  {label}: "{old_val}" → "{new_val}"')
+
+            # List unchanged fields
+            unchanged = [f for f in field_labels if f not in updates]
+            if unchanged:
+                lines.extend(["", f"No changes to: {', '.join(field_labels[f] for f in unchanged)}"])
+
+            lines.extend([
+                "",
+                "To apply these changes, run:",
+                f'  update_clinic("{clinic}", "{current["program_prefix"]}", ..., preview_only=False)'
+            ])
+
+            conn.close()
+            return "\n".join(lines)
+
+        # Execute UPDATE
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        set_clause += ", updated_date = CURRENT_TIMESTAMP"
+
+        conn.execute(
+            f"UPDATE clinics SET {set_clause} WHERE clinic_id = ?",
+            list(updates.values()) + [current['clinic_id']]
+        )
+
+        # Log to audit
+        cursor = conn.cursor()
+        for field, new_val in updates.items():
+            old_val = current.get(field)
+            log_audit(
+                cursor, 'clinic', current['clinic_id'], 'Updated', field,
+                str(old_val), str(new_val), 'MCP:update_clinic',
+                datetime.now().isoformat(), f"Updated {field}"
+            )
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"update_clinic() SUCCESS - updated {current['clinic_id']}")
+
+        changes_summary = ", ".join(f"{field_labels.get(f, f)}" for f in updates.keys())
+        return f"""✓ Clinic updated successfully!
+
+Clinic: {current['name']}
+Updated fields: {changes_summary}
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"update_clinic() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"update_clinic() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def set_clinic_config(
+    clinic: str,
+    program: str,
+    config_key: str,
+    config_value: str,
+    preview_only: bool = True
+) -> str:
+    """
+    Set a configuration value for a clinic.
+
+    Args:
+        clinic: Clinic name (fuzzy match supported)
+        program: Program prefix (P4M, PR4M, GRX)
+        config_key: Configuration key (e.g., "helpdesk_phone")
+        config_value: Value to set
+        preview_only: If True (default), shows what WOULD change
+
+    Returns:
+        Confirmation of config change
+
+    Common config keys:
+        helpdesk_phone, helpdesk_email, helpdesk_hours,
+        default_test, default_specimen, lab_account_number,
+        extract_patient_status, extract_procedure_type
+
+    Example:
+        set_clinic_config("Franz", "P4M", "helpdesk_phone", "555-999-9999", preview_only=False)
+    """
+    logger.info(f"set_clinic_config() called - clinic={clinic}, key={config_key}, preview={preview_only}")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Resolve program
+        try:
+            program_id = resolve_program_id_by_prefix(conn, program)
+        except ValueError as e:
+            conn.close()
+            return str(e)
+
+        # Find clinic
+        matches = fuzzy_match_clinic(conn, clinic, program_id)
+
+        if not matches:
+            conn.close()
+            return f"Clinic not found: {clinic} in program {program}"
+
+        if len(matches) > 1:
+            lines = ["Multiple clinics found:", ""]
+            for m in matches:
+                lines.append(f"  • {m['name']}")
+            conn.close()
+            return "\n".join(lines)
+
+        clinic_info = matches[0]
+        clinic_id = clinic_info['clinic_id']
+
+        # Check if config key exists in definitions
+        cursor = conn.execute(
+            "SELECT * FROM config_definitions WHERE config_key = ?",
+            (config_key,)
+        )
+        config_def = cursor.fetchone()
+
+        if not config_def:
+            # Get list of valid keys
+            cursor = conn.execute(
+                "SELECT config_key, display_name, category FROM config_definitions ORDER BY category, display_name"
+            )
+            all_keys = cursor.fetchall()
+
+            lines = [f"Unknown config key: {config_key}", "", "Valid config keys:"]
+            current_cat = None
+            for k in all_keys:
+                if k['category'] != current_cat:
+                    current_cat = k['category']
+                    lines.append(f"\n  {current_cat}:")
+                lines.append(f"    • {k['config_key']} - {k['display_name']}")
+
+            conn.close()
+            return "\n".join(lines)
+
+        # Check current value at clinic level
+        cursor = conn.execute(
+            "SELECT value FROM config_values WHERE config_key = ? AND clinic_id = ? AND location_id IS NULL",
+            (config_key, clinic_id)
+        )
+        current_clinic_val = cursor.fetchone()
+
+        # Check program-level value (inherited)
+        cursor = conn.execute(
+            "SELECT value FROM config_values WHERE config_key = ? AND program_id = ? AND clinic_id IS NULL",
+            (config_key, program_id)
+        )
+        program_val = cursor.fetchone()
+
+        # Determine current effective value
+        if current_clinic_val:
+            current_str = f'"{current_clinic_val["value"]}" [Clinic Override]'
+            is_update = True
+        elif program_val:
+            current_str = f'"{program_val["value"]}" [Inherited from Program]'
+            is_update = False
+        else:
+            current_str = f'"{config_def["default_value"] or "(none)"}" [Default]'
+            is_update = False
+
+        # Preview mode
+        if preview_only:
+            lines = [
+                "=== SET CONFIG PREVIEW ===",
+                "",
+                f"Clinic: {clinic_info['name']} ({program})",
+                f"Config: {config_key} ({config_def['display_name']})",
+                "",
+                f"Current: {current_str}",
+                f'New: "{config_value}" [Clinic Override]',
+                "",
+                "To apply, run:",
+                f'  set_clinic_config("{clinic}", "{program}", "{config_key}", "{config_value}", preview_only=False)'
+            ]
+            conn.close()
+            return "\n".join(lines)
+
+        # Execute INSERT or UPDATE
+        if is_update:
+            conn.execute("""
+                UPDATE config_values
+                SET value = ?, is_override = TRUE, updated_date = CURRENT_TIMESTAMP
+                WHERE config_key = ? AND clinic_id = ? AND location_id IS NULL
+            """, (config_value, config_key, clinic_id))
+        else:
+            conn.execute("""
+                INSERT INTO config_values (config_key, program_id, clinic_id, value, is_override, source, created_by)
+                VALUES (?, ?, ?, ?, TRUE, 'manual', 'MCP:set_clinic_config')
+            """, (config_key, program_id, clinic_id, config_value))
+
+        # Log to audit
+        cursor = conn.cursor()
+        log_audit(
+            cursor, 'config', f"{clinic_id}:{config_key}",
+            'Updated' if is_update else 'Created',
+            config_key,
+            current_clinic_val['value'] if current_clinic_val else None,
+            config_value, 'MCP:set_clinic_config',
+            datetime.now().isoformat(), f"Set {config_key} for {clinic_info['name']}"
+        )
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"set_clinic_config() SUCCESS - {config_key}={config_value} for {clinic_id}")
+
+        return f"""✓ Configuration set successfully!
+
+Clinic: {clinic_info['name']}
+Config: {config_key}
+Value: {config_value}
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"set_clinic_config() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"set_clinic_config() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def set_clinic_configs_batch(
+    clinic: str,
+    program: str,
+    configs: str,
+    preview_only: bool = True
+) -> str:
+    """
+    Set multiple configuration values for a clinic at once.
+
+    Args:
+        clinic: Clinic name (fuzzy match supported)
+        program: Program prefix (P4M, PR4M, GRX)
+        configs: JSON string of key-value pairs
+        preview_only: If True (default), shows what WOULD change
+
+    Returns:
+        Summary of all config changes
+
+    Example:
+        set_clinic_configs_batch(
+            clinic="Franz",
+            program="P4M",
+            configs='{"helpdesk_phone": "555-999-9999", "default_specimen": "Saliva"}',
+            preview_only=False
+        )
+    """
+    logger.info(f"set_clinic_configs_batch() called - clinic={clinic}, preview={preview_only}")
+
+    try:
+        # Parse JSON configs
+        try:
+            config_dict = json_lib.loads(configs)
+        except json_lib.JSONDecodeError as e:
+            return f"Invalid JSON in configs parameter: {e}"
+
+        if not isinstance(config_dict, dict):
+            return "configs must be a JSON object (dict)"
+
+        results = []
+        for key, value in config_dict.items():
+            result = set_clinic_config(clinic, program, key, str(value), preview_only)
+            results.append(f"--- {key} ---\n{result}")
+
+        return "\n\n".join(results)
+
+    except Exception as e:
+        logger.error(f"set_clinic_configs_batch() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def create_provider(
+    clinic: str,
+    program: str,
+    provider_name: str,
+    npi: str,
+    phone: str = None,
+    email: str = None,
+    specialty: str = None,
+    office_street: str = None,
+    office_city: str = None,
+    office_state: str = None,
+    office_zip: str = None,
+    preview_only: bool = True
+) -> str:
+    """
+    Add an ordering provider to a clinic.
+
+    Args:
+        clinic: Clinic name (fuzzy match supported)
+        program: Program prefix (P4M, PR4M, GRX)
+        provider_name: Full name (e.g., "Dr. Jane Smith")
+        npi: 10-digit NPI number
+        phone: Provider's phone number
+        email: Provider's email address
+        specialty: Medical specialty (optional)
+        office_street: Office address street
+        office_city: Office city
+        office_state: Office state (2-letter)
+        office_zip: Office ZIP code
+        preview_only: If True (default), shows what WOULD be created
+
+    Returns:
+        Confirmation with provider_id
+
+    Example:
+        create_provider(
+            clinic="Franz",
+            program="P4M",
+            provider_name="Dr. Jane Smith",
+            npi="1234567890",
+            phone="555-123-4567",
+            preview_only=False
+        )
+    """
+    logger.info(f"create_provider() called - clinic={clinic}, name={provider_name}, preview={preview_only}")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Resolve program
+        try:
+            program_id = resolve_program_id_by_prefix(conn, program)
+        except ValueError as e:
+            conn.close()
+            return str(e)
+
+        # Find clinic
+        matches = fuzzy_match_clinic(conn, clinic, program_id)
+
+        if not matches:
+            conn.close()
+            return f"Clinic not found: {clinic} in program {program}"
+
+        if len(matches) > 1:
+            lines = ["Multiple clinics found:", ""]
+            for m in matches:
+                lines.append(f"  • {m['name']}")
+            conn.close()
+            return "\n".join(lines)
+
+        clinic_info = matches[0]
+        clinic_id = clinic_info['clinic_id']
+
+        # Validate NPI (10 digits)
+        npi_clean = ''.join(c for c in npi if c.isdigit())
+        if len(npi_clean) != 10:
+            conn.close()
+            return f"Invalid NPI: {npi}. Must be exactly 10 digits."
+
+        # Get the default location for this clinic (or create one if none exists)
+        cursor = conn.execute(
+            "SELECT location_id, name FROM locations WHERE clinic_id = ? LIMIT 1",
+            (clinic_id,)
+        )
+        location = cursor.fetchone()
+
+        if not location:
+            # Create a default location
+            location_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO locations (location_id, clinic_id, name, code, is_primary, created_by)
+                VALUES (?, ?, ?, 'MAIN', TRUE, 'MCP:create_provider')
+            """, (location_id, clinic_id, f"{clinic_info['name']} - Main"))
+            location_name = f"{clinic_info['name']} - Main"
+        else:
+            location_id = location['location_id']
+            location_name = location['name']
+
+        # Check for duplicate NPI in this clinic
+        cursor = conn.execute("""
+            SELECT pr.name FROM providers pr
+            JOIN locations l ON pr.location_id = l.location_id
+            WHERE l.clinic_id = ? AND pr.npi = ? AND pr.is_active = TRUE
+        """, (clinic_id, npi_clean))
+        existing = cursor.fetchone()
+
+        if existing:
+            conn.close()
+            return f"Provider with NPI {npi_clean} already exists in this clinic: {existing['name']}"
+
+        # Format office address
+        office_parts = []
+        if office_street:
+            office_parts.append(office_street)
+        if office_city or office_state or office_zip:
+            csz = f"{office_city or ''}, {office_state or ''} {office_zip or ''}".strip(', ')
+            office_parts.append(csz)
+        office_display = ", ".join(office_parts) if office_parts else "(not provided)"
+
+        # Preview mode
+        if preview_only:
+            lines = [
+                "=== CREATE PROVIDER PREVIEW ===",
+                "",
+                f"Clinic: {clinic_info['name']} ({program})",
+                f"Location: {location_name}",
+                "",
+                f"Provider: {provider_name}",
+                f"NPI: {npi_clean}",
+                f"Phone: {phone or '(not provided)'}",
+                f"Email: {email or '(not provided)'}",
+                f"Specialty: {specialty or '(not provided)'}",
+                f"Office Address: {office_display}",
+                "",
+                "To create this provider, run:",
+                f'  create_provider("{clinic}", "{program}", "{provider_name}", "{npi}", preview_only=False, ...)'
+            ]
+            conn.close()
+            return "\n".join(lines)
+
+        # Execute INSERT
+        cursor = conn.execute("""
+            INSERT INTO providers (
+                location_id, name, npi, phone, email, specialty,
+                office_street, office_city, office_state, office_zip,
+                is_active, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, 'MCP:create_provider')
+        """, (
+            location_id, provider_name, npi_clean, phone, email, specialty,
+            office_street, office_city, office_state, office_zip
+        ))
+
+        provider_id = cursor.lastrowid
+
+        # Log to audit
+        log_audit(
+            cursor, 'provider', str(provider_id), 'Created', 'provider',
+            None, provider_name, 'MCP:create_provider',
+            datetime.now().isoformat(), f"Created provider {provider_name} (NPI: {npi_clean})"
+        )
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"create_provider() SUCCESS - created {provider_id}")
+
+        return f"""✓ Provider created successfully!
+
+Provider ID: {provider_id}
+Name: {provider_name}
+NPI: {npi_clean}
+Clinic: {clinic_info['name']}
+Location: {location_name}
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"create_provider() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"create_provider() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def import_onboarding_json(
+    file_path: str,
+    program: str,
+    preview_only: bool = True,
+    update_clinic_id: str = None,
+    force_create: bool = False
+) -> str:
+    """
+    Import clinic onboarding data from a JSON file into the database.
+
+    This is the main import tool that processes the JSON output from the
+    onboarding form and creates/updates all related records.
+
+    Args:
+        file_path: Path to the onboarding JSON file (e.g., ~/imports/franz.json)
+        program: Program prefix (P4M, PR4M, GRX)
+        preview_only: If True (default), shows what WOULD happen without making changes
+        update_clinic_id: If set, update this existing clinic instead of creating new
+        force_create: If True, create new clinic even if similar names exist
+
+    Returns:
+        Summary of import actions (preview or committed)
+
+    Example:
+        # Preview first
+        import_onboarding_json("~/imports/franz.json", "P4M")
+
+        # Then commit
+        import_onboarding_json("~/imports/franz.json", "P4M", preview_only=False)
+    """
+    logger.info(f"import_onboarding_json() called - file={file_path}, program={program}, preview={preview_only}")
+
+    try:
+        # Expand ~ in path
+        file_path = os.path.expanduser(file_path)
+
+        # 1. Load and validate JSON
+        if not os.path.exists(file_path):
+            return f"Error: File not found at {file_path}"
+
+        try:
+            with open(file_path, 'r') as f:
+                data = json_lib.load(f)
+        except json_lib.JSONDecodeError as e:
+            return f"Error: Invalid JSON in file. Details: {e}"
+
+        # 2. Validate required fields
+        # Support both old format (clinic_info) and new format (clinic_information)
+        clinic_info = data.get('clinic_information', data.get('clinic_info', {}))
+        clinic_name = clinic_info.get('clinic_name')
+        # Support both epic_department_id (new) and clinic_epic_id (old)
+        epic_id = clinic_info.get('epic_department_id') or clinic_info.get('clinic_epic_id')
+
+        if not clinic_name:
+            return "Error: Missing clinic_information.clinic_name in JSON file"
+
+        # Connect to database
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Resolve program
+        try:
+            program_id = resolve_program_id_by_prefix(conn, program)
+        except ValueError as e:
+            conn.close()
+            return str(e)
+
+        # Get program info
+        cursor = conn.execute("SELECT name FROM programs WHERE program_id = ?", (program_id,))
+        program_info = cursor.fetchone()
+
+        # 3. Check for existing clinic
+        existing_clinic = None
+        if update_clinic_id:
+            cursor = conn.execute("SELECT * FROM clinics WHERE clinic_id = ?", (update_clinic_id,))
+            existing_clinic = cursor.fetchone()
+            if not existing_clinic:
+                conn.close()
+                return f"Error: Clinic not found with ID: {update_clinic_id}"
+        elif not force_create:
+            matches = fuzzy_match_clinic(conn, clinic_name, program_id)
+            if epic_id:
+                cursor = conn.execute("SELECT * FROM clinics WHERE epic_id = ?", (epic_id,))
+                epic_match = cursor.fetchone()
+                if epic_match:
+                    matches.append(dict(epic_match))
+
+            if matches:
+                lines = [
+                    "⚠️  SIMILAR CLINICS FOUND",
+                    "",
+                    "Existing clinics that may match:"
+                ]
+                for m in matches:
+                    lines.append(f"  • {m['name']} (ID: {m['clinic_id'][:8]}...)")
+                    if m.get('epic_id'):
+                        lines.append(f"    EPIC ID: {m['epic_id']}")
+                lines.extend([
+                    "",
+                    "Options:",
+                    f"  • Update existing: import_onboarding_json(..., update_clinic_id=\"{matches[0]['clinic_id']}\")",
+                    "  • Force new: import_onboarding_json(..., force_create=True)"
+                ])
+                conn.close()
+                return "\n".join(lines)
+
+        # 4. Build import plan
+        plan = {
+            'clinic': {
+                'action': 'UPDATE' if existing_clinic else 'CREATE',
+                'clinic_id': existing_clinic['clinic_id'] if existing_clinic else str(uuid.uuid4()),
+                'name': clinic_name,
+                'epic_id': epic_id,
+                # Support both 'address' (new) and 'clinic_address' (old)
+                'address': clinic_info.get('address') or clinic_info.get('clinic_address'),
+                # Support both 'clinic_phone' (form field) and direct 'phone'
+                'phone': clinic_info.get('clinic_phone') or clinic_info.get('phone'),
+                'hours': clinic_info.get('hours_of_operation')
+            },
+            'locations': [],
+            'providers': [],
+            'configs': []
+        }
+
+        # Parse satellite locations (nested under clinic_information in new format)
+        satellite_locations = clinic_info.get('satellite_locations', data.get('satellite_locations', []))
+        for loc in satellite_locations:
+            # Support both 'name' (new format) and 'location_name' (old format)
+            loc_name = loc.get('name') or loc.get('location_name')
+            if loc_name:
+                plan['locations'].append({
+                    'action': 'CREATE',
+                    'name': loc_name,
+                    # Support both 'address' (new) and 'location_address' (old)
+                    'address': loc.get('address') or loc.get('location_address'),
+                    'phone': loc.get('phone') or loc.get('location_phone'),
+                    'hours': loc.get('hours_of_operation') or loc.get('location_hours')
+                })
+
+        # Parse ordering providers
+        for prov in data.get('ordering_providers', []):
+            if prov.get('name') and prov.get('npi'):
+                plan['providers'].append({
+                    'action': 'CREATE',
+                    'name': prov.get('name'),
+                    'npi': prov.get('npi'),
+                    'phone': prov.get('phone'),
+                    'email': prov.get('email'),
+                    'specialty': prov.get('specialty'),
+                    'office_address': prov.get('office_address')
+                })
+
+        # Parse configurations
+        config_mappings = [
+            ('lab_order_configuration.billing_method', 'billing_method'),
+            ('lab_order_configuration.send_kit_to_patient', 'send_kit_to_patient'),
+            ('lab_order_configuration.indication', 'default_indication'),
+            ('lab_order_configuration.criteria_for_testing', 'criteria_for_testing'),
+            ('lab_order_configuration.specimen_collection.default', 'default_specimen'),
+            ('lab_order_configuration.test_panel.test_name', 'default_test'),
+            ('lab_order_configuration.test_panel.test_code', 'default_test_code'),
+            ('helpdesk.phone', 'helpdesk_phone'),
+            ('helpdesk.include_in_emails', 'helpdesk_phone_in_emails'),
+            ('extract_filtering.patient_status', 'extract_patient_status'),
+            ('extract_filtering.procedure_type', 'extract_procedure_type'),
+            ('extract_filtering.filter_by_provider', 'extract_filter_by_provider'),
+        ]
+
+        for json_path, config_key in config_mappings:
+            value = get_nested_value(data, json_path)
+            if value is not None:
+                plan['configs'].append({
+                    'action': 'SET',
+                    'key': config_key,
+                    'value': str(value) if not isinstance(value, str) else value
+                })
+
+        # Handle provider_list specially - can be array of objects or comma-separated string
+        provider_list = get_nested_value(data, 'extract_filtering.provider_list')
+        if provider_list:
+            # New format: array of {first_name, last_name} objects
+            if isinstance(provider_list, list) and len(provider_list) > 0:
+                if isinstance(provider_list[0], dict):
+                    # Convert to comma-separated names: "Jane Smith, John Doe"
+                    names = [f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+                             for p in provider_list if p.get('first_name') or p.get('last_name')]
+                    provider_list = ', '.join(names)
+                else:
+                    # Already a list of strings
+                    provider_list = ', '.join(str(p) for p in provider_list)
+            plan['configs'].append({
+                'action': 'SET',
+                'key': 'extract_providers',
+                'value': provider_list
+            })
+
+        # 5. Preview mode
+        if preview_only:
+            lines = [
+                "=== IMPORT PREVIEW ===",
+                f"File: {file_path}",
+                f"Program: {program} ({program_info['name']})",
+                "Mode: PREVIEW (no changes will be made)",
+                "",
+                "CLINIC:",
+                f"  {'✎' if plan['clinic']['action'] == 'UPDATE' else '✓'} {plan['clinic']['action']} clinic \"{plan['clinic']['name']}\""
+            ]
+
+            if plan['clinic']['epic_id']:
+                lines.append(f"    EPIC ID: {plan['clinic']['epic_id']}")
+            if plan['clinic']['phone']:
+                lines.append(f"    Phone: {plan['clinic']['phone']}")
+
+            if plan['locations']:
+                lines.append(f"\nSATELLITE LOCATIONS ({len(plan['locations'])}):")
+                for loc in plan['locations']:
+                    lines.append(f"  ✓ CREATE location \"{loc['name']}\"")
+
+            if plan['providers']:
+                lines.append(f"\nORDERING PROVIDERS ({len(plan['providers'])}):")
+                for prov in plan['providers']:
+                    lines.append(f"  ✓ CREATE provider \"{prov['name']}\" (NPI: {prov['npi']})")
+
+            if plan['configs']:
+                lines.append(f"\nCONFIGURATIONS ({len(plan['configs'])}):")
+                for cfg in plan['configs']:
+                    lines.append(f"  ✓ SET {cfg['key']} = \"{cfg['value']}\"")
+
+            lines.extend([
+                "",
+                "=== SUMMARY ===",
+                f"Ready to {'update' if plan['clinic']['action'] == 'UPDATE' else 'create'}:",
+                f"  • 1 clinic",
+                f"  • {len(plan['locations'])} satellite location(s)",
+                f"  • {len(plan['providers'])} ordering provider(s)",
+                f"  • {len(plan['configs'])} configuration value(s)",
+                "",
+                "To execute this import, run:",
+                f'  import_onboarding_json("{file_path}", "{program}", preview_only=False)'
+            ])
+
+            conn.close()
+            return "\n".join(lines)
+
+        # 6. Execute import
+        clinic_id = plan['clinic']['clinic_id']
+
+        # Create or update clinic
+        if plan['clinic']['action'] == 'CREATE':
+            address = plan['clinic'].get('address') or {}
+            conn.execute("""
+                INSERT INTO clinics (
+                    clinic_id, program_id, name, epic_id, status,
+                    address_street, address_city, address_state, address_zip,
+                    phone, hours_of_operation, config_submitted_at, created_by
+                ) VALUES (?, ?, ?, ?, 'Onboarding', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'MCP:import_onboarding_json')
+            """, (
+                clinic_id, program_id, plan['clinic']['name'], plan['clinic']['epic_id'],
+                address.get('street'), address.get('city'), address.get('state'), address.get('zip'),
+                plan['clinic']['phone'], plan['clinic']['hours']
+            ))
+        else:
+            address = plan['clinic'].get('address') or {}
+            conn.execute("""
+                UPDATE clinics SET
+                    name = ?, epic_id = ?,
+                    address_street = ?, address_city = ?, address_state = ?, address_zip = ?,
+                    phone = ?, hours_of_operation = ?,
+                    config_submitted_at = CURRENT_TIMESTAMP, updated_date = CURRENT_TIMESTAMP
+                WHERE clinic_id = ?
+            """, (
+                plan['clinic']['name'], plan['clinic']['epic_id'],
+                address.get('street'), address.get('city'), address.get('state'), address.get('zip'),
+                plan['clinic']['phone'], plan['clinic']['hours'],
+                clinic_id
+            ))
+
+        # Get or create default location
+        cursor = conn.execute(
+            "SELECT location_id FROM locations WHERE clinic_id = ? LIMIT 1",
+            (clinic_id,)
+        )
+        loc_row = cursor.fetchone()
+        if loc_row:
+            main_location_id = loc_row['location_id']
+        else:
+            main_location_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO locations (location_id, clinic_id, name, code, is_primary, created_by)
+                VALUES (?, ?, ?, 'MAIN', TRUE, 'MCP:import_onboarding_json')
+            """, (main_location_id, clinic_id, f"{plan['clinic']['name']} - Main"))
+
+        # Create satellite locations
+        for loc in plan['locations']:
+            loc_id = str(uuid.uuid4())
+            loc_addr = loc.get('address') or {}
+            conn.execute("""
+                INSERT INTO locations (location_id, clinic_id, name, is_primary, created_by)
+                VALUES (?, ?, ?, FALSE, 'MCP:import_onboarding_json')
+            """, (loc_id, clinic_id, loc['name']))
+
+        # Create providers
+        for prov in plan['providers']:
+            npi_clean = ''.join(c for c in prov['npi'] if c.isdigit())
+            office = prov.get('office_address') or {}
+            conn.execute("""
+                INSERT INTO providers (
+                    location_id, name, npi, phone, email, specialty,
+                    office_street, office_city, office_state, office_zip,
+                    is_active, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, 'MCP:import_onboarding_json')
+            """, (
+                main_location_id, prov['name'], npi_clean,
+                prov.get('phone'), prov.get('email'), prov.get('specialty'),
+                office.get('street'), office.get('city'), office.get('state'), office.get('zip')
+            ))
+
+        # Set configurations
+        for cfg in plan['configs']:
+            # Check if exists
+            cursor = conn.execute(
+                "SELECT value_id FROM config_values WHERE config_key = ? AND clinic_id = ? AND location_id IS NULL",
+                (cfg['key'], clinic_id)
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                conn.execute("""
+                    UPDATE config_values SET value = ?, is_override = TRUE, updated_date = CURRENT_TIMESTAMP
+                    WHERE value_id = ?
+                """, (cfg['value'], existing['value_id']))
+            else:
+                # Check if config_key exists in definitions
+                cursor = conn.execute("SELECT 1 FROM config_definitions WHERE config_key = ?", (cfg['key'],))
+                if cursor.fetchone():
+                    conn.execute("""
+                        INSERT INTO config_values (config_key, program_id, clinic_id, value, is_override, source, created_by)
+                        VALUES (?, ?, ?, ?, TRUE, 'import', 'MCP:import_onboarding_json')
+                    """, (cfg['key'], program_id, clinic_id, cfg['value']))
+
+        # Log to audit
+        cursor = conn.cursor()
+        log_audit(
+            cursor, 'clinic', clinic_id,
+            'Updated' if plan['clinic']['action'] == 'UPDATE' else 'Created',
+            'import', None,
+            json_lib.dumps({
+                'file': file_path,
+                'locations': len(plan['locations']),
+                'providers': len(plan['providers']),
+                'configs': len(plan['configs'])
+            }),
+            'MCP:import_onboarding_json',
+            datetime.now().isoformat(),
+            f"Imported from {os.path.basename(file_path)}"
+        )
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"import_onboarding_json() SUCCESS - imported {clinic_id}")
+
+        return f"""✓ Import completed successfully!
+
+Clinic: {plan['clinic']['name']}
+Clinic ID: {clinic_id}
+Action: {'Updated' if plan['clinic']['action'] == 'UPDATE' else 'Created'}
+
+Imported:
+  • {len(plan['locations'])} satellite location(s)
+  • {len(plan['providers'])} ordering provider(s)
+  • {len(plan['configs'])} configuration value(s)
+
+Next steps:
+  • View clinic: list_clinics(program="{program}")
+  • Add more configs: set_clinic_config("{plan['clinic']['name']}", "{program}", ...)
+  • Regenerate dashboard: generate_dashboard_data()
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"import_onboarding_json() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"import_onboarding_json() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+
+
+# ============================================================
 # RUN SERVER
 # ============================================================
 if __name__ == "__main__":
