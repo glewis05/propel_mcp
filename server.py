@@ -152,16 +152,18 @@ req_queries = _req_queries_mod
 # ============================================================
 mcp = FastMCP("propel-health")
 
-# Database path - use environment variable with sensible default
+# Unified database path - all toolkits share a single database
+# The database contains: requirements, configurations, UAT, and access management
 DB_PATH = os.environ.get(
     "PROPEL_DB_PATH",
     os.path.expanduser("~/projects/data/client_product_database.db")
 )
 
-# Requirements database path
+# Legacy alias for backwards compatibility - both paths now resolve to the same unified DB
+# Other toolkits use symlinks: ~/projects/requirements_toolkit/data/ and ~/projects/uat_toolkit/data/
 REQ_DB_PATH = os.environ.get(
     "REQUIREMENTS_DB_PATH",
-    os.path.expanduser("~/projects/requirements_toolkit/data/client_product_database.db")
+    DB_PATH  # Now points to the same unified database
 )
 
 # Notion Dashboard Page ID (created by Claude)

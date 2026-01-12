@@ -4,9 +4,10 @@ Model Context Protocol (MCP) server that connects Claude to the Propel Health to
 
 ## Overview
 
-This MCP server exposes tools from:
+This MCP server connects to the **unified Propel Health database** and exposes tools from:
 - **Configurations Toolkit**: User access, training, compliance, and system configurations
-- **Requirements Toolkit**: User stories, UAT test cases, and traceability (future)
+- **Requirements Toolkit**: User stories, UAT test cases, and traceability
+- **UAT Toolkit**: UAT cycle management and test execution
 
 ## Installation
 
@@ -38,7 +39,14 @@ Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_deskt
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROPEL_DB_PATH` | `~/projects/data/client_product_database.db` | Path to shared database |
+| `PROPEL_DB_PATH` | `~/projects/data/client_product_database.db` | Path to unified database |
+
+## Database Architecture
+
+All toolkits share a single unified database at `~/projects/data/client_product_database.db`:
+- Programs (P4M, Px4M, ONB, etc.) are the central entity
+- Contains requirements, user stories, test cases, configurations, and access management
+- Other toolkits access via symlinks
 
 ## Available Tools
 
@@ -77,13 +85,3 @@ python3 server.py
 # Test MCP connection
 # (Use Claude Desktop or MCP inspector)
 ```
-git add .
-git commit -m "Add comprehensive documentation for MCP server tools
-
-- Quick Reference: Daily command cheat sheet
-- Tool Reference: All 35+ tools with parameters and examples
-- Workflow Guide: Step-by-step procedures for onboarding, reviews, audits
-- Database Schema: Complete table documentation
-- Troubleshooting: Common issues and solutions
-- Architecture: System design and data flow diagrams"
-git push
