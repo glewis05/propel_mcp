@@ -26,6 +26,12 @@ UAT CYCLE MANAGEMENT:
 - Reporting: get_cycle_dashboard, get_tester_workload
 - Decisions: record_go_nogo_decision
 
+ONBOARDING PROJECT MANAGEMENT:
+- Projects: create_onboarding_project, get_onboarding_project, list_onboarding_projects
+- Milestones: update_milestone
+- Dependencies: add_onboarding_dependency, resolve_dependency
+- Readiness: get_go_live_readiness
+
 ONBOARDING FORM TOOLKIT:
 - Question Management: list_form_questions, add_form_question, update_form_question, remove_form_question, reorder_form_questions
 
@@ -5126,8 +5132,9 @@ def export_terminated_audit(
                 user['termination_reason'] = 'See audit log'
 
                 cursor.execute("""
-                    SELECT ua.access_id, ua.role, ua.is_active, ua.granted_date,
-                           ua.revoked_date, ua.revoked_by, ua.revoke_reason,
+                    SELECT ua.access_id, ua.role,
+                           CASE WHEN ua.status = 'Active' THEN 1 ELSE 0 END as is_active,
+                           ua.granted_date, ua.revoked_date, ua.revoked_by, ua.revoke_reason,
                            p.name as program_name, c.name as clinic_name, l.name as location_name
                     FROM user_access ua
                     JOIN programs p ON ua.program_id = p.program_id
@@ -7713,7 +7720,7 @@ def generate_dashboard_data(
             JOIN user_access ua ON u.user_id = ua.user_id
             JOIN clinics c ON ua.clinic_id = c.clinic_id
             JOIN programs p ON ua.program_id = p.program_id
-            WHERE ua.is_active = 1
+            WHERE ua.status = 'Active'
             ORDER BY u.name
         """)
         users = [dict(row) for row in cursor.fetchall()]
@@ -10697,6 +10704,1056 @@ def record_go_nogo_decision(
         return f"Database error: {str(e)}"
     except Exception as e:
         logger.error(f"record_go_nogo_decision() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# ONBOARDING PROJECT MANAGEMENT TOOLS
+# ============================================================
+
+# Standard milestones for new onboarding projects
+# Each has: milestone_type, milestone_name, sequence_order, auto_verify_type
+STANDARD_MILESTONES = [
+    ("QUESTIONNAIRE", "Questionnaire Received", 1, None),
+    ("KICKOFF", "Kickoff Meeting", 2, None),
+    ("CONFIGURATION", "Configuration Complete", 3, "CONFIG_EXISTS"),
+    ("EXTRACT_VALIDATED", "Extract Validated", 4, "EXTRACT_VALID"),
+    ("USERS", "Users Provisioned", 5, "USERS_EXIST"),
+    ("TRAINING", "Training Complete", 6, "TRAINING_COMPLETE"),
+    ("UAT", "UAT Passed", 7, "TESTS_PASSING"),
+    ("GO_LIVE", "Go-Live", 8, None),
+]
+
+
+@mcp.tool()
+def create_onboarding_project(
+    program_prefix: str,
+    clinic_name: str,
+    target_launch_date: str,
+    propel_lead: str,
+    client_contact_name: str = None,
+    client_contact_email: str = None,
+    notes: str = None
+) -> str:
+    """
+    Create a new onboarding project with auto-generated milestones.
+
+    Creates a project to track clinic onboarding from intake through launch.
+    Automatically creates the 8 standard milestones with target dates based
+    on the launch date.
+
+    Args:
+        program_prefix: Program prefix (e.g., "P4M", "Px4M")
+        clinic_name: Name of the clinic being onboarded
+        target_launch_date: Target launch date (YYYY-MM-DD)
+        propel_lead: Propel project lead email
+        client_contact_name: Primary client contact name
+        client_contact_email: Primary client contact email
+        notes: Project notes
+
+    Returns:
+        Project creation confirmation with project_id and milestone timeline
+
+    Example:
+        create_onboarding_project(
+            program_prefix="P4M",
+            clinic_name="Portland Cancer Institute",
+            target_launch_date="2025-03-15",
+            propel_lead="glen.lewis@propelhealth.com",
+            client_contact_name="Dr. Smith",
+            client_contact_email="smith@portland.clinic"
+        )
+    """
+    import sqlite3
+    import hashlib
+
+    logger.info(f"create_onboarding_project() called - program={program_prefix}, clinic={clinic_name}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Validate program exists
+        cursor = conn.execute(
+            "SELECT program_id, name FROM programs WHERE prefix = ?",
+            (program_prefix,)
+        )
+        program = cursor.fetchone()
+        if not program:
+            return f"Error: Program not found with prefix '{program_prefix}'"
+
+        # Parse target date
+        try:
+            target_date = datetime.strptime(target_launch_date, "%Y-%m-%d").date()
+        except ValueError:
+            return f"Error: Invalid date format '{target_launch_date}'. Use YYYY-MM-DD."
+
+        # Generate project_id: ONB-<CLINIC_CODE>-<YYYYMM>
+        clinic_code = ''.join(c for c in clinic_name.upper() if c.isalpha())[:4]
+        date_code = target_date.strftime("%Y%m")
+        hash_suffix = hashlib.md5(f"{clinic_name}{datetime.now().isoformat()}".encode()).hexdigest()[:4].upper()
+        project_id = f"ONB-{clinic_code}-{date_code}-{hash_suffix}"
+
+        # Create project
+        conn.execute("""
+            INSERT INTO onboarding_projects (
+                project_id, program_id, project_name, clinic_name,
+                status, target_launch_date,
+                client_contact_name, client_contact_email, propel_lead,
+                notes, created_by
+            ) VALUES (?, ?, ?, ?, 'INTAKE', ?, ?, ?, ?, ?, 'MCP:create_onboarding_project')
+        """, (
+            project_id, program['program_id'],
+            f"{clinic_name} Onboarding", clinic_name,
+            target_launch_date,
+            client_contact_name, client_contact_email, propel_lead,
+            notes
+        ))
+
+        # Calculate milestone target dates (work backwards from launch)
+        # Rough schedule: 8 milestones over ~8-12 weeks
+        days_until_launch = (target_date - date.today()).days
+        if days_until_launch < 30:
+            days_until_launch = 60  # Minimum 60 days for planning
+
+        # Distribute milestones across timeline
+        milestone_intervals = [0.05, 0.10, 0.30, 0.45, 0.60, 0.75, 0.90, 1.0]
+
+        # Create standard milestones
+        for i, (m_type, m_name, seq, auto_verify) in enumerate(STANDARD_MILESTONES):
+            # Calculate target date for this milestone
+            days_to_milestone = int(days_until_launch * milestone_intervals[i])
+            m_target_date = date.today() + timedelta(days=days_to_milestone)
+
+            conn.execute("""
+                INSERT INTO onboarding_milestones (
+                    project_id, milestone_type, milestone_name, sequence_order,
+                    status, target_date, auto_verify_type
+                ) VALUES (?, ?, ?, ?, 'NOT_STARTED', ?, ?)
+            """, (project_id, m_type, m_name, seq, m_target_date.isoformat(), auto_verify))
+
+        # Log to audit
+        conn.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action, new_value,
+                changed_by, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            'onboarding_project', project_id, 'CREATE',
+            f'{{"clinic": "{clinic_name}", "program": "{program_prefix}", "target": "{target_launch_date}"}}',
+            f'MCP:create_onboarding_project:{propel_lead}',
+            f'New onboarding project for {clinic_name}'
+        ))
+
+        conn.commit()
+
+        # Build response
+        result = f"""
+╔══════════════════════════════════════════════════════════════╗
+║  ✅ ONBOARDING PROJECT CREATED                               ║
+╠══════════════════════════════════════════════════════════════╣
+║  Project ID: {project_id:<45} ║
+║  Clinic: {clinic_name:<49} ║
+║  Program: {program['name']:<48} ║
+║  Target Launch: {target_launch_date:<41} ║
+║  Propel Lead: {propel_lead:<44} ║
+╚══════════════════════════════════════════════════════════════╝
+
+MILESTONE TIMELINE:
+"""
+        # Show milestone schedule
+        cursor = conn.execute("""
+            SELECT milestone_name, target_date, status
+            FROM onboarding_milestones
+            WHERE project_id = ?
+            ORDER BY sequence_order
+        """, (project_id,))
+
+        for m in cursor.fetchall():
+            m_dict = dict(m)
+            result += f"  {m_dict['sequence_order'] if 'sequence_order' in m_dict else '•'}. {m_dict['milestone_name']:<30} Target: {m_dict['target_date']}\n"
+
+        result += f"""
+Next Steps:
+  • get_onboarding_project("{project_id}") - View full project details
+  • update_milestone("{project_id}", "QUESTIONNAIRE", "COMPLETE") - Mark questionnaire received
+  • add_onboarding_dependency("{project_id}", "EPIC_EXTRACT", "Build ticket #12345") - Add dependency
+"""
+        return result
+
+    except sqlite3.IntegrityError as e:
+        return f"Error: Database integrity error - {str(e)}"
+    except Exception as e:
+        logger.error(f"create_onboarding_project() error: {e}", exc_info=True)
+        return f"Error creating onboarding project: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def get_onboarding_project(project_id: str) -> str:
+    """
+    Get detailed status of an onboarding project.
+
+    Shows project info, milestone progress, and pending dependencies.
+
+    Args:
+        project_id: Project ID (e.g., "ONB-PORT-202503-A1B2")
+
+    Returns:
+        Project details with milestone timeline and dependencies
+
+    Example:
+        get_onboarding_project("ONB-PORT-202503-A1B2")
+    """
+    import sqlite3
+
+    logger.info(f"get_onboarding_project() called - project={project_id}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get project
+        cursor = conn.execute("""
+            SELECT op.*, p.name as program_name, p.prefix as program_prefix
+            FROM onboarding_projects op
+            JOIN programs p ON op.program_id = p.program_id
+            WHERE op.project_id = ?
+        """, (project_id,))
+        project = cursor.fetchone()
+
+        if not project:
+            return f"Error: Onboarding project not found: '{project_id}'"
+
+        project = dict(project)
+
+        # Get milestones
+        cursor = conn.execute("""
+            SELECT * FROM onboarding_milestones
+            WHERE project_id = ?
+            ORDER BY sequence_order
+        """, (project_id,))
+        milestones = [dict(m) for m in cursor.fetchall()]
+
+        # Get dependencies
+        cursor = conn.execute("""
+            SELECT * FROM onboarding_dependencies
+            WHERE project_id = ? AND status != 'RESOLVED'
+            ORDER BY due_date
+        """, (project_id,))
+        dependencies = [dict(d) for d in cursor.fetchall()]
+
+        # Calculate progress
+        total_milestones = len(milestones)
+        completed = sum(1 for m in milestones if m['status'] == 'COMPLETE')
+        progress_pct = int((completed / total_milestones) * 100) if total_milestones > 0 else 0
+
+        # Status indicators
+        status_icons = {
+            'INTAKE': '📋',
+            'IN_PROGRESS': '🔄',
+            'UAT_READY': '🧪',
+            'LAUNCHED': '🚀',
+            'ON_HOLD': '⏸️'
+        }
+
+        milestone_icons = {
+            'NOT_STARTED': '⬜',
+            'IN_PROGRESS': '🔵',
+            'COMPLETE': '✅',
+            'BLOCKED': '🔴'
+        }
+
+        result = f"""
+╔══════════════════════════════════════════════════════════════╗
+║  {status_icons.get(project['status'], '•')} ONBOARDING PROJECT: {project['clinic_name']:<34} ║
+╠══════════════════════════════════════════════════════════════╣
+║  Project ID: {project_id:<45} ║
+║  Program: {project['program_name']} [{project['program_prefix']}]{' ' * (40 - len(project['program_name']) - len(project['program_prefix']))} ║
+║  Status: {project['status']:<49} ║
+║  Target Launch: {project['target_launch_date'] or 'TBD':<41} ║
+║  Progress: [{('█' * (progress_pct // 5)) + ('·' * (20 - progress_pct // 5))}] {progress_pct}%{' ' * (3 - len(str(progress_pct)))} ║
+╚══════════════════════════════════════════════════════════════╝
+
+CONTACTS:
+  Propel Lead: {project['propel_lead'] or 'Not assigned'}
+  Client Contact: {project['client_contact_name'] or 'Not specified'} ({project['client_contact_email'] or 'no email'})
+
+MILESTONE PROGRESS:
+"""
+        for m in milestones:
+            icon = milestone_icons.get(m['status'], '•')
+            completion = f" - Completed {m['actual_completion_date']}" if m['status'] == 'COMPLETE' else f" - Target: {m['target_date']}"
+            result += f"  {icon} {m['sequence_order']}. {m['milestone_name']:<28}{completion}\n"
+            if m['status'] == 'BLOCKED' and m['blocker_reason']:
+                result += f"      ⚠️  Blocked: {m['blocker_reason'][:50]}\n"
+
+        if dependencies:
+            result += f"\nPENDING DEPENDENCIES ({len(dependencies)}):\n"
+            for d in dependencies:
+                status_icon = '🔴' if d['status'] == 'PENDING' else '🟡'
+                due = f" (Due: {d['due_date']})" if d['due_date'] else ""
+                result += f"  {status_icon} {d['dependency_type']}: {d['description'][:40]}{due}\n"
+                if d['owner']:
+                    result += f"      Owner: {d['owner']}\n"
+
+        if project['notes']:
+            result += f"\nNOTES:\n  {project['notes'][:200]}\n"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"get_onboarding_project() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def list_onboarding_projects(
+    program_prefix: str = None,
+    status: str = None,
+    propel_lead: str = None
+) -> str:
+    """
+    List onboarding projects with optional filters.
+
+    Args:
+        program_prefix: Filter by program (e.g., "P4M")
+        status: Filter by status (INTAKE, IN_PROGRESS, UAT_READY, LAUNCHED, ON_HOLD)
+        propel_lead: Filter by Propel lead email
+
+    Returns:
+        List of matching projects with progress summary
+
+    Example:
+        list_onboarding_projects(program_prefix="P4M")
+        list_onboarding_projects(status="IN_PROGRESS")
+    """
+    import sqlite3
+
+    logger.info(f"list_onboarding_projects() called - program={program_prefix}, status={status}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Build query
+        query = """
+            SELECT op.*, p.name as program_name, p.prefix as program_prefix,
+                   (SELECT COUNT(*) FROM onboarding_milestones om
+                    WHERE om.project_id = op.project_id AND om.status = 'COMPLETE') as completed_milestones,
+                   (SELECT COUNT(*) FROM onboarding_milestones om
+                    WHERE om.project_id = op.project_id) as total_milestones,
+                   (SELECT COUNT(*) FROM onboarding_dependencies od
+                    WHERE od.project_id = op.project_id AND od.status != 'RESOLVED') as pending_dependencies
+            FROM onboarding_projects op
+            JOIN programs p ON op.program_id = p.program_id
+            WHERE 1=1
+        """
+        params = []
+
+        if program_prefix:
+            query += " AND p.prefix = ?"
+            params.append(program_prefix)
+        if status:
+            query += " AND op.status = ?"
+            params.append(status)
+        if propel_lead:
+            query += " AND op.propel_lead LIKE ?"
+            params.append(f"%{propel_lead}%")
+
+        query += " ORDER BY op.target_launch_date, op.clinic_name"
+
+        cursor = conn.execute(query, params)
+        projects = [dict(p) for p in cursor.fetchall()]
+
+        if not projects:
+            filters = []
+            if program_prefix:
+                filters.append(f"program={program_prefix}")
+            if status:
+                filters.append(f"status={status}")
+            if propel_lead:
+                filters.append(f"lead={propel_lead}")
+            filter_str = f" (filters: {', '.join(filters)})" if filters else ""
+            return f"No onboarding projects found{filter_str}."
+
+        status_icons = {
+            'INTAKE': '📋',
+            'IN_PROGRESS': '🔄',
+            'UAT_READY': '🧪',
+            'LAUNCHED': '🚀',
+            'ON_HOLD': '⏸️'
+        }
+
+        result = "ONBOARDING PROJECTS\n"
+        result += "=" * 70 + "\n\n"
+
+        for p in projects:
+            icon = status_icons.get(p['status'], '•')
+            progress = int((p['completed_milestones'] / p['total_milestones']) * 100) if p['total_milestones'] > 0 else 0
+            bar = '█' * (progress // 10) + '·' * (10 - progress // 10)
+
+            result += f"{icon} {p['clinic_name']}\n"
+            result += f"   ID: {p['project_id']}\n"
+            result += f"   Program: {p['program_name']} [{p['program_prefix']}]\n"
+            result += f"   Status: {p['status']} | Target: {p['target_launch_date'] or 'TBD'}\n"
+            result += f"   Progress: [{bar}] {progress}% ({p['completed_milestones']}/{p['total_milestones']} milestones)\n"
+            if p['pending_dependencies'] > 0:
+                result += f"   ⚠️  {p['pending_dependencies']} pending dependencies\n"
+            result += "\n"
+
+        result += f"Total: {len(projects)} projects\n"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"list_onboarding_projects() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def update_milestone(
+    project_id: str,
+    milestone_type: str,
+    status: str,
+    completed_by: str = None,
+    notes: str = None,
+    blocker_reason: str = None
+) -> str:
+    """
+    Update the status of an onboarding milestone.
+
+    Args:
+        project_id: Project ID
+        milestone_type: Milestone type (QUESTIONNAIRE, KICKOFF, CONFIGURATION, EXTRACT_VALIDATED, USERS, TRAINING, UAT, GO_LIVE)
+        status: New status (NOT_STARTED, IN_PROGRESS, COMPLETE, BLOCKED)
+        completed_by: Who completed it (required if status=COMPLETE)
+        notes: Additional notes
+        blocker_reason: Reason for blocking (required if status=BLOCKED)
+
+    Returns:
+        Update confirmation
+
+    Example:
+        update_milestone("ONB-PORT-202503-A1B2", "QUESTIONNAIRE", "COMPLETE", completed_by="glen.lewis@propelhealth.com")
+        update_milestone("ONB-PORT-202503-A1B2", "CONFIGURATION", "BLOCKED", blocker_reason="Waiting for EPIC build")
+    """
+    import sqlite3
+
+    logger.info(f"update_milestone() called - project={project_id}, type={milestone_type}, status={status}")
+
+    valid_types = [m[0] for m in STANDARD_MILESTONES]
+    if milestone_type not in valid_types:
+        return f"Error: Invalid milestone_type '{milestone_type}'. Valid: {', '.join(valid_types)}"
+
+    valid_statuses = ['NOT_STARTED', 'IN_PROGRESS', 'COMPLETE', 'BLOCKED']
+    if status not in valid_statuses:
+        return f"Error: Invalid status '{status}'. Valid: {', '.join(valid_statuses)}"
+
+    if status == 'COMPLETE' and not completed_by:
+        return "Error: completed_by is required when status is COMPLETE"
+
+    if status == 'BLOCKED' and not blocker_reason:
+        return "Error: blocker_reason is required when status is BLOCKED"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get milestone
+        cursor = conn.execute("""
+            SELECT om.*, op.clinic_name
+            FROM onboarding_milestones om
+            JOIN onboarding_projects op ON om.project_id = op.project_id
+            WHERE om.project_id = ? AND om.milestone_type = ?
+        """, (project_id, milestone_type))
+        milestone = cursor.fetchone()
+
+        if not milestone:
+            return f"Error: Milestone '{milestone_type}' not found for project '{project_id}'"
+
+        milestone = dict(milestone)
+        old_status = milestone['status']
+
+        # Update milestone
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        completion_date = date.today().isoformat() if status == 'COMPLETE' else None
+
+        conn.execute("""
+            UPDATE onboarding_milestones SET
+                status = ?,
+                actual_completion_date = COALESCE(?, actual_completion_date),
+                completed_by = COALESCE(?, completed_by),
+                notes = COALESCE(?, notes),
+                blocker_reason = ?,
+                updated_date = CURRENT_TIMESTAMP
+            WHERE project_id = ? AND milestone_type = ?
+        """, (
+            status, completion_date, completed_by, notes,
+            blocker_reason if status == 'BLOCKED' else None,
+            project_id, milestone_type
+        ))
+
+        # Check if we should update project status
+        if status == 'COMPLETE':
+            # Get all milestones to check progress
+            cursor = conn.execute("""
+                SELECT milestone_type, status FROM onboarding_milestones
+                WHERE project_id = ?
+            """, (project_id,))
+            all_milestones = {m['milestone_type']: m['status'] for m in cursor.fetchall()}
+
+            # Auto-update project status based on milestone completion
+            if all_milestones.get('GO_LIVE') == 'COMPLETE':
+                conn.execute("""
+                    UPDATE onboarding_projects SET
+                        status = 'LAUNCHED',
+                        actual_launch_date = DATE('now'),
+                        updated_date = CURRENT_TIMESTAMP
+                    WHERE project_id = ?
+                """, (project_id,))
+            elif all_milestones.get('UAT') == 'COMPLETE':
+                conn.execute("""
+                    UPDATE onboarding_projects SET status = 'UAT_READY', updated_date = CURRENT_TIMESTAMP
+                    WHERE project_id = ? AND status != 'LAUNCHED'
+                """, (project_id,))
+            elif milestone_type == 'QUESTIONNAIRE':
+                conn.execute("""
+                    UPDATE onboarding_projects SET status = 'IN_PROGRESS', updated_date = CURRENT_TIMESTAMP
+                    WHERE project_id = ? AND status = 'INTAKE'
+                """, (project_id,))
+
+        # Log to audit
+        conn.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            'onboarding_milestone', f"{project_id}:{milestone_type}",
+            'UPDATE', 'status',
+            old_status, status,
+            f'MCP:update_milestone:{completed_by or "system"}',
+            notes or f'Milestone {milestone_type} changed to {status}'
+        ))
+
+        conn.commit()
+
+        status_icons = {
+            'NOT_STARTED': '⬜',
+            'IN_PROGRESS': '🔵',
+            'COMPLETE': '✅',
+            'BLOCKED': '🔴'
+        }
+
+        result = f"""
+{status_icons.get(status, '•')} Milestone Updated!
+
+Project: {milestone['clinic_name']} ({project_id})
+Milestone: {milestone['milestone_name']}
+Status: {old_status} → {status}
+"""
+        if status == 'COMPLETE':
+            result += f"Completed by: {completed_by}\n"
+            result += f"Completion date: {date.today().isoformat()}\n"
+        if status == 'BLOCKED':
+            result += f"Blocker: {blocker_reason}\n"
+        if notes:
+            result += f"Notes: {notes}\n"
+
+        # Get updated project status
+        cursor = conn.execute("SELECT status FROM onboarding_projects WHERE project_id = ?", (project_id,))
+        proj = cursor.fetchone()
+        if proj and proj['status'] != 'INTAKE':
+            result += f"\nProject status: {proj['status']}\n"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"update_milestone() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def add_onboarding_dependency(
+    project_id: str,
+    dependency_type: str,
+    description: str,
+    milestone_type: str = None,
+    external_reference: str = None,
+    external_system: str = None,
+    owner: str = None,
+    owner_email: str = None,
+    due_date: str = None
+) -> str:
+    """
+    Add an external dependency to an onboarding project.
+
+    Args:
+        project_id: Project ID
+        dependency_type: Type of dependency (EPIC_EXTRACT, AWS_APPROVAL, LEGAL_REVIEW, TRAINING_SCHEDULE, CLIENT_SIGN_OFF, OTHER)
+        description: Description of the dependency
+        milestone_type: Link to specific milestone (optional)
+        external_reference: External ticket/case number
+        external_system: External system name (EPIC, Salesforce, Jira, etc.)
+        owner: Person responsible for resolving
+        owner_email: Owner's email
+        due_date: When dependency needs to be resolved (YYYY-MM-DD)
+
+    Returns:
+        Dependency creation confirmation
+
+    Example:
+        add_onboarding_dependency(
+            "ONB-PORT-202503-A1B2",
+            "EPIC_EXTRACT",
+            "EPIC build ticket for patient extract",
+            external_reference="EPIC-12345",
+            external_system="EPIC",
+            owner="John Doe",
+            due_date="2025-02-15"
+        )
+    """
+    import sqlite3
+
+    logger.info(f"add_onboarding_dependency() called - project={project_id}, type={dependency_type}")
+
+    valid_types = ['EPIC_EXTRACT', 'AWS_APPROVAL', 'LEGAL_REVIEW', 'TRAINING_SCHEDULE', 'CLIENT_SIGN_OFF', 'OTHER']
+    if dependency_type not in valid_types:
+        return f"Error: Invalid dependency_type '{dependency_type}'. Valid: {', '.join(valid_types)}"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Verify project exists
+        cursor = conn.execute(
+            "SELECT clinic_name FROM onboarding_projects WHERE project_id = ?",
+            (project_id,)
+        )
+        project = cursor.fetchone()
+        if not project:
+            return f"Error: Project not found: '{project_id}'"
+
+        # Get milestone_id if specified
+        milestone_id = None
+        if milestone_type:
+            cursor = conn.execute(
+                "SELECT milestone_id FROM onboarding_milestones WHERE project_id = ? AND milestone_type = ?",
+                (project_id, milestone_type)
+            )
+            milestone = cursor.fetchone()
+            if milestone:
+                milestone_id = milestone['milestone_id']
+
+        # Parse due_date
+        if due_date:
+            try:
+                datetime.strptime(due_date, "%Y-%m-%d")
+            except ValueError:
+                return f"Error: Invalid date format '{due_date}'. Use YYYY-MM-DD."
+
+        # Create dependency
+        cursor = conn.execute("""
+            INSERT INTO onboarding_dependencies (
+                project_id, milestone_id, dependency_type, description,
+                external_reference, external_system,
+                owner, owner_email, due_date,
+                created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'MCP:add_onboarding_dependency')
+            RETURNING dependency_id
+        """, (
+            project_id, milestone_id, dependency_type, description,
+            external_reference, external_system,
+            owner, owner_email, due_date
+        ))
+        dep_id = cursor.fetchone()['dependency_id']
+
+        # Log to audit
+        conn.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action, new_value, changed_by, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            'onboarding_dependency', str(dep_id), 'CREATE',
+            f'{{"type": "{dependency_type}", "desc": "{description[:50]}"}}',
+            'MCP:add_onboarding_dependency',
+            f'New {dependency_type} dependency added'
+        ))
+
+        conn.commit()
+
+        result = f"""
+🔗 Dependency Added!
+
+Project: {project['clinic_name']} ({project_id})
+Dependency ID: {dep_id}
+Type: {dependency_type}
+Description: {description}
+"""
+        if external_reference:
+            result += f"External Ref: {external_reference}"
+            if external_system:
+                result += f" ({external_system})"
+            result += "\n"
+        if owner:
+            result += f"Owner: {owner}"
+            if owner_email:
+                result += f" ({owner_email})"
+            result += "\n"
+        if due_date:
+            result += f"Due Date: {due_date}\n"
+        if milestone_type:
+            result += f"Linked to: {milestone_type} milestone\n"
+
+        result += f"\nNext: resolve_dependency({dep_id}, ...) when resolved\n"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"add_onboarding_dependency() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def resolve_dependency(
+    dependency_id: int,
+    resolved_by: str,
+    resolution_notes: str = None
+) -> str:
+    """
+    Mark a dependency as resolved.
+
+    Args:
+        dependency_id: Dependency ID
+        resolved_by: Who resolved it
+        resolution_notes: How it was resolved
+
+    Returns:
+        Resolution confirmation
+
+    Example:
+        resolve_dependency(123, "glen.lewis@propelhealth.com", "EPIC build complete, extract verified")
+    """
+    import sqlite3
+
+    logger.info(f"resolve_dependency() called - id={dependency_id}, by={resolved_by}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get dependency
+        cursor = conn.execute("""
+            SELECT od.*, op.clinic_name
+            FROM onboarding_dependencies od
+            JOIN onboarding_projects op ON od.project_id = op.project_id
+            WHERE od.dependency_id = ?
+        """, (dependency_id,))
+        dep = cursor.fetchone()
+
+        if not dep:
+            return f"Error: Dependency not found: {dependency_id}"
+
+        dep = dict(dep)
+
+        if dep['status'] == 'RESOLVED':
+            return f"Dependency {dependency_id} is already resolved (on {dep['resolved_date']})"
+
+        # Update dependency
+        conn.execute("""
+            UPDATE onboarding_dependencies SET
+                status = 'RESOLVED',
+                resolved_date = DATE('now'),
+                resolved_by = ?,
+                resolution_notes = ?,
+                updated_date = CURRENT_TIMESTAMP
+            WHERE dependency_id = ?
+        """, (resolved_by, resolution_notes, dependency_id))
+
+        # If linked to a milestone, check if we should unblock it
+        if dep['milestone_id']:
+            # Check if there are other pending dependencies for this milestone
+            cursor = conn.execute("""
+                SELECT COUNT(*) as pending FROM onboarding_dependencies
+                WHERE milestone_id = ? AND status != 'RESOLVED' AND dependency_id != ?
+            """, (dep['milestone_id'], dependency_id))
+            pending = cursor.fetchone()['pending']
+
+            if pending == 0:
+                # Unblock the milestone if it was blocked
+                conn.execute("""
+                    UPDATE onboarding_milestones SET
+                        status = CASE WHEN status = 'BLOCKED' THEN 'IN_PROGRESS' ELSE status END,
+                        blocker_reason = NULL,
+                        updated_date = CURRENT_TIMESTAMP
+                    WHERE milestone_id = ?
+                """, (dep['milestone_id'],))
+
+        # Log to audit
+        conn.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action, old_value, new_value,
+                changed_by, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            'onboarding_dependency', str(dependency_id), 'RESOLVE',
+            dep['status'], 'RESOLVED',
+            f'MCP:resolve_dependency:{resolved_by}',
+            resolution_notes or 'Dependency resolved'
+        ))
+
+        conn.commit()
+
+        result = f"""
+✅ Dependency Resolved!
+
+Project: {dep['clinic_name']} ({dep['project_id']})
+Dependency: {dep['dependency_type']} - {dep['description'][:50]}
+Resolved by: {resolved_by}
+Resolved date: {date.today().isoformat()}
+"""
+        if resolution_notes:
+            result += f"Notes: {resolution_notes}\n"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"resolve_dependency() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def get_go_live_readiness(project_id: str) -> str:
+    """
+    Check if a project is ready for go-live launch.
+
+    Reviews all milestones and dependencies to generate a readiness report.
+    Runs auto-verification checks where applicable.
+
+    Args:
+        project_id: Project ID
+
+    Returns:
+        Detailed readiness report with pass/fail status and blockers
+
+    Example:
+        get_go_live_readiness("ONB-PORT-202503-A1B2")
+    """
+    import sqlite3
+
+    logger.info(f"get_go_live_readiness() called - project={project_id}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get project
+        cursor = conn.execute("""
+            SELECT op.*, p.name as program_name, p.prefix, c.clinic_id
+            FROM onboarding_projects op
+            JOIN programs p ON op.program_id = p.program_id
+            LEFT JOIN clinics c ON op.clinic_id = c.clinic_id
+            WHERE op.project_id = ?
+        """, (project_id,))
+        project = cursor.fetchone()
+
+        if not project:
+            return f"Error: Project not found: '{project_id}'"
+
+        project = dict(project)
+
+        # Get milestones
+        cursor = conn.execute("""
+            SELECT * FROM onboarding_milestones
+            WHERE project_id = ?
+            ORDER BY sequence_order
+        """, (project_id,))
+        milestones = [dict(m) for m in cursor.fetchall()]
+
+        # Get pending dependencies
+        cursor = conn.execute("""
+            SELECT * FROM onboarding_dependencies
+            WHERE project_id = ? AND status != 'RESOLVED'
+        """, (project_id,))
+        pending_deps = [dict(d) for d in cursor.fetchall()]
+
+        # Run auto-verification checks
+        auto_checks = {}
+        clinic_id = project.get('clinic_id')
+
+        for m in milestones:
+            if m['auto_verify_type'] and clinic_id:
+                check_type = m['auto_verify_type']
+                passed = False
+                details = ""
+
+                if check_type == 'CONFIG_EXISTS':
+                    # Check if configs exist for this clinic
+                    cursor = conn.execute("""
+                        SELECT COUNT(*) as cnt FROM config_values
+                        WHERE clinic_id = ?
+                    """, (clinic_id,))
+                    cnt = cursor.fetchone()['cnt']
+                    passed = cnt > 0
+                    details = f"{cnt} configurations found"
+
+                elif check_type == 'USERS_EXIST':
+                    # Check if users exist with access
+                    cursor = conn.execute("""
+                        SELECT COUNT(DISTINCT user_id) as cnt FROM user_access
+                        WHERE clinic_id = ? AND status = 'Active'
+                    """, (clinic_id,))
+                    cnt = cursor.fetchone()['cnt']
+                    passed = cnt > 0
+                    details = f"{cnt} users with access"
+
+                elif check_type == 'TRAINING_COMPLETE':
+                    # Check if users have completed training
+                    cursor = conn.execute("""
+                        SELECT
+                            COUNT(DISTINCT ut.user_id) as trained,
+                            (SELECT COUNT(DISTINCT ua.user_id) FROM user_access ua
+                             WHERE ua.clinic_id = ? AND ua.status = 'Active') as total
+                        FROM user_training ut
+                        JOIN user_access ua ON ut.user_id = ua.user_id
+                        WHERE ua.clinic_id = ? AND ut.status = 'Completed'
+                    """, (clinic_id, clinic_id))
+                    result = cursor.fetchone()
+                    trained, total = result['trained'], result['total']
+                    passed = trained >= total and total > 0
+                    details = f"{trained}/{total} users trained"
+
+                elif check_type == 'TESTS_PASSING':
+                    # Check if there's a UAT cycle with passing tests
+                    cursor = conn.execute("""
+                        SELECT
+                            COUNT(CASE WHEN tc.test_status = 'Pass' THEN 1 END) as passed,
+                            COUNT(*) as total
+                        FROM uat_cycles uc
+                        JOIN uat_test_cases tc ON uc.cycle_id = tc.cycle_id
+                        WHERE uc.program_id = ? AND uc.status != 'complete'
+                    """, (project['program_id'],))
+                    result = cursor.fetchone()
+                    passed_tests, total_tests = result['passed'] or 0, result['total'] or 0
+                    passed = passed_tests == total_tests and total_tests > 0
+                    details = f"{passed_tests}/{total_tests} tests passing"
+
+                auto_checks[m['milestone_type']] = {
+                    'passed': passed,
+                    'details': details
+                }
+
+                # Update auto-verification in database
+                conn.execute("""
+                    UPDATE onboarding_milestones SET
+                        auto_verified_date = CURRENT_TIMESTAMP,
+                        auto_verified_result = ?
+                    WHERE milestone_id = ?
+                """, (passed, m['milestone_id']))
+
+        conn.commit()
+
+        # Build readiness report
+        all_milestones_complete = all(m['status'] == 'COMPLETE' for m in milestones if m['milestone_type'] != 'GO_LIVE')
+        no_pending_deps = len(pending_deps) == 0
+        ready = all_milestones_complete and no_pending_deps
+
+        result = f"""
+╔══════════════════════════════════════════════════════════════╗
+║  🚀 GO-LIVE READINESS REPORT                                 ║
+╠══════════════════════════════════════════════════════════════╣
+║  Project: {project['clinic_name']:<47} ║
+║  Program: {project['program_name']:<48} ║
+║  Target Launch: {project['target_launch_date'] or 'TBD':<41} ║
+╚══════════════════════════════════════════════════════════════╝
+
+OVERALL STATUS: {'✅ READY FOR LAUNCH' if ready else '❌ NOT READY'}
+
+MILESTONE CHECKLIST:
+"""
+        blockers = []
+        for m in milestones:
+            if m['milestone_type'] == 'GO_LIVE':
+                continue  # Skip GO_LIVE milestone itself
+
+            is_complete = m['status'] == 'COMPLETE'
+            icon = '✅' if is_complete else '❌'
+
+            auto_info = ""
+            if m['milestone_type'] in auto_checks:
+                check = auto_checks[m['milestone_type']]
+                auto_icon = '✓' if check['passed'] else '✗'
+                auto_info = f" [Auto: {auto_icon} {check['details']}]"
+
+            result += f"  {icon} {m['milestone_name']:<30}{auto_info}\n"
+
+            if not is_complete:
+                blockers.append(f"- {m['milestone_name']}: {m['status']}")
+                if m['blocker_reason']:
+                    blockers.append(f"  Blocker: {m['blocker_reason']}")
+
+        result += f"\nDEPENDENCY CHECK:\n"
+        if pending_deps:
+            result += f"  ❌ {len(pending_deps)} pending dependencies:\n"
+            for d in pending_deps:
+                result += f"     • {d['dependency_type']}: {d['description'][:40]}\n"
+                blockers.append(f"- Dependency: {d['dependency_type']} - {d['description'][:30]}")
+        else:
+            result += "  ✅ All dependencies resolved\n"
+
+        if blockers:
+            result += f"\n⚠️  BLOCKERS ({len(blockers)}):\n"
+            for b in blockers:
+                result += f"  {b}\n"
+
+        if ready:
+            result += f"""
+✅ All prerequisites met!
+
+Next step:
+  update_milestone("{project_id}", "GO_LIVE", "COMPLETE", completed_by="your.email@propelhealth.com")
+"""
+        else:
+            result += f"""
+❌ Address blockers before launching.
+
+Commands:
+  • update_milestone("{project_id}", "<TYPE>", "COMPLETE", ...) - Mark milestone complete
+  • resolve_dependency(<id>, ...) - Resolve dependency
+"""
+
+        return result
+
+    except Exception as e:
+        logger.error(f"get_go_live_readiness() error: {e}", exc_info=True)
         return f"Error: {str(e)}"
     finally:
         if conn:
