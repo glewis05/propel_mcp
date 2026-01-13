@@ -44,6 +44,9 @@ ONBOARDING FORM TOOLKIT:
 
 DASHBOARD DATA GENERATION:
 - generate_dashboard_data: Generate JSON for clinic configuration dashboard (GitHub Pages)
+
+REQUIREMENTS DASHBOARD:
+- generate_requirements_dashboard: Generate requirements dashboard HTML + push to GitHub Pages
 """
 
 # ============================================================
@@ -12628,6 +12631,891 @@ def get_uat_progress(
         return f"Database error: {str(e)}"
     except Exception as e:
         logger.error(f"get_uat_progress() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# REQUIREMENTS DASHBOARD
+# ============================================================
+# Generate the requirements dashboard HTML from database state.
+# Produces a standalone HTML file with all stories, test counts,
+# filtering by program/priority, and pushes to GitHub Pages.
+# ============================================================
+
+
+def escape_html(text: str) -> str:
+    """
+    PURPOSE:
+        Escape HTML special characters for safe embedding.
+
+    R EQUIVALENT:
+        htmltools::htmlEscape()
+    """
+    if not text:
+        return ""
+    return (text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;"))
+
+
+def generate_full_html_template(
+    total_stories: int,
+    total_tests: int,
+    program_cards_html: str,
+    program_filters_html: str,
+    categories_html: str,
+    priority_counts: dict,
+    today: str
+) -> str:
+    """
+    PURPOSE:
+        Generate the complete HTML template with all CSS and JS.
+        This creates a standalone requirements dashboard page.
+
+    PARAMETERS:
+        total_stories (int): Total number of user stories
+        total_tests (int): Total number of test cases
+        program_cards_html (str): HTML for program summary cards
+        program_filters_html (str): HTML for program filter buttons
+        categories_html (str): HTML for all category sections with stories
+        priority_counts (dict): Count of stories by priority
+        today (str): Formatted date string for "Last Updated"
+
+    RETURNS:
+        str: Complete HTML document as a string
+
+    WHY THIS APPROACH:
+        Single-file HTML with embedded CSS/JS for easy GitHub Pages hosting.
+        No build step required - just commit and push.
+    """
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Propel Health | Requirements Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {{
+            --color-bg: #f8fafb;
+            --color-surface: #ffffff;
+            --color-border: #e2e8f0;
+            --color-border-light: #f1f5f9;
+            --color-text: #1e293b;
+            --color-text-secondary: #64748b;
+            --color-text-muted: #94a3b8;
+            --color-primary: #0f766e;
+            --color-primary-light: #ccfbf1;
+            --color-primary-dark: #0d9488;
+            --color-accent: #0ea5e9;
+            --color-accent-light: #e0f2fe;
+            --color-must-have: #dc2626;
+            --color-must-have-bg: #fee2e2;
+            --color-should-have: #059669;
+            --color-should-have-bg: #d1fae5;
+            --color-could-have: #d97706;
+            --color-could-have-bg: #fef3c7;
+            --color-draft: #6366f1;
+            --color-draft-bg: #e0e7ff;
+            --color-p4m: #0f766e;
+            --color-p4m-light: #ccfbf1;
+            --color-plat: #7c3aed;
+            --color-plat-light: #ede9fe;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+            --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -2px rgba(0,0,0,0.05);
+            --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.05), 0 4px 6px -4px rgba(0,0,0,0.05);
+            --radius-sm: 6px;
+            --radius-md: 10px;
+            --radius-lg: 16px;
+        }}
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--color-bg);
+            color: var(--color-text);
+            line-height: 1.6;
+            font-size: 15px;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #134e4a 0%, #1e3a5f 100%);
+            color: white;
+            padding: 2.5rem 2rem;
+            position: relative;
+            overflow: hidden;
+        }}
+        .header::before {{
+            content: '';
+            position: absolute;
+            top: -50%;
+            right: -10%;
+            width: 500px;
+            height: 500px;
+            background: radial-gradient(circle, rgba(255,255,255,0.06) 0%, transparent 70%);
+            border-radius: 50%;
+        }}
+        .header-content {{
+            max-width: 1400px;
+            margin: 0 auto;
+            position: relative;
+            z-index: 1;
+        }}
+        .header-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(255,255,255,0.12);
+            padding: 0.4rem 0.9rem;
+            border-radius: 100px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            margin-bottom: 0.75rem;
+        }}
+        .header h1 {{
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 0.4rem;
+        }}
+        .header p {{
+            opacity: 0.85;
+            font-size: 1rem;
+        }}
+        .header-meta {{
+            display: flex;
+            gap: 2rem;
+            margin-top: 1.25rem;
+            flex-wrap: wrap;
+        }}
+        .header-meta-item {{
+            display: flex;
+            flex-direction: column;
+        }}
+        .header-meta-label {{
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            opacity: 0.6;
+        }}
+        .header-meta-value {{
+            font-weight: 600;
+            font-size: 0.95rem;
+        }}
+        .main {{
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }}
+        .summary-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }}
+        .summary-card {{
+            background: var(--color-surface);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-md);
+            padding: 1rem;
+            box-shadow: var(--shadow-sm);
+        }}
+        .summary-card-label {{
+            font-size: 0.75rem;
+            color: var(--color-text-secondary);
+        }}
+        .summary-card-value {{
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--color-primary);
+        }}
+        .summary-card-sub {{
+            font-size: 0.7rem;
+            color: var(--color-text-muted);
+        }}
+        .filters {{
+            display: flex;
+            gap: 0.75rem;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+            align-items: center;
+        }}
+        .filter-group {{
+            display: flex;
+            gap: 0.5rem;
+        }}
+        .filter-btn {{
+            padding: 0.5rem 1rem;
+            border: 1px solid var(--color-border);
+            background: var(--color-surface);
+            border-radius: 100px;
+            font-family: inherit;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--color-text-secondary);
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }}
+        .filter-btn:hover {{
+            border-color: var(--color-primary);
+            color: var(--color-primary);
+        }}
+        .filter-btn.active {{
+            background: var(--color-primary);
+            border-color: var(--color-primary);
+            color: white;
+        }}
+        .filter-btn.p4m.active {{ background: var(--color-p4m); border-color: var(--color-p4m); }}
+        .filter-btn.plat.active {{ background: var(--color-plat); border-color: var(--color-plat); }}
+        .search-box {{
+            flex: 1;
+            min-width: 200px;
+            max-width: 300px;
+            position: relative;
+        }}
+        .search-box input {{
+            width: 100%;
+            padding: 0.5rem 1rem 0.5rem 2.5rem;
+            border: 1px solid var(--color-border);
+            border-radius: 100px;
+            font-family: inherit;
+            font-size: 0.85rem;
+        }}
+        .search-box input:focus {{
+            outline: none;
+            border-color: var(--color-primary);
+        }}
+        .search-box svg {{
+            position: absolute;
+            left: 0.85rem;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--color-text-muted);
+        }}
+        .category-section {{ margin-bottom: 2rem; }}
+        .category-header {{
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--color-border);
+        }}
+        .category-icon {{
+            width: 32px;
+            height: 32px;
+            border-radius: var(--radius-sm);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.9rem;
+        }}
+        .category-icon.analytics {{ background: #dbeafe; }}
+        .category-icon.audit {{ background: #fce7f3; }}
+        .category-icon.config {{ background: #fef3c7; }}
+        .category-icon.dash {{ background: #d1fae5; }}
+        .category-icon.referral {{ background: #ccfbf1; }}
+        .category-icon.role {{ background: #fae8ff; }}
+        .category-title {{ font-size: 1.1rem; font-weight: 600; }}
+        .category-count {{ font-size: 0.8rem; color: var(--color-text-muted); margin-left: auto; }}
+        .stories-grid {{ display: grid; gap: 1rem; }}
+        .story-card {{
+            background: var(--color-surface);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-sm);
+            overflow: hidden;
+        }}
+        .story-card:hover {{ box-shadow: var(--shadow-md); }}
+        .story-card.hidden {{ display: none; }}
+        .story-header {{
+            padding: 1.25rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 1rem;
+            cursor: pointer;
+        }}
+        .story-header:hover {{ background: var(--color-bg); }}
+        .story-id {{
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            font-weight: 500;
+            padding: 0.2rem 0.5rem;
+            border-radius: var(--radius-sm);
+            margin-bottom: 0.4rem;
+            display: inline-block;
+        }}
+        .story-id.p4m {{ background: var(--color-p4m-light); color: var(--color-p4m); }}
+        .story-id.plat {{ background: var(--color-plat-light); color: var(--color-plat); }}
+        .story-title {{ font-size: 1.05rem; font-weight: 600; margin-bottom: 0.25rem; }}
+        .story-meta {{ display: flex; gap: 0.5rem; flex-wrap: wrap; }}
+        .badge {{
+            font-size: 0.65rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            padding: 0.25rem 0.5rem;
+            border-radius: 100px;
+        }}
+        .badge-must-have {{ background: var(--color-must-have-bg); color: var(--color-must-have); }}
+        .badge-should-have {{ background: var(--color-should-have-bg); color: var(--color-should-have); }}
+        .badge-could-have {{ background: var(--color-could-have-bg); color: var(--color-could-have); }}
+        .badge-draft {{ background: var(--color-draft-bg); color: var(--color-draft); }}
+        .story-toggle {{ color: var(--color-text-muted); transition: transform 0.2s; }}
+        .story-card.open .story-toggle {{ transform: rotate(180deg); }}
+        .story-body {{
+            display: none;
+            padding: 0 1.25rem 1.25rem;
+            border-top: 1px solid var(--color-border-light);
+        }}
+        .story-card.open .story-body {{ display: block; }}
+        .story-section {{ margin-top: 1rem; }}
+        .story-section-title {{
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--color-text-muted);
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }}
+        .story-section-title::before {{
+            content: '';
+            width: 3px;
+            height: 12px;
+            background: var(--color-primary);
+            border-radius: 2px;
+        }}
+        .user-story {{
+            font-size: 0.95rem;
+            background: linear-gradient(135deg, var(--color-primary-light) 0%, #f0fdfa 100%);
+            padding: 0.9rem 1rem;
+            border-radius: var(--radius-md);
+            border-left: 3px solid var(--color-primary);
+            font-style: italic;
+        }}
+        .acceptance-criteria {{ list-style: none; counter-reset: criteria; }}
+        .acceptance-criteria li {{
+            counter-increment: criteria;
+            display: flex;
+            gap: 0.6rem;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid var(--color-border-light);
+            font-size: 0.9rem;
+        }}
+        .acceptance-criteria li:last-child {{ border-bottom: none; }}
+        .acceptance-criteria li::before {{
+            content: counter(criteria);
+            min-width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--color-accent-light);
+            color: var(--color-accent);
+            border-radius: 50%;
+            font-size: 0.7rem;
+            font-weight: 600;
+        }}
+        .test-count {{
+            font-size: 0.8rem;
+            color: var(--color-text-secondary);
+            background: var(--color-bg);
+            padding: 0.5rem 0.75rem;
+            border-radius: var(--radius-sm);
+            margin-top: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }}
+        .footer {{
+            text-align: center;
+            padding: 2rem;
+            color: var(--color-text-muted);
+            font-size: 0.85rem;
+            border-top: 1px solid var(--color-border);
+            margin-top: 2rem;
+        }}
+        .footer a {{ color: var(--color-primary); text-decoration: none; }}
+        @media (max-width: 768px) {{
+            .header {{ padding: 1.5rem 1rem; }}
+            .header h1 {{ font-size: 1.5rem; }}
+            .main {{ padding: 1rem; }}
+            .summary-grid {{ grid-template-columns: repeat(2, 1fr); }}
+        }}
+        @media print {{
+            .story-body {{ display: block !important; }}
+            .filters {{ display: none; }}
+        }}
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-content">
+            <div class="header-badge">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                </svg>
+                Requirements Dashboard
+            </div>
+            <h1>Propel Health Requirements</h1>
+            <p>User stories and acceptance criteria for all programs.</p>
+            <div class="header-meta">
+                <div class="header-meta-item">
+                    <span class="header-meta-label">Total Stories</span>
+                    <span class="header-meta-value">{total_stories}</span>
+                </div>
+                <div class="header-meta-item">
+                    <span class="header-meta-label">Test Cases</span>
+                    <span class="header-meta-value">{total_tests}</span>
+                </div>
+                <div class="header-meta-item">
+                    <span class="header-meta-label">Last Updated</span>
+                    <span class="header-meta-value">{today}</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="main">
+        <div class="summary-grid">
+            {program_cards_html}
+            <div class="summary-card">
+                <div class="summary-card-label">Must Have</div>
+                <div class="summary-card-value">{priority_counts.get("Must Have", 0)}</div>
+                <div class="summary-card-sub">Critical priority</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-card-label">Should Have</div>
+                <div class="summary-card-value">{priority_counts.get("Should Have", 0)}</div>
+                <div class="summary-card-sub">High priority</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-card-label">Could Have</div>
+                <div class="summary-card-value">{priority_counts.get("Could Have", 0)}</div>
+                <div class="summary-card-sub">Future scope</div>
+            </div>
+        </div>
+
+        <div class="filters">
+            <div class="filter-group">
+                {program_filters_html}
+            </div>
+            <div class="filter-group">
+                <button class="filter-btn active" data-priority="all">All Priorities</button>
+                <button class="filter-btn" data-priority="must-have">Must Have</button>
+                <button class="filter-btn" data-priority="should-have">Should Have</button>
+                <button class="filter-btn" data-priority="could-have">Could Have</button>
+            </div>
+            <div class="search-box">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <path d="m21 21-4.35-4.35"></path>
+                </svg>
+                <input type="text" placeholder="Search stories..." id="searchInput">
+            </div>
+        </div>
+
+        {categories_html}
+    </main>
+
+    <footer class="footer">
+        <p>Propel Health Requirements Dashboard</p>
+        <p style="margin-top: 0.5rem;">Generated {today}</p>
+    </footer>
+
+    <script>
+        function toggleStory(header) {{
+            header.closest('.story-card').classList.toggle('open');
+        }}
+
+        document.querySelectorAll('.filter-btn[data-filter]').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+                document.querySelectorAll('.filter-btn[data-filter]').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                filterStories();
+            }});
+        }});
+
+        document.querySelectorAll('.filter-btn[data-priority]').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+                document.querySelectorAll('.filter-btn[data-priority]').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                filterStories();
+            }});
+        }});
+
+        document.getElementById('searchInput').addEventListener('input', filterStories);
+
+        function filterStories() {{
+            const programFilter = document.querySelector('.filter-btn[data-filter].active')?.dataset.filter || 'all';
+            const priorityFilter = document.querySelector('.filter-btn[data-priority].active')?.dataset.priority || 'all';
+            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+
+            document.querySelectorAll('.story-card').forEach(card => {{
+                const program = card.dataset.program;
+                const priority = card.dataset.priority;
+                const searchText = card.dataset.search + ' ' + card.querySelector('.story-title').textContent.toLowerCase();
+
+                const matchesProgram = programFilter === 'all' || program === programFilter;
+                const matchesPriority = priorityFilter === 'all' || priority === priorityFilter;
+                const matchesSearch = !searchTerm || searchText.includes(searchTerm);
+
+                card.classList.toggle('hidden', !(matchesProgram && matchesPriority && matchesSearch));
+            }});
+
+            document.querySelectorAll('.category-section').forEach(section => {{
+                const visibleStories = section.querySelectorAll('.story-card:not(.hidden)').length;
+                section.querySelector('.category-count').textContent = visibleStories + ' stor' + (visibleStories === 1 ? 'y' : 'ies');
+                section.style.display = visibleStories === 0 ? 'none' : 'block';
+            }});
+        }}
+    </script>
+</body>
+</html>'''
+
+
+@mcp.tool()
+async def generate_requirements_dashboard(
+    output_path: str = None,
+    push_to_github: bool = True,
+    repo_path: str = None
+) -> str:
+    """
+    PURPOSE:
+        Generate the requirements dashboard HTML from current database state.
+        Queries stories, test counts, and generates a filterable HTML dashboard.
+
+    R EQUIVALENT:
+        Like using DBI to query, then htmltools to build HTML, then git2r to push.
+
+    PARAMETERS:
+        output_path (str): Where to write the HTML file.
+                           Default: ~/projects/requirements_toolkit/docs/index.html
+        push_to_github (bool): If True, commits and pushes changes to GitHub
+        repo_path (str): Path to the requirements_toolkit repo.
+                         Default: ~/projects/requirements_toolkit
+
+    RETURNS:
+        str: Confirmation message with file path and URL
+
+    EXAMPLE:
+        generate_requirements_dashboard()  # Generate and push
+        generate_requirements_dashboard(push_to_github=False)  # Generate only
+
+    WHY THIS APPROACH:
+        Single-file HTML with embedded CSS/JS for easy GitHub Pages hosting.
+        No build step required - just generate and push.
+    """
+    import re
+    import subprocess
+    from pathlib import Path
+
+    # Set default paths
+    if repo_path is None:
+        repo_path = Path.home() / "projects" / "requirements_toolkit"
+    else:
+        repo_path = Path(repo_path).expanduser()
+
+    if output_path is None:
+        output_path = repo_path / "docs" / "index.html"
+    else:
+        output_path = Path(output_path).expanduser()
+
+    # Ensure docs directory exists
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # =========================================================================
+    # CONNECT TO DATABASE
+    # =========================================================================
+    # Use the shared database via symlink
+    db_path = Path.home() / "projects" / "data" / "client_product_database.db"
+
+    if not db_path.exists():
+        return f"Error: Database not found at {db_path}"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        # =====================================================================
+        # QUERY DATA FROM DATABASE
+        # =====================================================================
+
+        # Get all stories with program info
+        # The stories table has: story_id, title, user_story, acceptance_criteria,
+        # status, priority, category, version, program_id
+        stories_query = """
+            SELECT s.story_id, s.title, s.user_story, s.acceptance_criteria,
+                   s.status, s.priority, s.category, s.version,
+                   p.prefix, p.program_name
+            FROM stories s
+            JOIN programs p ON s.program_id = p.program_id
+            ORDER BY p.prefix, s.category, s.story_id
+        """
+
+        cursor = conn.execute(stories_query)
+        stories = cursor.fetchall()
+
+        if not stories:
+            return "No stories found in database. Add stories first."
+
+        # Get test counts per story
+        test_counts_query = """
+            SELECT story_id, COUNT(*) as test_count
+            FROM test_cases
+            GROUP BY story_id
+        """
+
+        cursor = conn.execute(test_counts_query)
+        test_counts = {row['story_id']: row['test_count'] for row in cursor.fetchall()}
+
+        # Get summary stats
+        total_stories = len(stories)
+        total_tests_query = "SELECT COUNT(*) as cnt FROM test_cases"
+        total_tests = conn.execute(total_tests_query).fetchone()['cnt']
+
+        # Count by priority
+        priority_counts = {"Must Have": 0, "Should Have": 0, "Could Have": 0, "Won't Have": 0}
+        for story in stories:
+            priority = story['priority']
+            if priority in priority_counts:
+                priority_counts[priority] += 1
+
+        # Count by program
+        program_counts = {}
+        program_test_counts = {}
+        for story in stories:
+            prefix = story['prefix']
+            if prefix not in program_counts:
+                program_counts[prefix] = 0
+                program_test_counts[prefix] = 0
+            program_counts[prefix] += 1
+            program_test_counts[prefix] += test_counts.get(story['story_id'], 0)
+
+        # =====================================================================
+        # GROUP STORIES BY CATEGORY
+        # =====================================================================
+
+        categories = {}
+        for story in stories:
+            category = story['category'] or "UNCATEGORIZED"
+            if category not in categories:
+                categories[category] = []
+            categories[category].append(story)
+
+        # Category display info
+        category_info = {
+            "REFERRAL": {"icon": "📋", "title": "Referral Workflow", "css": "referral"},
+            "ANALYTICS": {"icon": "📊", "title": "Analytics", "css": "analytics"},
+            "DASH": {"icon": "🖥️", "title": "Dashboard", "css": "dash"},
+            "CONFIG": {"icon": "⚙️", "title": "Configuration", "css": "config"},
+            "AUDIT": {"icon": "🔒", "title": "Compliance (Part 11)", "css": "audit"},
+            "RECORD": {"icon": "🔒", "title": "Compliance (Part 11)", "css": "audit"},
+            "ROLE": {"icon": "👤", "title": "Roles & Permissions", "css": "role"},
+            "UNCATEGORIZED": {"icon": "📁", "title": "Other", "css": "other"},
+        }
+
+        # Merge AUDIT and RECORD into single compliance category
+        if "AUDIT" in categories and "RECORD" in categories:
+            categories["COMPLIANCE"] = categories.pop("AUDIT", []) + categories.pop("RECORD", [])
+            category_info["COMPLIANCE"] = {"icon": "🔒", "title": "Compliance (Part 11)", "css": "audit"}
+        elif "AUDIT" in categories:
+            categories["COMPLIANCE"] = categories.pop("AUDIT")
+            category_info["COMPLIANCE"] = category_info["AUDIT"]
+        elif "RECORD" in categories:
+            categories["COMPLIANCE"] = categories.pop("RECORD")
+            category_info["COMPLIANCE"] = category_info["RECORD"]
+
+        # =====================================================================
+        # GENERATE HTML
+        # =====================================================================
+
+        today = datetime.now().strftime("%B %d, %Y")
+
+        # Build program summary cards
+        program_cards_html = ""
+        for prefix, count in program_counts.items():
+            program_cards_html += f"""
+                <div class="summary-card">
+                    <div class="summary-card-label">{prefix}</div>
+                    <div class="summary-card-value">{count}</div>
+                    <div class="summary-card-sub">{program_test_counts[prefix]} test cases</div>
+                </div>
+            """
+
+        # Build program filter buttons
+        program_filters_html = '<button class="filter-btn active" data-filter="all">All Programs</button>'
+        for prefix, count in program_counts.items():
+            program_filters_html += f'<button class="filter-btn {prefix.lower()}" data-filter="{prefix.lower()}">{prefix} ({count})</button>'
+
+        # Build category sections
+        categories_html = ""
+
+        # Define category order
+        category_order = ["REFERRAL", "ANALYTICS", "DASH", "CONFIG", "COMPLIANCE", "ROLE", "UNCATEGORIZED"]
+
+        for cat_key in category_order:
+            if cat_key not in categories:
+                continue
+
+            cat_stories = categories[cat_key]
+            info = category_info.get(cat_key, category_info["UNCATEGORIZED"])
+
+            stories_html = ""
+            for story in cat_stories:
+                story_id = story['story_id']
+                title = story['title']
+                user_story = story['user_story']
+                acceptance_criteria = story['acceptance_criteria']
+                status = story['status']
+                priority = story['priority']
+                version = story['version']
+                prefix = story['prefix']
+
+                # Parse acceptance criteria (handle numbered list or newline separated)
+                ac_items = []
+                if acceptance_criteria:
+                    # Remove any leading numbers and clean up
+                    lines = acceptance_criteria.strip().split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if line and not line.isdigit():
+                            # Remove leading numbers like "1." or "1)"
+                            line = re.sub(r'^\d+[\.\)]\s*', '', line)
+                            if line:
+                                ac_items.append(line)
+
+                ac_html = ""
+                for item in ac_items:
+                    ac_html += f"<li>{escape_html(item)}</li>"
+
+                test_count = test_counts.get(story_id, 0)
+
+                # Priority badge class
+                priority_class = priority.lower().replace(" ", "-") if priority else "should-have"
+
+                stories_html += f"""
+                    <article class="story-card" data-program="{prefix.lower()}" data-priority="{priority_class}" data-search="{title.lower()} {user_story.lower() if user_story else ''}">
+                        <div class="story-header" onclick="toggleStory(this)">
+                            <div>
+                                <span class="story-id {prefix.lower()}">{story_id}</span>
+                                <h3 class="story-title">{escape_html(title)}</h3>
+                                <div class="story-meta">
+                                    <span class="badge badge-{priority_class}">{priority}</span>
+                                    <span class="badge badge-draft">{status} v{version}</span>
+                                </div>
+                            </div>
+                            <svg class="story-toggle" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                        </div>
+                        <div class="story-body">
+                            <div class="story-section">
+                                <h4 class="story-section-title">User Story</h4>
+                                <p class="user-story">{escape_html(user_story) if user_story else 'No user story defined.'}</p>
+                            </div>
+                            <div class="story-section">
+                                <h4 class="story-section-title">Acceptance Criteria</h4>
+                                <ol class="acceptance-criteria">
+                                    {ac_html if ac_html else '<li>No acceptance criteria defined.</li>'}
+                                </ol>
+                            </div>
+                            <div class="test-count">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
+                                {test_count} test case{'s' if test_count != 1 else ''}
+                            </div>
+                        </div>
+                    </article>
+                """
+
+            categories_html += f"""
+                <section class="category-section" data-category="{cat_key.lower()}">
+                    <div class="category-header">
+                        <div class="category-icon {info['css']}">{info['icon']}</div>
+                        <h2 class="category-title">{info['title']}</h2>
+                        <span class="category-count">{len(cat_stories)} stor{'y' if len(cat_stories) == 1 else 'ies'}</span>
+                    </div>
+                    <div class="stories-grid">
+                        {stories_html}
+                    </div>
+                </section>
+            """
+
+        # Build the full HTML
+        html_content = generate_full_html_template(
+            total_stories=total_stories,
+            total_tests=total_tests,
+            program_cards_html=program_cards_html,
+            program_filters_html=program_filters_html,
+            categories_html=categories_html,
+            priority_counts=priority_counts,
+            today=today
+        )
+
+        # =====================================================================
+        # WRITE FILE
+        # =====================================================================
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+        result = f"✅ Dashboard generated: {output_path}\n"
+        result += f"   Stories: {total_stories} | Tests: {total_tests}\n"
+
+        # =====================================================================
+        # PUSH TO GITHUB (optional)
+        # =====================================================================
+
+        if push_to_github:
+            try:
+                original_dir = os.getcwd()
+                os.chdir(repo_path)
+
+                # Pull latest
+                subprocess.run(["git", "pull"], check=True, capture_output=True)
+
+                # Add and commit
+                subprocess.run(["git", "add", "docs/"], check=True, capture_output=True)
+
+                commit_msg = f"Update requirements dashboard - {total_stories} stories, {total_tests} tests"
+                commit_result = subprocess.run(
+                    ["git", "commit", "-m", commit_msg],
+                    capture_output=True,
+                    text=True
+                )
+
+                if "nothing to commit" in commit_result.stdout or "nothing to commit" in commit_result.stderr:
+                    result += "   No changes to commit.\n"
+                else:
+                    # Push
+                    subprocess.run(["git", "push"], check=True, capture_output=True)
+                    result += "   ✅ Pushed to GitHub\n"
+                    result += "   🔗 https://glewis05.github.io/requirements_toolkit/\n"
+
+                os.chdir(original_dir)
+
+            except subprocess.CalledProcessError as e:
+                result += f"   ⚠️ Git error: {e}\n"
+            except Exception as e:
+                result += f"   ⚠️ Error pushing to GitHub: {e}\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"generate_requirements_dashboard() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"generate_requirements_dashboard() error: {e}", exc_info=True)
         return f"Error: {str(e)}"
     finally:
         if conn:
