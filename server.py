@@ -26,6 +26,13 @@ UAT CYCLE MANAGEMENT:
 - Reporting: get_cycle_dashboard, get_tester_workload
 - Decisions: record_go_nogo_decision
 
+UAT TOOLKIT INTEGRATION:
+- Cycle Setup: setup_uat_cycle_with_testers - Create cycle + assign testers with overlap
+- Tester Assignment: assign_uat_testers - Add/modify tester assignments
+- Tracker Generation: generate_uat_trackers - Generate HTML files + push to GitHub
+- Results Import: import_uat_results_json - Paste JSON from Formspree email
+- Dashboard: regenerate_uat_dashboard, get_uat_progress - View/update progress
+
 ONBOARDING PROJECT MANAGEMENT:
 - Projects: create_onboarding_project, get_onboarding_project, list_onboarding_projects
 - Milestones: update_milestone
@@ -11755,6 +11762,872 @@ Commands:
 
     except Exception as e:
         logger.error(f"get_go_live_readiness() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# UAT TOOLKIT INTEGRATION
+# ============================================================
+# These tools integrate with the uat_toolkit for generating
+# HTML trackers and importing results from Formspree emails.
+
+UAT_TOOLKIT_PATH = os.path.expanduser("~/projects/uat_toolkit")
+
+
+@mcp.tool()
+def setup_uat_cycle_with_testers(
+    program_prefix: str,
+    cycle_name: str,
+    uat_type: str,
+    target_launch_date: str,
+    testers: str,
+    overlap_percent: int = 20,
+    formspree_id: str = None,
+    clinical_pm: str = None,
+    clinical_pm_email: str = None,
+    description: str = None
+) -> str:
+    """
+    Create a UAT cycle AND assign testers with configurable overlap in one step.
+
+    This is the main setup tool for new UAT cycles. It:
+    1. Creates the UAT cycle record
+    2. Assigns tests to testers based on even split
+    3. Creates overlap assignments for cross-checking
+
+    Args:
+        program_prefix: Program prefix (e.g., "ONB", "NCCN", "GRX")
+        cycle_name: Display name (e.g., "ONB Questionnaire v1")
+        uat_type: Type of UAT - 'feature', 'rule_validation', or 'regression'
+        target_launch_date: Target date (YYYY-MM-DD)
+        testers: JSON array of tester objects with name and email
+                 Example: '[{"name": "Glen Lewis", "email": "glen@..."}, {"name": "Kim", "email": "kim@..."}]'
+        overlap_percent: Percentage of tests both testers should execute (default 20%)
+        formspree_id: Formspree form ID for email submissions
+        clinical_pm: Clinical PM name
+        clinical_pm_email: Clinical PM email
+        description: Optional description
+
+    Returns:
+        Summary of created cycle and assignments
+
+    Example:
+        setup_uat_cycle_with_testers(
+            program_prefix="ONB",
+            cycle_name="ONB Questionnaire v1",
+            uat_type="feature",
+            target_launch_date="2025-05-02",
+            testers='[{"name": "Glen Lewis", "email": "glen.lewis@propelhealth.com"}, {"name": "Kim Childers", "email": "kim.childers@providence.org"}]',
+            overlap_percent=20,
+            formspree_id="mqeekjjz"
+        )
+    """
+    import math
+
+    logger.info(f"setup_uat_cycle_with_testers() called - program={program_prefix}, name={cycle_name}")
+
+    # Validate uat_type
+    valid_types = ['feature', 'rule_validation', 'regression']
+    if uat_type not in valid_types:
+        return f"Error: Invalid uat_type '{uat_type}'. Valid types: {', '.join(valid_types)}"
+
+    # Parse testers JSON
+    try:
+        testers_list = json.loads(testers)
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid testers JSON: {str(e)}"
+
+    if not testers_list:
+        return "Error: At least one tester is required"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Resolve program
+        cursor = conn.execute(
+            "SELECT program_id, name, prefix FROM programs WHERE UPPER(prefix) = UPPER(?)",
+            (program_prefix,)
+        )
+        program = cursor.fetchone()
+        if not program:
+            return f"Error: Program not found with prefix '{program_prefix}'"
+
+        # Generate cycle_id
+        cycle_id = f"UAT-{program['prefix']}-{str(uuid.uuid4())[:8].upper()}"
+
+        # Insert cycle
+        conn.execute("""
+            INSERT INTO uat_cycles (
+                cycle_id, program_id, name, description, uat_type,
+                target_launch_date, clinical_pm, clinical_pm_email,
+                formspree_id, status, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planning', 'MCP:setup_uat_cycle_with_testers')
+        """, (
+            cycle_id, program['program_id'], cycle_name, description, uat_type,
+            target_launch_date, clinical_pm, clinical_pm_email, formspree_id
+        ))
+
+        # Get all test cases for this program (matching test_id prefix)
+        cursor = conn.execute("""
+            SELECT test_id, workflow_section, workflow_order
+            FROM uat_test_cases
+            WHERE test_id LIKE ?
+            AND uat_cycle_id IS NULL
+            ORDER BY workflow_section, workflow_order, test_id
+        """, (f"{program['prefix'].upper()}-%",))
+
+        all_tests = cursor.fetchall()
+        total_tests = len(all_tests)
+
+        if total_tests == 0:
+            # Try looking for tests without cycle assigned
+            cursor = conn.execute("""
+                SELECT test_id, workflow_section, workflow_order
+                FROM uat_test_cases
+                WHERE test_id LIKE ?
+                ORDER BY workflow_section, workflow_order, test_id
+            """, (f"{program['prefix'].upper()}-%",))
+            all_tests = cursor.fetchall()
+            total_tests = len(all_tests)
+
+            if total_tests == 0:
+                conn.rollback()
+                return f"Error: No test cases found for program prefix '{program_prefix}'"
+
+        # Calculate overlap
+        overlap_count = max(1, math.ceil(total_tests * (overlap_percent / 100)))
+        num_testers = len(testers_list)
+
+        # Assign cycle to tests and distribute among testers
+        if num_testers == 1:
+            # Single tester gets all tests
+            tester = testers_list[0]
+            for test in all_tests:
+                conn.execute("""
+                    UPDATE uat_test_cases
+                    SET uat_cycle_id = ?, assigned_to = ?, assignment_type = 'primary'
+                    WHERE test_id = ?
+                """, (cycle_id, tester['email'], test['test_id']))
+
+        elif num_testers == 2:
+            # Two testers: split with overlap
+            tester1 = testers_list[0]
+            tester2 = testers_list[1]
+
+            # Overlap tests come from the middle (both get them)
+            mid = total_tests // 2
+            overlap_start = mid - overlap_count // 2
+            overlap_end = overlap_start + overlap_count
+
+            for i, test in enumerate(all_tests):
+                test_id = test['test_id']
+
+                # Link test to cycle
+                conn.execute("""
+                    UPDATE uat_test_cases SET uat_cycle_id = ? WHERE test_id = ?
+                """, (cycle_id, test_id))
+
+                # Assign primary tester
+                if i < mid:
+                    conn.execute("""
+                        UPDATE uat_test_cases
+                        SET assigned_to = ?, assignment_type = 'primary'
+                        WHERE test_id = ?
+                    """, (tester1['email'], test_id))
+                else:
+                    conn.execute("""
+                        UPDATE uat_test_cases
+                        SET assigned_to = ?, assignment_type = 'primary'
+                        WHERE test_id = ?
+                    """, (tester2['email'], test_id))
+
+        else:
+            # More than 2 testers: distribute evenly
+            tests_per_tester = total_tests // num_testers
+
+            for i, test in enumerate(all_tests):
+                test_id = test['test_id']
+                tester_idx = min(i // tests_per_tester, num_testers - 1)
+                tester = testers_list[tester_idx]
+
+                conn.execute("""
+                    UPDATE uat_test_cases
+                    SET uat_cycle_id = ?, assigned_to = ?, assignment_type = 'primary'
+                    WHERE test_id = ?
+                """, (cycle_id, tester['email'], test_id))
+
+        # Log to audit
+        conn.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                new_value, changed_by, change_reason
+            ) VALUES (?, ?, 'CREATE', 'cycle', ?, 'system', ?)
+        """, (
+            'uat_cycles', cycle_id,
+            json.dumps({"testers": num_testers, "tests": total_tests, "overlap": overlap_count}),
+            f"Created UAT cycle with testers via MCP tool"
+        ))
+
+        conn.commit()
+
+        logger.info(f"setup_uat_cycle_with_testers() SUCCESS - created {cycle_id}")
+
+        # Build summary
+        summary_lines = [
+            f"✅ UAT Cycle Created: {cycle_id}",
+            f"",
+            f"📋 **{cycle_name}**",
+            f"   Program: {program['name']} [{program['prefix']}]",
+            f"   Type: {uat_type}",
+            f"   Target: {target_launch_date or 'TBD'}",
+            f"   Formspree: {formspree_id or 'Not configured'}",
+            f"",
+            f"📊 **Test Distribution:**",
+            f"   Total tests: {total_tests}",
+            f"   Overlap: {overlap_count} tests ({overlap_percent}%)",
+            f""
+        ]
+
+        # Get tester counts
+        for tester in testers_list:
+            cursor = conn.execute("""
+                SELECT COUNT(*) as cnt FROM uat_test_cases
+                WHERE uat_cycle_id = ? AND assigned_to = ?
+            """, (cycle_id, tester['email']))
+            count = cursor.fetchone()['cnt']
+            summary_lines.append(f"   {tester['name']}: {count} tests")
+
+        summary_lines.extend([
+            f"",
+            f"🔜 **Next Steps:**",
+            f"   1. Run: generate_uat_trackers(cycle_id='{cycle_id}')",
+            f"   2. Share tracker URLs with testers"
+        ])
+
+        return "\n".join(summary_lines)
+
+    except sqlite3.Error as e:
+        logger.error(f"setup_uat_cycle_with_testers() database error: {e}")
+        if conn:
+            conn.rollback()
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"setup_uat_cycle_with_testers() error: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def assign_uat_testers(
+    cycle_id: str,
+    testers: str,
+    sections: str = None,
+    overlap_percent: int = 20
+) -> str:
+    """
+    Add or modify tester assignments for an existing UAT cycle.
+
+    Args:
+        cycle_id: UAT cycle ID (e.g., "UAT-ONB-12345678")
+        testers: JSON array of tester objects with name and email
+                 Example: '[{"name": "Sarah", "email": "sarah@..."}]'
+        sections: Optional JSON array of section codes to assign
+                  Example: '["P4M", "GRX"]' - only assign tests in these sections
+        overlap_percent: Percentage of tests for cross-checking (default 20%)
+
+    Returns:
+        Assignment summary
+
+    Example:
+        assign_uat_testers(
+            cycle_id="UAT-ONB-12345678",
+            testers='[{"name": "Sarah Johnson", "email": "sarah.johnson@providence.org"}]',
+            sections='["GRX"]'
+        )
+    """
+    logger.info(f"assign_uat_testers() called - cycle={cycle_id}")
+
+    # Parse testers JSON
+    try:
+        testers_list = json.loads(testers)
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid testers JSON: {str(e)}"
+
+    # Parse sections if provided
+    section_filter = None
+    if sections:
+        try:
+            section_filter = json.loads(sections)
+        except json.JSONDecodeError as e:
+            return f"Error: Invalid sections JSON: {str(e)}"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Verify cycle exists
+        cursor = conn.execute("SELECT * FROM uat_cycles WHERE cycle_id = ?", (cycle_id,))
+        cycle = cursor.fetchone()
+        if not cycle:
+            return f"Error: UAT cycle not found: {cycle_id}"
+
+        # Get unassigned tests (or tests in specified sections)
+        if section_filter:
+            placeholders = ','.join('?' * len(section_filter))
+            cursor = conn.execute(f"""
+                SELECT test_id, workflow_section FROM uat_test_cases
+                WHERE uat_cycle_id = ?
+                AND workflow_section IN ({placeholders})
+                ORDER BY workflow_section, workflow_order
+            """, [cycle_id] + section_filter)
+        else:
+            cursor = conn.execute("""
+                SELECT test_id, workflow_section FROM uat_test_cases
+                WHERE uat_cycle_id = ? AND (assigned_to IS NULL OR assigned_to = '')
+                ORDER BY workflow_section, workflow_order
+            """, (cycle_id,))
+
+        tests = cursor.fetchall()
+        if not tests:
+            return f"No unassigned tests found for cycle {cycle_id}" + (
+                f" in sections {section_filter}" if section_filter else ""
+            )
+
+        # Distribute tests among new testers
+        total_tests = len(tests)
+        num_testers = len(testers_list)
+        tests_per_tester = total_tests // num_testers
+
+        assigned_counts = {t['email']: 0 for t in testers_list}
+
+        for i, test in enumerate(tests):
+            tester_idx = min(i // tests_per_tester, num_testers - 1)
+            tester = testers_list[tester_idx]
+
+            conn.execute("""
+                UPDATE uat_test_cases
+                SET assigned_to = ?, assignment_type = 'primary'
+                WHERE test_id = ?
+            """, (tester['email'], test['test_id']))
+            assigned_counts[tester['email']] += 1
+
+        conn.commit()
+
+        # Build summary
+        summary = [f"✅ Assigned {total_tests} tests to {num_testers} tester(s)", ""]
+        for tester in testers_list:
+            count = assigned_counts[tester['email']]
+            summary.append(f"   {tester['name']}: {count} tests")
+
+        return "\n".join(summary)
+
+    except sqlite3.Error as e:
+        logger.error(f"assign_uat_testers() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"assign_uat_testers() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def generate_uat_trackers(
+    cycle_id: str,
+    push_to_github: bool = True
+) -> str:
+    """
+    Generate personalized UAT tracker HTML files for each tester and optionally push to GitHub.
+
+    This runs the tracker generator script which:
+    1. Queries test assignments from database
+    2. Creates one HTML file per tester with their assigned tests
+    3. Creates a tester selection index page
+    4. Updates the main landing page
+    5. Optionally commits and pushes to GitHub
+
+    Args:
+        cycle_id: UAT cycle ID (e.g., "UAT-ONB-12345678")
+        push_to_github: Whether to commit and push changes (default True)
+
+    Returns:
+        List of generated files and tester URLs
+
+    Example:
+        generate_uat_trackers(cycle_id="UAT-ONB-12345678")
+    """
+    import subprocess
+
+    logger.info(f"generate_uat_trackers() called - cycle={cycle_id}")
+
+    script_path = os.path.join(UAT_TOOLKIT_PATH, "scripts", "generate_tester_trackers.py")
+
+    if not os.path.exists(script_path):
+        return f"Error: Generator script not found: {script_path}"
+
+    # Get formspree_id from cycle
+    conn = None
+    formspree_id = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute("SELECT formspree_id FROM uat_cycles WHERE cycle_id = ?", (cycle_id,))
+        row = cursor.fetchone()
+        if row:
+            formspree_id = row['formspree_id']
+    finally:
+        if conn:
+            conn.close()
+
+    # Run generator script
+    cmd = ["python", script_path, cycle_id]
+    if formspree_id:
+        cmd.append(formspree_id)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=UAT_TOOLKIT_PATH,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        output = result.stdout
+
+        if result.returncode != 0:
+            logger.error(f"generate_uat_trackers() script failed: {result.stderr}")
+            return f"Error: Generator failed:\n{result.stderr}"
+
+        # Push to GitHub if requested
+        if push_to_github:
+            # Add docs folder
+            subprocess.run(
+                ["git", "add", "docs/"],
+                cwd=UAT_TOOLKIT_PATH,
+                capture_output=True
+            )
+
+            # Commit
+            commit_result = subprocess.run(
+                ["git", "commit", "-m", f"Generated trackers for {cycle_id}\n\nCo-Authored-By: Claude <noreply@anthropic.com>"],
+                cwd=UAT_TOOLKIT_PATH,
+                capture_output=True,
+                text=True
+            )
+
+            if "nothing to commit" in commit_result.stdout + commit_result.stderr:
+                output += "\n\n📝 No changes to commit (files unchanged)"
+            else:
+                # Push
+                push_result = subprocess.run(
+                    ["git", "push", "origin", "main"],
+                    cwd=UAT_TOOLKIT_PATH,
+                    capture_output=True,
+                    text=True
+                )
+
+                if push_result.returncode == 0:
+                    output += "\n\n✅ Pushed to GitHub. URLs will be live in ~1 minute."
+                else:
+                    output += f"\n\n⚠️ Push failed: {push_result.stderr}"
+
+        logger.info(f"generate_uat_trackers() completed")
+        return output
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"generate_uat_trackers() timed out")
+        return "Error: Generator timed out after 60 seconds"
+    except Exception as e:
+        logger.error(f"generate_uat_trackers() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def import_uat_results_json(
+    json_data: str,
+    partial: bool = True
+) -> str:
+    """
+    Import UAT results from pasted JSON (from Formspree email).
+
+    Paste the JSON payload from your Formspree email directly into this tool.
+    It will update test results in the database.
+
+    Args:
+        json_data: The JSON string from Formspree email (paste the entire JSON)
+        partial: If True (default), only update executed tests.
+                 If False, treat as final submission and update all tests.
+
+    Returns:
+        Import summary with updated test counts
+
+    Example:
+        import_uat_results_json(json_data='{"tester": "Kim Childers", "synced_at": "2025-01-13T22:00:00Z", "results": [...]}')
+
+    Usage:
+        Just paste the JSON from your email:
+
+        import_uat_results_json(json_data='''
+        {
+            "_subject": "UAT Progress: ONB v1 - Kim Childers (45%)",
+            "tester": "Kim Childers",
+            "synced_at": "2025-01-13T22:00:00.000Z",
+            "progress": {...},
+            "results": [...]
+        }
+        ''')
+    """
+    logger.info(f"import_uat_results_json() called")
+
+    # Parse JSON
+    try:
+        data = json.loads(json_data)
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON: {str(e)}\n\nMake sure you pasted the complete JSON from the email."
+
+    tester = data.get('tester', 'Unknown')
+    tester_email = data.get('tester_email', '')
+    sync_type = data.get('sync_type', 'manual')
+    synced_at = data.get('synced_at', data.get('submitted_at', datetime.now().isoformat()))
+    progress = data.get('progress', {})
+    results = data.get('results', [])
+
+    if not results:
+        return "Error: No results found in JSON"
+
+    # Auto-detect partial mode from sync_type
+    if sync_type in ('auto_open', 'auto_10pm', 'manual'):
+        partial = True
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        updated = 0
+        skipped = 0
+        not_found = []
+
+        for result in results:
+            test_id = result.get('test_id')
+            status = result.get('status', result.get('test_status', 'Not Run'))
+            notes = result.get('notes', '')
+            tested_date = result.get('tested_date', synced_at)
+
+            if not test_id:
+                continue
+
+            # Skip unexecuted tests in partial sync
+            if partial and status in ('Not Run', 'Not_Run', ''):
+                skipped += 1
+                continue
+
+            # Update test case
+            cursor = conn.execute("""
+                UPDATE uat_test_cases
+                SET test_status = ?,
+                    tested_by = ?,
+                    tested_date = ?,
+                    execution_notes = CASE
+                        WHEN ? != '' AND (execution_notes IS NULL OR execution_notes = '')
+                        THEN ?
+                        WHEN ? != ''
+                        THEN execution_notes || char(10) || '[' || ? || '] ' || ?
+                        ELSE execution_notes
+                    END,
+                    updated_date = CURRENT_TIMESTAMP
+                WHERE test_id = ?
+            """, (
+                status, tester, tested_date,
+                notes, notes,  # For empty case
+                notes, synced_at[:10], notes,  # For append case
+                test_id
+            ))
+
+            if cursor.rowcount > 0:
+                updated += 1
+            else:
+                not_found.append(test_id)
+
+        # Log import to audit history
+        conn.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                new_value, changed_by, change_reason
+            ) VALUES (?, ?, 'IMPORT', 'test_status', ?, ?, ?)
+        """, (
+            'uat_test_cases',
+            f"batch-{len(results)}",
+            json.dumps({"updated": updated, "skipped": skipped, "sync_type": sync_type}),
+            tester,
+            f"Imported from Formspree {sync_type} sync"
+        ))
+
+        conn.commit()
+
+        logger.info(f"import_uat_results_json() SUCCESS - updated {updated} tests")
+
+        # Build summary
+        lines = [
+            f"✅ **Import Complete**",
+            f"",
+            f"📥 **Source:** {sync_type} sync from {tester}",
+            f"   Synced at: {synced_at[:19]}",
+            f"",
+            f"📊 **Progress reported:**"
+        ]
+
+        if progress:
+            lines.append(f"   {progress.get('percent_complete', '?')}% complete ({progress.get('executed', '?')}/{progress.get('total', '?')})")
+            lines.append(f"   ✅ {progress.get('passed', 0)} Pass | ❌ {progress.get('failed', 0)} Fail | 🚧 {progress.get('blocked', 0)} Blocked")
+
+        lines.extend([
+            f"",
+            f"📝 **Import results:**",
+            f"   Updated: {updated} tests",
+            f"   Skipped: {skipped} (not executed yet)",
+        ])
+
+        if not_found:
+            lines.append(f"   ⚠️ Not found: {len(not_found)} ({', '.join(not_found[:3])}{'...' if len(not_found) > 3 else ''})")
+
+        lines.extend([
+            f"",
+            f"🔜 **Next:** Run `regenerate_uat_dashboard('{data.get('cycle_id', 'CYCLE_ID')}')` to update the dashboard"
+        ])
+
+        return "\n".join(lines)
+
+    except sqlite3.Error as e:
+        logger.error(f"import_uat_results_json() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"import_uat_results_json() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def regenerate_uat_dashboard(
+    cycle_id: str,
+    push_to_github: bool = True
+) -> str:
+    """
+    Regenerate the UAT dashboard HTML with current data from database.
+
+    Call this after importing results to update the dashboard.
+
+    Args:
+        cycle_id: UAT cycle ID (e.g., "UAT-ONB-12345678")
+        push_to_github: Whether to commit and push changes (default True)
+
+    Returns:
+        Confirmation with dashboard URL
+
+    Example:
+        regenerate_uat_dashboard(cycle_id="UAT-ONB-12345678")
+    """
+    import subprocess
+
+    logger.info(f"regenerate_uat_dashboard() called - cycle={cycle_id}")
+
+    script_path = os.path.join(UAT_TOOLKIT_PATH, "scripts", "generate_dashboard.py")
+
+    if not os.path.exists(script_path):
+        return f"Error: Dashboard generator not found: {script_path}"
+
+    try:
+        result = subprocess.run(
+            ["python", script_path, cycle_id],
+            cwd=UAT_TOOLKIT_PATH,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            logger.error(f"regenerate_uat_dashboard() script failed: {result.stderr}")
+            return f"Error: Generator failed:\n{result.stderr}"
+
+        output = result.stdout
+
+        if push_to_github:
+            # Add docs folder
+            subprocess.run(
+                ["git", "add", "docs/"],
+                cwd=UAT_TOOLKIT_PATH,
+                capture_output=True
+            )
+
+            # Commit
+            commit_result = subprocess.run(
+                ["git", "commit", "-m", f"Dashboard update for {cycle_id}\n\nCo-Authored-By: Claude <noreply@anthropic.com>"],
+                cwd=UAT_TOOLKIT_PATH,
+                capture_output=True,
+                text=True
+            )
+
+            if "nothing to commit" in commit_result.stdout + commit_result.stderr:
+                output += "\n\n📝 No changes to commit (dashboard unchanged)"
+            else:
+                # Push
+                push_result = subprocess.run(
+                    ["git", "push", "origin", "main"],
+                    cwd=UAT_TOOLKIT_PATH,
+                    capture_output=True,
+                    text=True
+                )
+
+                if push_result.returncode == 0:
+                    output += "\n\n✅ Pushed to GitHub"
+                else:
+                    output += f"\n\n⚠️ Push failed: {push_result.stderr}"
+
+        # Add dashboard URL
+        cycle_slug = cycle_id.lower().replace('_', '-')
+        output += f"\n\n🔗 Dashboard: https://glewis05.github.io/uat_toolkit/dashboard-{cycle_slug}.html"
+
+        logger.info(f"regenerate_uat_dashboard() completed")
+        return output
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"regenerate_uat_dashboard() timed out")
+        return "Error: Generator timed out after 30 seconds"
+    except Exception as e:
+        logger.error(f"regenerate_uat_dashboard() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def get_uat_progress(
+    cycle_id: str = None,
+    program_prefix: str = None
+) -> str:
+    """
+    Get quick UAT progress summary for chat display.
+
+    Simpler than get_cycle_dashboard - designed for quick status checks.
+
+    Args:
+        cycle_id: Specific cycle ID (e.g., "UAT-ONB-12345678")
+        program_prefix: Program prefix to find most recent cycle (e.g., "ONB")
+
+    Returns:
+        Formatted progress summary
+
+    Example:
+        get_uat_progress(cycle_id="UAT-ONB-12345678")
+        get_uat_progress(program_prefix="ONB")
+    """
+    logger.info(f"get_uat_progress() called - cycle={cycle_id}, program={program_prefix}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Find cycle
+        if cycle_id:
+            cursor = conn.execute("""
+                SELECT c.*, p.prefix, p.name as program_name
+                FROM uat_cycles c
+                JOIN programs p ON c.program_id = p.program_id
+                WHERE c.cycle_id = ?
+            """, (cycle_id,))
+        elif program_prefix:
+            cursor = conn.execute("""
+                SELECT c.*, p.prefix, p.name as program_name
+                FROM uat_cycles c
+                JOIN programs p ON c.program_id = p.program_id
+                WHERE UPPER(p.prefix) = UPPER(?)
+                ORDER BY c.created_date DESC LIMIT 1
+            """, (program_prefix,))
+        else:
+            cursor = conn.execute("""
+                SELECT c.*, p.prefix, p.name as program_name
+                FROM uat_cycles c
+                JOIN programs p ON c.program_id = p.program_id
+                ORDER BY c.created_date DESC LIMIT 1
+            """)
+
+        cycle = cursor.fetchone()
+        if not cycle:
+            return "Error: No UAT cycle found"
+
+        cycle = dict(cycle)
+        cycle_id = cycle['cycle_id']
+
+        # Get tester progress
+        cursor = conn.execute("""
+            SELECT
+                assigned_to,
+                COUNT(*) as total,
+                SUM(CASE WHEN test_status NOT IN ('Not Run', '') THEN 1 ELSE 0 END) as executed,
+                SUM(CASE WHEN test_status = 'Pass' THEN 1 ELSE 0 END) as passed,
+                SUM(CASE WHEN test_status = 'Fail' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN test_status = 'Blocked' THEN 1 ELSE 0 END) as blocked,
+                MAX(tested_date) as last_activity
+            FROM uat_test_cases
+            WHERE uat_cycle_id = ?
+            AND assigned_to IS NOT NULL
+            GROUP BY assigned_to
+        """, (cycle_id,))
+
+        testers = cursor.fetchall()
+
+        # Calculate overall
+        total_tests = sum(t['total'] for t in testers)
+        total_executed = sum(t['executed'] or 0 for t in testers)
+        total_passed = sum(t['passed'] or 0 for t in testers)
+        total_failed = sum(t['failed'] or 0 for t in testers)
+        total_blocked = sum(t['blocked'] or 0 for t in testers)
+        overall_pct = round((total_executed / total_tests) * 100) if total_tests > 0 else 0
+
+        # Build output
+        lines = [
+            f"📊 **{cycle['name']}** ({cycle_id})",
+            f"   Target: {cycle['target_launch_date'] or 'TBD'}",
+            f"",
+            f"## Overall Progress: {overall_pct}%",
+            f"   {total_executed}/{total_tests} tests executed",
+            f"   ✅ {total_passed} Pass | ❌ {total_failed} Fail | 🚧 {total_blocked} Blocked",
+            f"",
+            f"## Tester Progress:"
+        ]
+
+        for t in testers:
+            t = dict(t)
+            email = t['assigned_to']
+            name = email.split('@')[0].replace('.', ' ').title() if email else 'Unassigned'
+            total = t['total']
+            executed = t['executed'] or 0
+            pct = round((executed / total) * 100) if total > 0 else 0
+
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            lines.append(f"   **{name}**: {bar} {pct}% ({executed}/{total})")
+            lines.append(f"      ✅{t['passed'] or 0} ❌{t['failed'] or 0} 🚧{t['blocked'] or 0}")
+
+        return "\n".join(lines)
+
+    except sqlite3.Error as e:
+        logger.error(f"get_uat_progress() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"get_uat_progress() error: {e}", exc_info=True)
         return f"Error: {str(e)}"
     finally:
         if conn:
