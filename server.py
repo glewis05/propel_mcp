@@ -3031,6 +3031,10 @@ Next Steps:
   • get_story(story_id="{story_id}") - View full story details
   • list_stories(program_prefix="{prefix}") - View all stories in program
   • Create test cases linked to this story
+
+⚠️  COMPLIANCE REMINDER:
+  Run vet_story_for_compliance("{story_id}") to assess regulatory requirements
+  (Part 11, HIPAA, SOC2, HITRUST) and create compliance test cases.
 """
         return result
 
@@ -3708,7 +3712,7 @@ def create_test_case(
         # ----------------------------------------------------------------
         # STEP 3: Validate compliance_framework if provided
         # ----------------------------------------------------------------
-        valid_frameworks = ["Part11", "HIPAA", "SOC2"]
+        valid_frameworks = ["Part11", "HIPAA", "SOC2", "HITRUST"]
         if compliance_framework is not None:
             # Normalize common variations
             framework_normalized = compliance_framework.strip()
@@ -3722,7 +3726,9 @@ def create_test_case(
                 "HIPAA": "HIPAA",
                 "SOC2": "SOC2",
                 "SOCII": "SOC2",
-                "SOC": "SOC2"
+                "SOC": "SOC2",
+                "HITRUST": "HITRUST",
+                "HITRUSTCSF": "HITRUST"
             }
 
             if framework_upper in framework_map:
@@ -3734,6 +3740,7 @@ def create_test_case(
                     f"  • Part11 - FDA 21 CFR Part 11\n"
                     f"  • HIPAA - Health Insurance Portability and Accountability\n"
                     f"  • SOC2 - Service Organization Control 2\n"
+                    f"  • HITRUST - HITRUST Common Security Framework\n"
                     f"  • None - No compliance requirement"
                 )
 
@@ -4427,7 +4434,7 @@ def update_test_case(
         # ----------------------------------------------------------------
         # STEP 3: Validate compliance_framework if provided
         # ----------------------------------------------------------------
-        valid_frameworks = ["Part11", "HIPAA", "SOC2"]
+        valid_frameworks = ["Part11", "HIPAA", "SOC2", "HITRUST"]
         if compliance_framework is not None:
             # Normalize common variations
             framework_normalized = compliance_framework.strip()
@@ -4442,6 +4449,8 @@ def update_test_case(
                 "SOC2": "SOC2",
                 "SOCII": "SOC2",
                 "SOC": "SOC2",
+                "HITRUST": "HITRUST",
+                "HITRUSTCSF": "HITRUST",
                 "NONE": None  # Allow clearing the framework
             }
 
@@ -4454,6 +4463,7 @@ def update_test_case(
                     f"  • Part11 - FDA 21 CFR Part 11\n"
                     f"  • HIPAA - Health Insurance Portability and Accountability\n"
                     f"  • SOC2 - Service Organization Control 2\n"
+                    f"  • HITRUST - HITRUST Common Security Framework\n"
                     f"  • None - No compliance requirement (or use 'NONE' to clear)"
                 )
 
@@ -4867,6 +4877,693 @@ def get_coverage_gaps(program_prefix: str) -> str:
     finally:
         if db:
             db.close()
+
+
+# ============================================================
+# COMPLIANCE VETTING TOOLS
+# ============================================================
+# These tools support the compliance vetting workflow for regulatory
+# frameworks: Part 11 (FDA), HIPAA, SOC2, and HITRUST.
+# Compliance tests are tracked separately from functional tests.
+
+@mcp.tool()
+def list_compliance_frameworks() -> str:
+    """
+    List all available compliance frameworks with descriptions and guidance.
+
+    PURPOSE:
+        Show what regulatory frameworks are available for tagging test cases
+        and vetting user stories. Each framework includes guidance on when
+        it applies to help with compliance analysis.
+
+    R EQUIVALENT:
+        Like reading a reference table with filter conditions.
+
+    RETURNS:
+        Formatted list of frameworks with:
+        - Framework ID and name
+        - Full regulatory name
+        - Description
+        - When it applies (trigger conditions)
+        - Available test templates
+
+    WHY THIS APPROACH:
+        Centralized reference for compliance frameworks ensures consistent
+        application across all programs and stories.
+    """
+    import sqlite3
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get frameworks
+        cursor = conn.execute("""
+            SELECT f.*, COUNT(t.template_id) as template_count
+            FROM compliance_frameworks f
+            LEFT JOIN compliance_test_templates t ON f.framework_id = t.framework_id AND t.is_active = TRUE
+            WHERE f.is_active = TRUE
+            GROUP BY f.framework_id
+            ORDER BY f.framework_id
+        """)
+        frameworks = cursor.fetchall()
+
+        if not frameworks:
+            return "No compliance frameworks defined. Database may need initialization."
+
+        result = "Compliance Frameworks\n"
+        result += "=" * 60 + "\n\n"
+
+        for fw in frameworks:
+            result += f"[{fw['framework_id']}] {fw['full_name']}\n"
+            result += f"  {fw['description']}\n"
+            if fw['regulation_url']:
+                result += f"  URL: {fw['regulation_url']}\n"
+            result += f"\n  APPLIES WHEN:\n"
+            # Wrap applies_when text
+            applies = fw['applies_when'] or 'Not specified'
+            result += f"    {applies}\n"
+            result += f"\n  Templates: {fw['template_count']} available\n"
+            result += "-" * 60 + "\n\n"
+
+        # Also show templates summary
+        cursor = conn.execute("""
+            SELECT framework_id, template_id, template_name, applies_when
+            FROM compliance_test_templates
+            WHERE is_active = TRUE
+            ORDER BY framework_id, template_id
+        """)
+        templates = cursor.fetchall()
+
+        if templates:
+            result += "\nAvailable Test Templates:\n"
+            result += "=" * 60 + "\n"
+            current_fw = None
+            for t in templates:
+                if t['framework_id'] != current_fw:
+                    current_fw = t['framework_id']
+                    result += f"\n{current_fw}:\n"
+                result += f"  [{t['template_id']}] {t['template_name']}\n"
+                result += f"      When: {t['applies_when'][:60]}...\n" if len(t['applies_when'] or '') > 60 else f"      When: {t['applies_when']}\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error listing compliance frameworks: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def vet_story_for_compliance(
+    story_id: str,
+    auto_create_tests: bool = False
+) -> str:
+    """
+    Analyze a user story against all compliance frameworks.
+
+    PURPOSE:
+        Determine which regulatory frameworks apply to a story based on
+        its acceptance criteria content. This uses keyword/pattern matching
+        to identify compliance requirements.
+
+    R EQUIVALENT:
+        Like using grepl() to match patterns, then joining to a reference table.
+
+    PARAMETERS:
+        story_id (str): The story to vet (e.g., "P4M-DASH-001")
+        auto_create_tests (bool): If True, automatically create compliance test
+                                  cases from templates for applicable frameworks
+
+    RETURNS:
+        Compliance vetting report showing:
+        - Which frameworks apply and why
+        - Which templates should be used
+        - Existing compliance test coverage
+        - Gaps that need to be addressed
+
+    KEYWORD TRIGGERS:
+        - Part 11: audit, log, track, record, export, report, signature
+        - HIPAA: patient, PHI, clinical, dashboard, role, access, permission
+        - SOC2: authentication, login, encrypt, integrity, available
+        - HITRUST: security, risk, control, third-party, integration
+
+    WHY THIS APPROACH:
+        Automated analysis ensures consistent compliance vetting across all
+        stories and prevents regulatory gaps from being missed.
+    """
+    import sqlite3
+    import re
+    from datetime import datetime
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get the story
+        cursor = conn.execute("""
+            SELECT s.*, p.prefix, p.name as program_name
+            FROM user_stories s
+            JOIN programs p ON s.program_id = p.program_id
+            WHERE s.story_id = ?
+        """, (story_id,))
+        story = cursor.fetchone()
+
+        if not story:
+            return f"Story not found: {story_id}"
+
+        # Get all frameworks
+        cursor = conn.execute("SELECT * FROM compliance_frameworks WHERE is_active = TRUE")
+        frameworks = cursor.fetchall()
+
+        # Get all templates
+        cursor = conn.execute("SELECT * FROM compliance_test_templates WHERE is_active = TRUE")
+        templates = cursor.fetchall()
+
+        # Get existing compliance tests for this story
+        cursor = conn.execute("""
+            SELECT test_id, title, compliance_framework, compliance_template_id
+            FROM uat_test_cases
+            WHERE story_id = ? AND (compliance_framework IS NOT NULL OR is_compliance_test = TRUE)
+        """, (story_id,))
+        existing_tests = cursor.fetchall()
+
+        # Get existing vetting records
+        cursor = conn.execute("""
+            SELECT * FROM story_compliance_vetting WHERE story_id = ?
+        """, (story_id,))
+        existing_vetting = {v['framework_id']: dict(v) for v in cursor.fetchall()}
+
+        # Combine story text for analysis
+        story_text = f"{story['title']} {story['user_story'] or ''} {story['acceptance_criteria'] or ''}".lower()
+
+        # Define keyword patterns for each framework
+        framework_patterns = {
+            'PART11': {
+                'keywords': ['audit', 'log', 'track', 'record', 'export', 'report', 'signature',
+                            'timestamp', 'before', 'after', 'history', 'change'],
+                'templates': ['P11-VIEW', 'P11-EDIT', 'P11-STATUS', 'P11-EXPORT']
+            },
+            'HIPAA': {
+                'keywords': ['patient', 'phi', 'clinical', 'dashboard', 'role', 'access',
+                            'permission', 'minimum necessary', 'hipaa', 'health information',
+                            'diagnosis', 'medical', 'protected'],
+                'templates': ['HIPAA-MIN', 'HIPAA-RBAC', 'HIPAA-TRANSMIT']
+            },
+            'SOC2': {
+                'keywords': ['authentication', 'login', 'encrypt', 'integrity', 'available',
+                            'password', 'session', 'secure', 'timeout', 'calculation', 'score'],
+                'templates': ['SOC2-AUTH', 'SOC2-INTEG']
+            },
+            'HITRUST': {
+                'keywords': ['security', 'risk', 'control', 'third-party', 'integration',
+                            'vendor', 'external', 'api', 'certification'],
+                'templates': ['HITRUST-CTRL', 'HITRUST-ACCESS']
+            }
+        }
+
+        result = f"Compliance Vetting Report: {story_id}\n"
+        result += "=" * 60 + "\n\n"
+        result += f"Title: {story['title']}\n"
+        result += f"Program: {story['program_name']} [{story['prefix']}]\n"
+        result += f"Status: {story['status']}\n\n"
+
+        vetting_results = []
+        templates_to_apply = []
+        tests_created = []
+
+        for fw in frameworks:
+            fw_id = fw['framework_id']
+            patterns = framework_patterns.get(fw_id, {'keywords': [], 'templates': []})
+
+            # Check for keyword matches
+            matches = [kw for kw in patterns['keywords'] if kw in story_text]
+            applies = len(matches) >= 2  # Require at least 2 keyword matches
+
+            # Get applicable templates
+            applicable_templates = [t for t in templates
+                                   if t['framework_id'] == fw_id
+                                   and t['template_id'] in patterns['templates']]
+
+            # Check existing coverage
+            existing_for_fw = [t for t in existing_tests if t['compliance_framework'] == fw_id.replace('PART11', 'Part11')]
+
+            vetting_results.append({
+                'framework_id': fw_id,
+                'applies': applies,
+                'matches': matches,
+                'templates': applicable_templates,
+                'existing_tests': existing_for_fw
+            })
+
+            if applies:
+                for tmpl in applicable_templates:
+                    templates_to_apply.append(tmpl)
+
+        # Output results by framework
+        result += "Framework Analysis:\n"
+        result += "-" * 60 + "\n"
+
+        for vr in vetting_results:
+            fw_id = vr['framework_id']
+            status = "✅ APPLIES" if vr['applies'] else "⬜ Not Applicable"
+            result += f"\n[{fw_id}] {status}\n"
+
+            if vr['matches']:
+                result += f"  Keywords found: {', '.join(vr['matches'][:5])}"
+                if len(vr['matches']) > 5:
+                    result += f" (+{len(vr['matches'])-5} more)"
+                result += "\n"
+
+            if vr['applies']:
+                result += f"  Templates to apply: {len(vr['templates'])}\n"
+                for t in vr['templates']:
+                    result += f"    • [{t['template_id']}] {t['template_name']}\n"
+
+                result += f"  Existing tests: {len(vr['existing_tests'])}\n"
+                for et in vr['existing_tests']:
+                    result += f"    • [{et['test_id']}] {et['title'][:40]}\n"
+
+                gap = len(vr['templates']) - len(vr['existing_tests'])
+                if gap > 0:
+                    result += f"  ⚠️  GAP: {gap} compliance tests needed\n"
+
+            # Record vetting
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            conn.execute("""
+                INSERT OR REPLACE INTO story_compliance_vetting
+                (story_id, framework_id, applies, rationale, test_cases_required, test_cases_created, vetted_by, vetted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                story_id,
+                fw_id,
+                vr['applies'],
+                f"Keywords: {', '.join(vr['matches'][:5])}" if vr['matches'] else "No matching keywords",
+                len(vr['templates']) if vr['applies'] else 0,
+                len(vr['existing_tests']),
+                'system',
+                now
+            ))
+
+        conn.commit()
+
+        # Auto-create tests if requested
+        if auto_create_tests and templates_to_apply:
+            result += "\n" + "=" * 60 + "\n"
+            result += "Auto-Creating Compliance Tests:\n"
+            result += "-" * 60 + "\n"
+
+            # Get program_id for test case creation
+            program_id = story['program_id']
+
+            for tmpl in templates_to_apply:
+                # Check if test already exists for this template
+                cursor = conn.execute("""
+                    SELECT test_id FROM uat_test_cases
+                    WHERE story_id = ? AND compliance_template_id = ?
+                """, (story_id, tmpl['template_id']))
+                if cursor.fetchone():
+                    result += f"  ⏭️  [{tmpl['template_id']}] Already exists - skipped\n"
+                    continue
+
+                # Generate test_id
+                cursor = conn.execute("""
+                    SELECT test_id FROM uat_test_cases
+                    WHERE story_id = ?
+                    ORDER BY test_id DESC LIMIT 1
+                """, (story_id,))
+                last_test = cursor.fetchone()
+                if last_test:
+                    # Extract number and increment
+                    match = re.search(r'TC(\d+)$', last_test['test_id'])
+                    next_num = int(match.group(1)) + 1 if match else 1
+                else:
+                    next_num = 1
+
+                test_id = f"{story_id}-TC{next_num:02d}"
+
+                # Map framework_id to compliance_framework format
+                fw_map = {'PART11': 'Part11', 'HIPAA': 'HIPAA', 'SOC2': 'SOC2', 'HITRUST': 'HITRUST'}
+                compliance_fw = fw_map.get(tmpl['framework_id'], tmpl['framework_id'])
+
+                # Insert test case
+                conn.execute("""
+                    INSERT INTO uat_test_cases (
+                        test_id, story_id, program_id, title, test_type, test_steps,
+                        expected_results, priority, compliance_framework, is_compliance_test,
+                        compliance_template_id, test_status, created_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Not Run', CURRENT_TIMESTAMP)
+                """, (
+                    test_id, story_id, program_id,
+                    tmpl['template_name'],
+                    tmpl['test_type'],
+                    tmpl['standard_test_steps'],
+                    tmpl['standard_expected_result'],
+                    'Must Have',
+                    compliance_fw,
+                    True,
+                    tmpl['template_id']
+                ))
+
+                tests_created.append(test_id)
+                result += f"  ✅ [{test_id}] {tmpl['template_name']} ({compliance_fw})\n"
+
+            conn.commit()
+
+            if tests_created:
+                result += f"\nCreated {len(tests_created)} compliance test cases.\n"
+
+        # Summary
+        applicable_count = sum(1 for vr in vetting_results if vr['applies'])
+        result += "\n" + "=" * 60 + "\n"
+        result += "Summary:\n"
+        result += f"  Frameworks applicable: {applicable_count} of {len(vetting_results)}\n"
+        result += f"  Existing compliance tests: {len(existing_tests)}\n"
+        if auto_create_tests:
+            result += f"  Tests created this run: {len(tests_created)}\n"
+        else:
+            if templates_to_apply:
+                result += f"\n  💡 Run with auto_create_tests=True to create {len(templates_to_apply)} compliance tests\n"
+
+        return result
+
+    except Exception as e:
+        import traceback
+        return f"Error vetting story: {str(e)}\n{traceback.format_exc()}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def get_compliance_coverage(program_prefix: str = None) -> str:
+    """
+    Get compliance test coverage report across programs.
+
+    PURPOSE:
+        Show compliance test coverage by framework, helping identify gaps
+        in regulatory test coverage that need to be addressed.
+
+    R EQUIVALENT:
+        Like a pivot table summarizing test counts by framework and program.
+
+    PARAMETERS:
+        program_prefix (str): Optional filter by program (e.g., "P4M").
+                              If None, returns coverage for all programs.
+
+    RETURNS:
+        Coverage report showing:
+        - Test cases by framework (Part11, HIPAA, SOC2, HITRUST)
+        - Stories with compliance coverage vs. gaps
+        - Framework-specific compliance percentage
+
+    WHY THIS APPROACH:
+        Centralized coverage view ensures no regulatory gaps slip through
+        and supports audit readiness reporting.
+    """
+    import sqlite3
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Build query with optional program filter
+        program_filter = ""
+        params = []
+        if program_prefix:
+            program_filter = "AND p.prefix = ?"
+            params.append(program_prefix.upper())
+
+        # Get program info
+        if program_prefix:
+            cursor = conn.execute(
+                "SELECT program_id, name, prefix FROM programs WHERE UPPER(prefix) = ?",
+                (program_prefix.upper(),)
+            )
+            program = cursor.fetchone()
+            if not program:
+                return f"Program not found: {program_prefix}"
+
+        # Count compliance tests by framework
+        cursor = conn.execute(f"""
+            SELECT
+                COALESCE(t.compliance_framework, 'None') as framework,
+                COUNT(*) as test_count,
+                COUNT(DISTINCT t.story_id) as stories_covered
+            FROM uat_test_cases t
+            JOIN programs p ON t.program_id = p.program_id
+            WHERE (t.compliance_framework IS NOT NULL OR t.is_compliance_test = TRUE)
+            {program_filter}
+            GROUP BY t.compliance_framework
+            ORDER BY t.compliance_framework
+        """, params)
+        framework_counts = cursor.fetchall()
+
+        # Get total stories and stories with compliance tests
+        cursor = conn.execute(f"""
+            SELECT COUNT(DISTINCT s.story_id) as total_stories
+            FROM user_stories s
+            JOIN programs p ON s.program_id = p.program_id
+            WHERE 1=1 {program_filter}
+        """, params)
+        total_stories = cursor.fetchone()['total_stories']
+
+        cursor = conn.execute(f"""
+            SELECT COUNT(DISTINCT t.story_id) as covered_stories
+            FROM uat_test_cases t
+            JOIN programs p ON t.program_id = p.program_id
+            WHERE (t.compliance_framework IS NOT NULL OR t.is_compliance_test = TRUE)
+            {program_filter}
+        """, params)
+        covered_stories = cursor.fetchone()['covered_stories']
+
+        # Get vetting status
+        cursor = conn.execute(f"""
+            SELECT
+                v.framework_id,
+                SUM(CASE WHEN v.applies = TRUE THEN 1 ELSE 0 END) as applicable,
+                SUM(CASE WHEN v.applies = FALSE THEN 1 ELSE 0 END) as not_applicable,
+                COUNT(*) as vetted
+            FROM story_compliance_vetting v
+            JOIN user_stories s ON v.story_id = s.story_id
+            JOIN programs p ON s.program_id = p.program_id
+            WHERE 1=1 {program_filter}
+            GROUP BY v.framework_id
+        """, params)
+        vetting_status = {row['framework_id']: dict(row) for row in cursor.fetchall()}
+
+        # Build report
+        title = f"Compliance Coverage: {program_prefix.upper()}" if program_prefix else "Compliance Coverage: All Programs"
+        result = f"{title}\n"
+        result += "=" * 60 + "\n\n"
+
+        # Overall stats
+        coverage_pct = (covered_stories / total_stories * 100) if total_stories > 0 else 0
+        result += f"Stories with compliance tests: {covered_stories}/{total_stories} ({coverage_pct:.1f}%)\n\n"
+
+        # Framework breakdown
+        result += "Test Cases by Framework:\n"
+        result += "-" * 40 + "\n"
+
+        total_compliance_tests = 0
+        for fc in framework_counts:
+            fw = fc['framework']
+            count = fc['test_count']
+            stories = fc['stories_covered']
+            total_compliance_tests += count
+            result += f"  {fw:12} │ {count:4} tests │ {stories:3} stories\n"
+
+        result += "-" * 40 + "\n"
+        result += f"  {'TOTAL':12} │ {total_compliance_tests:4} tests │ {covered_stories:3} stories\n\n"
+
+        # Vetting status
+        result += "Vetting Status by Framework:\n"
+        result += "-" * 40 + "\n"
+
+        frameworks = ['PART11', 'HIPAA', 'SOC2', 'HITRUST']
+        for fw in frameworks:
+            vs = vetting_status.get(fw, {'applicable': 0, 'not_applicable': 0, 'vetted': 0})
+            vetted = vs['vetted']
+            applicable = vs['applicable']
+            result += f"  {fw:12} │ {vetted:3} vetted │ {applicable:3} applicable\n"
+
+        # Stories needing vetting
+        cursor = conn.execute(f"""
+            SELECT s.story_id, s.title
+            FROM user_stories s
+            JOIN programs p ON s.program_id = p.program_id
+            WHERE s.story_id NOT IN (
+                SELECT DISTINCT story_id FROM story_compliance_vetting
+            )
+            {program_filter}
+            ORDER BY s.story_id
+        """, params)
+        unvetted = cursor.fetchall()
+
+        result += f"\nStories Needing Vetting: {len(unvetted)}\n"
+        if unvetted:
+            result += "-" * 40 + "\n"
+            for story in unvetted[:10]:
+                result += f"  • [{story['story_id']}] {story['title'][:40]}\n"
+            if len(unvetted) > 10:
+                result += f"  ... and {len(unvetted) - 10} more\n"
+            result += f"\n💡 Run vet_story_for_compliance(story_id) for each\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error getting compliance coverage: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def create_compliance_tests_from_template(
+    story_id: str,
+    framework_id: str
+) -> str:
+    """
+    Create compliance test cases for a story using standard templates.
+
+    PURPOSE:
+        Apply predefined compliance test templates to a story, creating
+        consistent test cases for regulatory coverage.
+
+    R EQUIVALENT:
+        Like using a template to generate multiple rows with consistent structure.
+
+    PARAMETERS:
+        story_id (str): Target story (e.g., "P4M-DASH-001")
+        framework_id (str): PART11, HIPAA, SOC2, or HITRUST
+
+    RETURNS:
+        List of created test case IDs with confirmation
+
+    WHY THIS APPROACH:
+        Templates ensure consistent compliance testing across all stories
+        and reduce the risk of missing regulatory requirements.
+    """
+    import sqlite3
+    import re
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Normalize framework_id
+        framework_id = framework_id.upper().replace("-", "").replace(" ", "")
+        if framework_id == "PART11":
+            pass  # Already correct
+        elif framework_id not in ['PART11', 'HIPAA', 'SOC2', 'HITRUST']:
+            return f"Invalid framework_id: {framework_id}. Valid values: PART11, HIPAA, SOC2, HITRUST"
+
+        # Get the story
+        cursor = conn.execute("""
+            SELECT s.*, p.prefix FROM user_stories s
+            JOIN programs p ON s.program_id = p.program_id
+            WHERE s.story_id = ?
+        """, (story_id,))
+        story = cursor.fetchone()
+
+        if not story:
+            return f"Story not found: {story_id}"
+
+        # Get templates for this framework
+        cursor = conn.execute("""
+            SELECT * FROM compliance_test_templates
+            WHERE framework_id = ? AND is_active = TRUE
+        """, (framework_id,))
+        templates = cursor.fetchall()
+
+        if not templates:
+            return f"No templates found for framework: {framework_id}"
+
+        # Map framework_id to compliance_framework format
+        fw_map = {'PART11': 'Part11', 'HIPAA': 'HIPAA', 'SOC2': 'SOC2', 'HITRUST': 'HITRUST'}
+        compliance_fw = fw_map.get(framework_id, framework_id)
+
+        tests_created = []
+        tests_skipped = []
+
+        for tmpl in templates:
+            # Check if test already exists for this template
+            cursor = conn.execute("""
+                SELECT test_id FROM uat_test_cases
+                WHERE story_id = ? AND compliance_template_id = ?
+            """, (story_id, tmpl['template_id']))
+            if cursor.fetchone():
+                tests_skipped.append(tmpl['template_id'])
+                continue
+
+            # Generate test_id
+            cursor = conn.execute("""
+                SELECT test_id FROM uat_test_cases
+                WHERE story_id = ?
+                ORDER BY test_id DESC LIMIT 1
+            """, (story_id,))
+            last_test = cursor.fetchone()
+            if last_test:
+                match = re.search(r'TC(\d+)$', last_test['test_id'])
+                next_num = int(match.group(1)) + 1 if match else 1
+            else:
+                next_num = 1
+
+            test_id = f"{story_id}-TC{next_num:02d}"
+
+            # Insert test case
+            conn.execute("""
+                INSERT INTO uat_test_cases (
+                    test_id, story_id, program_id, title, test_type, test_steps,
+                    expected_results, priority, compliance_framework, is_compliance_test,
+                    compliance_template_id, test_status, created_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Not Run', CURRENT_TIMESTAMP)
+            """, (
+                test_id, story_id, story['program_id'],
+                tmpl['template_name'],
+                tmpl['test_type'],
+                tmpl['standard_test_steps'],
+                tmpl['standard_expected_result'],
+                'Must Have',
+                compliance_fw,
+                True,
+                tmpl['template_id']
+            ))
+
+            tests_created.append((test_id, tmpl['template_name']))
+
+        conn.commit()
+
+        # Build result
+        result = f"Compliance Tests Created for {story_id}\n"
+        result += "=" * 50 + "\n"
+        result += f"Framework: {framework_id}\n\n"
+
+        if tests_created:
+            result += f"Created {len(tests_created)} test cases:\n"
+            for test_id, title in tests_created:
+                result += f"  ✅ [{test_id}] {title}\n"
+
+        if tests_skipped:
+            result += f"\nSkipped {len(tests_skipped)} (already exist):\n"
+            for tmpl_id in tests_skipped:
+                result += f"  ⏭️  {tmpl_id}\n"
+
+        if not tests_created and not tests_skipped:
+            result += "No tests created - all templates already applied.\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error creating compliance tests: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
 
 
 # ============================================================
@@ -13839,19 +14536,24 @@ async def generate_requirements_dashboard(
         if not stories:
             return "No stories found in database. Add stories first."
 
-        # Get test counts per story
+        # Get test counts per story (EXCLUDE compliance tests for stakeholder view)
+        # Compliance tests are tracked separately for audit purposes
         test_counts_query = """
             SELECT story_id, COUNT(*) as test_count
             FROM uat_test_cases
+            WHERE is_compliance_test = FALSE OR is_compliance_test IS NULL
             GROUP BY story_id
         """
 
         cursor = conn.execute(test_counts_query)
         test_counts = {row['story_id']: row['test_count'] for row in cursor.fetchall()}
 
-        # Get summary stats
+        # Get summary stats (EXCLUDE compliance tests for stakeholder view)
         total_stories = len(stories)
-        total_tests_query = "SELECT COUNT(*) as cnt FROM uat_test_cases"
+        total_tests_query = """
+            SELECT COUNT(*) as cnt FROM uat_test_cases
+            WHERE is_compliance_test = FALSE OR is_compliance_test IS NULL
+        """
         total_tests_result = conn.execute(total_tests_query).fetchone()
         total_tests = total_tests_result['cnt'] if total_tests_result else 0
 
