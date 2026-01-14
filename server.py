@@ -186,6 +186,19 @@ REQ_DB_PATH = os.environ.get(
 # Notion Dashboard Page ID (created by Claude)
 NOTION_DASHBOARD_PAGE_ID = "2dab5d1d-1631-81bb-8eeb-c4f4397de747"
 
+# =============================================================================
+# REQUIREMENTS TOOLKIT VERSION
+# =============================================================================
+# Semantic versioning: MAJOR.MINOR.PATCH
+#   MAJOR: Breaking changes (schema changes, removed features)
+#   MINOR: New features (new tools, new dashboard sections)
+#   PATCH: Bug fixes (display fixes, minor tweaks)
+#
+# Version History:
+#   1.0.0 - Initial release with dashboard, stories, test cases
+#   1.1.0 - Compliance vetting framework, centralized priority display logic
+REQUIREMENTS_TOOLKIT_VERSION = "1.1.0"
+
 
 # ============================================================
 # HELPER FUNCTIONS
@@ -14587,7 +14600,7 @@ def generate_full_html_template(
 
     <footer class="footer">
         <p>Providence GenomicsNow Requirements Dashboard</p>
-        <p style="margin-top: 0.5rem;">Requirements Toolkit v{DASHBOARD_TEMPLATE_VERSION} | Designed by Glen Lewis</p>
+        <p style="margin-top: 0.5rem;">Requirements Toolkit v{REQUIREMENTS_TOOLKIT_VERSION} | Designed by Glen Lewis</p>
         <p style="margin-top: 0.25rem; font-size: 0.75rem;">Generated {today}</p>
     </footer>
 
@@ -14686,7 +14699,7 @@ def validate_dashboard_structure(html_content: str) -> list:
         ("Category sections", 'class="category-section"'),
         ("Story cards", 'class="story-card"'),
         ("Footer", 'class="footer"'),
-        ("Version attribution", f'Requirements Toolkit v{DASHBOARD_TEMPLATE_VERSION}'),
+        ("Version attribution", f'Requirements Toolkit v{REQUIREMENTS_TOOLKIT_VERSION}'),
         ("Filter JavaScript", 'function filterStories()'),
         ("Toggle JavaScript", 'function toggleStory('),
     ]
