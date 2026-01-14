@@ -13286,6 +13286,13 @@ def generate_full_html_template(
             margin-top: 2rem;
         }}
         .footer a {{ color: var(--color-primary); text-decoration: none; }}
+        .attribution {{
+            position: fixed;
+            bottom: 12px;
+            right: 16px;
+            font-size: 10px;
+            color: #999;
+        }}
         @media (max-width: 768px) {{
             .header {{ padding: 1.5rem 1rem; }}
             .header h1 {{ font-size: 1.5rem; }}
@@ -13435,6 +13442,7 @@ def generate_full_html_template(
         <p>Propel Health Requirements Dashboard</p>
         <p style="margin-top: 0.5rem;">Generated {today}</p>
     </footer>
+    <div class="attribution">Requirements Toolkit designed by Glen Lewis</div>
 
     <script>
         function toggleStory(header) {{
