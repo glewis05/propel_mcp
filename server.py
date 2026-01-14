@@ -13252,12 +13252,20 @@ def generate_full_html_template(
             margin-top: 5px;
             min-width: 20px;
         }}
+        /* Section Title */
+        .section-title {{
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--color-text-secondary);
+            margin-bottom: 0.5rem;
+        }}
         /* Roadmap Summary Section */
         .roadmap-summary {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
             gap: 0.75rem;
             margin-top: 1rem;
+            margin-bottom: 1.75rem;
             padding: 1rem;
             background: var(--color-surface);
             border: 1px solid var(--color-border);
@@ -13335,6 +13343,7 @@ def generate_full_html_template(
     </header>
 
     <main class="main">
+        <div class="section-title">Programs</div>
         <div class="summary-grid">
             {program_cards_html}
             <div class="summary-card">
