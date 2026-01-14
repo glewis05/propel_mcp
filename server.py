@@ -3172,8 +3172,21 @@ def update_story(
         # STEP 2b: Validate roadmap_target if provided
         # Roadmap target is separate from priority - it indicates WHEN on the
         # annual roadmap, while priority indicates importance for THIS release
+        # Dynamically generate valid targets based on current year
         # ----------------------------------------------------------------
-        valid_roadmap_targets = ["Q1 2026", "Q2 2026", "Q3 2026", "Q4 2026", "2027", "Backlog"]
+        from datetime import datetime
+        current_year = datetime.now().year  # e.g., 2026
+        next_year = current_year + 1        # e.g., 2027
+        beyond_year = next_year + 1         # e.g., 2028
+
+        # Build valid targets: Q1-Q4 for current and next year, plus beyond bucket and Backlog
+        valid_roadmap_targets = []
+        for year in [current_year, next_year]:
+            for q in range(1, 5):
+                valid_roadmap_targets.append(f"Q{q} {year}")
+        valid_roadmap_targets.append(f"{beyond_year}+")
+        valid_roadmap_targets.append("Backlog")
+
         if roadmap_target is not None and roadmap_target not in valid_roadmap_targets:
             target_list = "\n".join(f"  • {t}" for t in valid_roadmap_targets)
             return (
@@ -12922,6 +12935,56 @@ def generate_full_html_template(
         No build step required - just commit and push.
     """
 
+    # Calculate dynamic year values for roadmap timeline
+    # This ensures the dashboard always shows current year + next year quarters
+    from datetime import datetime
+    current_year = datetime.now().year  # e.g., 2026
+    next_year = current_year + 1        # e.g., 2027
+    beyond_year = next_year + 1         # e.g., 2028
+
+    # Generate dynamic roadmap summary items HTML
+    roadmap_items_html = ""
+    for year in [current_year, next_year]:
+        year_short = str(year)[-2:]  # e.g., "26" from 2026
+        for q in range(1, 5):
+            key = f"Q{q} {year}"
+            label = f"Q{q} '{year_short}"
+            count = roadmap_counts.get(key, 0)
+            roadmap_items_html += f'''            <div class="roadmap-item">
+                <div class="roadmap-item-label">{label}</div>
+                <div class="roadmap-item-value">{count}</div>
+            </div>
+'''
+    beyond_count = roadmap_counts.get(f"{beyond_year}+", 0)
+    roadmap_items_html += f'''            <div class="roadmap-item">
+                <div class="roadmap-item-label">{beyond_year}+</div>
+                <div class="roadmap-item-value">{beyond_count}</div>
+            </div>
+'''
+    backlog_count = roadmap_counts.get("Backlog", 0)
+    unscheduled_count = roadmap_counts.get("Unscheduled", 0)
+    roadmap_items_html += f'''            <div class="roadmap-item">
+                <div class="roadmap-item-label">Backlog</div>
+                <div class="roadmap-item-value">{backlog_count}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Unscheduled</div>
+                <div class="roadmap-item-value">{unscheduled_count}</div>
+            </div>
+'''
+
+    # Generate dynamic roadmap filter buttons HTML
+    roadmap_filters_html = ""
+    for year in [current_year, next_year]:
+        year_short = str(year)[-2:]
+        for q in range(1, 5):
+            data_value = f"q{q}-{year}"
+            label = f"Q{q} '{year_short}"
+            roadmap_filters_html += f'                    <button class="filter-btn" data-roadmap="{data_value}">{label}</button>\n'
+    roadmap_filters_html += f'                    <button class="filter-btn" data-roadmap="{beyond_year}-plus">{beyond_year}+</button>\n'
+    roadmap_filters_html += '                    <button class="filter-btn" data-roadmap="backlog">Backlog</button>\n'
+    roadmap_filters_html += '                    <button class="filter-btn" data-roadmap="unscheduled">Unscheduled</button>'
+
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13493,52 +13556,9 @@ def generate_full_html_template(
             </div>
 
             <!-- Roadmap -->
-            <div class="section-title" style="font-size: 11px; margin-top: 0.75rem;">Roadmap (Next 5 Quarters)</div>
+            <div class="section-title" style="font-size: 11px; margin-top: 0.75rem;">Roadmap ({current_year}-{next_year})</div>
             <div class="roadmap-summary" style="margin-top: 0.5rem; margin-bottom: 0;">
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">Q1 '25</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Q1 2025", 0)}</div>
-            </div>
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">Q2 '25</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Q2 2025", 0)}</div>
-            </div>
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">Q3 '25</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Q3 2025", 0)}</div>
-            </div>
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">Q4 '25</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Q4 2025", 0)}</div>
-            </div>
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">Q1 '26</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Q1 2026", 0)}</div>
-            </div>
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">Q2 '26</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Q2 2026", 0)}</div>
-            </div>
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">Q3 '26</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Q3 2026", 0)}</div>
-            </div>
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">Q4 '26</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Q4 2026", 0)}</div>
-            </div>
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">2027+</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("2027+", 0)}</div>
-            </div>
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">Backlog</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Backlog", 0)}</div>
-            </div>
-            <div class="roadmap-item">
-                <div class="roadmap-item-label">Unscheduled</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Unscheduled", 0)}</div>
-            </div>
+            {roadmap_items_html}
         </div>
         </div><!-- End Priority Planning Container -->
 
@@ -13557,17 +13577,7 @@ def generate_full_html_template(
                 </div>
                 <div class="filter-group">
                     <button class="filter-btn active" data-roadmap="all">All</button>
-                    <button class="filter-btn" data-roadmap="q1-2025">Q1 '25</button>
-                    <button class="filter-btn" data-roadmap="q2-2025">Q2 '25</button>
-                    <button class="filter-btn" data-roadmap="q3-2025">Q3 '25</button>
-                    <button class="filter-btn" data-roadmap="q4-2025">Q4 '25</button>
-                    <button class="filter-btn" data-roadmap="q1-2026">Q1 '26</button>
-                    <button class="filter-btn" data-roadmap="q2-2026">Q2 '26</button>
-                    <button class="filter-btn" data-roadmap="q3-2026">Q3 '26</button>
-                    <button class="filter-btn" data-roadmap="q4-2026">Q4 '26</button>
-                    <button class="filter-btn" data-roadmap="2027-plus">2027+</button>
-                    <button class="filter-btn" data-roadmap="backlog">Backlog</button>
-                    <button class="filter-btn" data-roadmap="unscheduled">Unscheduled</button>
+                    {roadmap_filters_html}
                 </div>
                 <div class="search-box">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -13808,20 +13818,22 @@ async def generate_requirements_dashboard(
                 priority_counts[priority] += 1
 
         # Count by roadmap target (annual planning timeline)
-        # Valid values in order: Q1-Q4 2025, Q1-Q4 2026, 2027+, Backlog, NULL (Unscheduled)
-        roadmap_counts = {
-            "Q1 2025": 0,
-            "Q2 2025": 0,
-            "Q3 2025": 0,
-            "Q4 2025": 0,
-            "Q1 2026": 0,
-            "Q2 2026": 0,
-            "Q3 2026": 0,
-            "Q4 2026": 0,
-            "2027+": 0,
-            "Backlog": 0,
-            "Unscheduled": 0
-        }
+        # Dynamically generate quarters based on current year
+        # Shows: current year (Q1-Q4), next year (Q1-Q4), year after+, Backlog, Unscheduled
+        from datetime import datetime
+        current_year = datetime.now().year  # e.g., 2026
+        next_year = current_year + 1        # e.g., 2027
+        beyond_year = next_year + 1         # e.g., 2028
+
+        roadmap_counts = {}
+        # Add all quarters for current and next year
+        for year in [current_year, next_year]:
+            for q in range(1, 5):
+                roadmap_counts[f"Q{q} {year}"] = 0
+        # Add the "beyond" bucket and special categories
+        roadmap_counts[f"{beyond_year}+"] = 0
+        roadmap_counts["Backlog"] = 0
+        roadmap_counts["Unscheduled"] = 0
         for story in stories:
             roadmap = story['roadmap_target']
             if roadmap is None or roadmap == '':
@@ -13831,6 +13843,9 @@ async def generate_requirements_dashboard(
             else:
                 # Handle any unexpected values by putting them in Unscheduled
                 roadmap_counts["Unscheduled"] += 1
+
+        # Note: Roadmap summary HTML and filter buttons HTML are generated dynamically
+        # inside generate_full_html_template() based on current_year/next_year
 
         # Count by program
         program_counts = {}
