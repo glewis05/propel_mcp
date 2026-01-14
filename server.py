@@ -12799,6 +12799,14 @@ def escape_html(text: str) -> str:
         .replace("'", "&#39;"))
 
 
+# =============================================================================
+# DASHBOARD TEMPLATE VERSION
+# =============================================================================
+# Frozen template structure - do not change layout without updating version
+DASHBOARD_TEMPLATE_VERSION = "1.0"
+DASHBOARD_TEMPLATE_DATE = "2025-01-14"
+
+
 def generate_full_html_template(
     total_stories: int,
     total_tests: int,
@@ -12813,6 +12821,10 @@ def generate_full_html_template(
     PURPOSE:
         Generate the complete HTML template with all CSS and JS.
         This creates a standalone requirements dashboard page.
+
+    TEMPLATE VERSION:
+        v1.0 (2025-01-14) - Frozen layout approved by Glen Lewis
+        See: templates/dashboard_template_v1.0.html for baseline reference
 
     PARAMETERS:
         total_stories (int): Total number of user stories
@@ -13449,9 +13461,9 @@ def generate_full_html_template(
 
     <footer class="footer">
         <p>Propel Health Requirements Dashboard</p>
-        <p style="margin-top: 0.5rem;">Generated {today}</p>
+        <p style="margin-top: 0.5rem;">Requirements Toolkit v{DASHBOARD_TEMPLATE_VERSION} | Designed by Glen Lewis</p>
+        <p style="margin-top: 0.25rem; font-size: 0.75rem;">Generated {today}</p>
     </footer>
-    <div class="attribution">Requirements Toolkit designed by Glen Lewis</div>
 
     <script>
         function toggleStory(header) {{
