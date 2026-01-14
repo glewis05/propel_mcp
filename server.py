@@ -3068,7 +3068,13 @@ def update_story(
     client_feedback: Optional[str] = None,
     internal_notes: Optional[str] = None,
     change_reason: Optional[str] = None,
-    roadmap_target: Optional[str] = None
+    roadmap_target: Optional[str] = None,
+    # Date override parameters for backdating historical records
+    draft_date: Optional[str] = None,
+    internal_review_date: Optional[str] = None,
+    client_review_date: Optional[str] = None,
+    approved_date: Optional[str] = None,
+    needs_discussion_date: Optional[str] = None
 ) -> str:
     """
     Update an existing user story's content, status, or add feedback.
@@ -3095,6 +3101,13 @@ def update_story(
         roadmap_target: Annual planning timeline - "Q1 2026", "Q2 2026", "Q3 2026",
                         "Q4 2026", "2027", or "Backlog" (separate from priority)
 
+        Date Override Parameters (for backdating historical records):
+        draft_date: Override draft date (YYYY-MM-DD format)
+        internal_review_date: Override internal review date (YYYY-MM-DD format)
+        client_review_date: Override client review date (YYYY-MM-DD format)
+        approved_date: Override approved date (YYYY-MM-DD format)
+        needs_discussion_date: Override needs discussion date (YYYY-MM-DD format)
+
     Returns:
         Confirmation with updated fields and new version number
 
@@ -3103,6 +3116,21 @@ def update_story(
         - Auto-increments version on any change for tracking
         - Status changes automatically set corresponding date field for audit trail
         - Per-field audit logging for regulatory compliance
+
+    DATE BACKDATING:
+        To record historical dates (e.g., when populating past records), provide explicit
+        date values in YYYY-MM-DD format:
+
+        update_story(
+            story_id="DIS-RECRUIT-001",
+            status="Pending Client Review",
+            draft_date="2025-10-15",
+            internal_review_date="2025-12-05",
+            client_review_date="2026-01-10"
+        )
+
+        If date parameters are not provided, status changes will auto-set dates to now.
+        Manual backdates are marked in the audit trail for compliance transparency.
     """
     import sqlite3
 
@@ -3152,6 +3180,27 @@ def update_story(
                 f"Invalid roadmap_target: '{roadmap_target}'\n\n"
                 f"Valid roadmap targets:\n{target_list}"
             )
+
+        # ----------------------------------------------------------------
+        # STEP 2c: Validate date override parameters if provided
+        # Dates must be in YYYY-MM-DD format for consistency
+        # ----------------------------------------------------------------
+        import re
+        date_pattern = r'^\d{4}-\d{2}-\d{2}$'
+        date_params = {
+            'draft_date': draft_date,
+            'internal_review_date': internal_review_date,
+            'client_review_date': client_review_date,
+            'approved_date': approved_date,
+            'needs_discussion_date': needs_discussion_date
+        }
+
+        for param_name, param_value in date_params.items():
+            if param_value is not None and not re.match(date_pattern, param_value):
+                return (
+                    f"Invalid {param_name}: '{param_value}'\n\n"
+                    f"Date must be in YYYY-MM-DD format (e.g., '2025-12-05')."
+                )
 
         # ----------------------------------------------------------------
         # STEP 3: Connect to database and fetch existing story
@@ -3222,24 +3271,53 @@ def update_story(
             # ----------------------------------------------------------------
             # Set the corresponding date field for each status transition
             # This creates an audit trail showing when the story moved through
-            # each stage of the workflow
+            # each stage of the workflow.
+            #
+            # If an explicit date override is provided, use that instead of now.
             # ----------------------------------------------------------------
             status_date_map = {
-                "Draft": "draft_date",
-                "Internal Review": "internal_review_date",
-                "Pending Client Review": "client_review_date",
-                "Approved": "approved_date",
-                "Needs Discussion": "needs_discussion_date"
+                "Draft": ("draft_date", draft_date),
+                "Internal Review": ("internal_review_date", internal_review_date),
+                "Pending Client Review": ("client_review_date", client_review_date),
+                "Approved": ("approved_date", approved_date),
+                "Needs Discussion": ("needs_discussion_date", needs_discussion_date)
             }
 
             if status in status_date_map:
-                date_field = status_date_map[status]
-                updates[date_field] = now
-                changes.append((date_field, old_story.get(date_field), now))
+                date_field, explicit_date = status_date_map[status]
+                # Use explicit date if provided, otherwise use current timestamp
+                date_value = explicit_date if explicit_date else now
+                is_backdate = explicit_date is not None
+                updates[date_field] = date_value
+                # Mark backdates in audit trail
+                if is_backdate:
+                    changes.append((date_field, old_story.get(date_field), f"{date_value} (manual backdate)"))
+                else:
+                    changes.append((date_field, old_story.get(date_field), date_value))
 
             # Special handling for Approved status - also set approved_by
             if status == "Approved":
                 updates['approved_by'] = 'MCP:update_story'
+
+        # ----------------------------------------------------------------
+        # Handle explicit date overrides independent of status changes
+        # This allows correcting/backdating dates without changing status
+        # ----------------------------------------------------------------
+        date_override_map = {
+            'draft_date': draft_date,
+            'internal_review_date': internal_review_date,
+            'client_review_date': client_review_date,
+            'approved_date': approved_date,
+            'needs_discussion_date': needs_discussion_date
+        }
+
+        for date_field, explicit_date in date_override_map.items():
+            # Only process if explicitly provided AND not already handled by status change above
+            if explicit_date is not None and date_field not in updates:
+                old_date = old_story.get(date_field)
+                if explicit_date != old_date:
+                    updates[date_field] = explicit_date
+                    changes.append((date_field, old_date, f"{explicit_date} (manual backdate)"))
 
         if priority is not None and priority != old_story.get('priority'):
             updates['priority'] = priority
