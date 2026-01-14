@@ -13285,6 +13285,21 @@ def generate_full_html_template(
         .priority-planning-container .summary-grid {{
             margin-bottom: 1rem;
         }}
+        /* Filters Container - groups all filter controls */
+        .filters-container {{
+            background: #f9fafb;
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-lg);
+            padding: 1.25rem;
+            margin-bottom: 1.5rem;
+        }}
+        .filters-container .section-title {{
+            margin-top: 0;
+            margin-bottom: 1rem;
+        }}
+        .filters-container .filters {{
+            margin-bottom: 0;
+        }}
         /* Roadmap Summary Section */
         .roadmap-summary {{
             display: grid;
@@ -13449,38 +13464,42 @@ def generate_full_html_template(
         </div>
         </div><!-- End Priority Planning Container -->
 
-        <div class="filters">
-            <div class="filter-group">
-                {program_filters_html}
+        <!-- Filters Container -->
+        <div class="filters-container">
+            <div class="section-title">Filters</div>
+            <div class="filters">
+                <div class="filter-group">
+                    {program_filters_html}
+                </div>
+                <div class="filter-group">
+                    <button class="filter-btn active" data-priority="all">All Priorities</button>
+                    <button class="filter-btn" data-priority="must-have">Must Have</button>
+                    <button class="filter-btn" data-priority="should-have">Should Have</button>
+                    <button class="filter-btn" data-priority="could-have">Could Have</button>
+                </div>
+                <div class="filter-group">
+                    <button class="filter-btn active" data-roadmap="all">All</button>
+                    <button class="filter-btn" data-roadmap="q1-2025">Q1 '25</button>
+                    <button class="filter-btn" data-roadmap="q2-2025">Q2 '25</button>
+                    <button class="filter-btn" data-roadmap="q3-2025">Q3 '25</button>
+                    <button class="filter-btn" data-roadmap="q4-2025">Q4 '25</button>
+                    <button class="filter-btn" data-roadmap="q1-2026">Q1 '26</button>
+                    <button class="filter-btn" data-roadmap="q2-2026">Q2 '26</button>
+                    <button class="filter-btn" data-roadmap="q3-2026">Q3 '26</button>
+                    <button class="filter-btn" data-roadmap="q4-2026">Q4 '26</button>
+                    <button class="filter-btn" data-roadmap="2027-plus">2027+</button>
+                    <button class="filter-btn" data-roadmap="backlog">Backlog</button>
+                    <button class="filter-btn" data-roadmap="unscheduled">Unscheduled</button>
+                </div>
+                <div class="search-box">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <path d="m21 21-4.35-4.35"></path>
+                    </svg>
+                    <input type="text" placeholder="Search stories..." id="searchInput">
+                </div>
             </div>
-            <div class="filter-group">
-                <button class="filter-btn active" data-priority="all">All Priorities</button>
-                <button class="filter-btn" data-priority="must-have">Must Have</button>
-                <button class="filter-btn" data-priority="should-have">Should Have</button>
-                <button class="filter-btn" data-priority="could-have">Could Have</button>
-            </div>
-            <div class="filter-group">
-                <button class="filter-btn active" data-roadmap="all">All</button>
-                <button class="filter-btn" data-roadmap="q1-2025">Q1 '25</button>
-                <button class="filter-btn" data-roadmap="q2-2025">Q2 '25</button>
-                <button class="filter-btn" data-roadmap="q3-2025">Q3 '25</button>
-                <button class="filter-btn" data-roadmap="q4-2025">Q4 '25</button>
-                <button class="filter-btn" data-roadmap="q1-2026">Q1 '26</button>
-                <button class="filter-btn" data-roadmap="q2-2026">Q2 '26</button>
-                <button class="filter-btn" data-roadmap="q3-2026">Q3 '26</button>
-                <button class="filter-btn" data-roadmap="q4-2026">Q4 '26</button>
-                <button class="filter-btn" data-roadmap="2027-plus">2027+</button>
-                <button class="filter-btn" data-roadmap="backlog">Backlog</button>
-                <button class="filter-btn" data-roadmap="unscheduled">Unscheduled</button>
-            </div>
-            <div class="search-box">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="11" cy="11" r="8"></circle>
-                    <path d="m21 21-4.35-4.35"></path>
-                </svg>
-                <input type="text" placeholder="Search stories..." id="searchInput">
-            </div>
-        </div>
+        </div><!-- End Filters Container -->
 
         {categories_html}
     </main>
