@@ -2851,7 +2851,8 @@ def create_story(
             "Must Have": "Critical requirement",
             "Should Have": "Important but not critical",
             "Could Have": "Nice to have",
-            "Won't Have": "Out of scope for now"
+            "Won't Have": "Out of scope for now",
+            "Not Assigned": "Priority not yet determined"
         }
         if error := validate_choice(priority, list(priority_descriptions.keys()), "priority", priority_descriptions):
             return error
@@ -3157,7 +3158,7 @@ def update_story(
         # ----------------------------------------------------------------
         # STEP 2: Validate priority if provided
         # ----------------------------------------------------------------
-        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have"]
+        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have", "Not Assigned"]
         if priority is not None and priority not in valid_priorities:
             return (
                 f"Invalid priority: '{priority}'\n\n"
@@ -3165,7 +3166,8 @@ def update_story(
                 f"  • Must Have - Critical requirement\n"
                 f"  • Should Have - Important but not critical\n"
                 f"  • Could Have - Nice to have\n"
-                f"  • Won't Have - Out of scope for now"
+                f"  • Won't Have - Out of scope for now\n"
+                f"  • Not Assigned - Priority not yet determined"
             )
 
         # ----------------------------------------------------------------
@@ -3691,7 +3693,7 @@ def create_test_case(
         # ----------------------------------------------------------------
         # STEP 2: Validate priority
         # ----------------------------------------------------------------
-        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have"]
+        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have", "Not Assigned"]
         if priority not in valid_priorities:
             return (
                 f"Invalid priority: '{priority}'\n\n"
@@ -3699,7 +3701,8 @@ def create_test_case(
                 f"  • Must Have - Critical test\n"
                 f"  • Should Have - Important but not critical\n"
                 f"  • Could Have - Nice to have\n"
-                f"  • Won't Have - Out of scope for now"
+                f"  • Won't Have - Out of scope for now\n"
+                f"  • Not Assigned - Priority not yet determined"
             )
 
         # ----------------------------------------------------------------
@@ -4409,7 +4412,7 @@ def update_test_case(
         # ----------------------------------------------------------------
         # STEP 2: Validate priority if provided
         # ----------------------------------------------------------------
-        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have"]
+        valid_priorities = ["Must Have", "Should Have", "Could Have", "Won't Have", "Not Assigned"]
         if priority is not None and priority not in valid_priorities:
             return (
                 f"Invalid priority: '{priority}'\n\n"
@@ -4417,7 +4420,8 @@ def update_test_case(
                 f"  • Must Have - Critical test\n"
                 f"  • Should Have - Important but not critical\n"
                 f"  • Could Have - Nice to have\n"
-                f"  • Won't Have - Out of scope for now"
+                f"  • Won't Have - Out of scope for now\n"
+                f"  • Not Assigned - Priority not yet determined"
             )
 
         # ----------------------------------------------------------------
@@ -13139,6 +13143,31 @@ def generate_full_html_template(
         .filter-group {{
             display: flex;
             gap: 0.5rem;
+            flex-wrap: wrap;
+        }}
+        .filter-row {{
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }}
+        .filter-row:last-child {{
+            margin-bottom: 0;
+        }}
+        .filter-row-label {{
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--color-text-secondary);
+            min-width: 70px;
+            padding-top: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }}
+        .filter-pills {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            flex: 1;
         }}
         .filter-btn {{
             padding: 0.5rem 1rem;
@@ -13257,6 +13286,7 @@ def generate_full_html_template(
         .badge-must-have {{ background: var(--color-must-have-bg); color: var(--color-must-have); }}
         .badge-should-have {{ background: var(--color-should-have-bg); color: var(--color-should-have); }}
         .badge-could-have {{ background: var(--color-could-have-bg); color: var(--color-could-have); }}
+        .badge-not-assigned {{ background: #e5e7eb; color: #6b7280; }}
         .badge-status {{ background: var(--color-draft-bg); color: var(--color-draft); }}
         /* Roadmap badges - blue/teal color scheme to differentiate from priority (red) and status (gray) */
         .badge-roadmap {{ background: #e0f2fe; color: #0369a1; font-weight: 600; }}
@@ -13565,21 +13595,36 @@ def generate_full_html_template(
         <!-- Filters Container -->
         <div class="filters-container">
             <div class="section-title">Filters</div>
-            <div class="filters">
-                <div class="filter-group">
+
+            <div class="filter-row">
+                <span class="filter-row-label">Programs</span>
+                <div class="filter-pills">
                     {program_filters_html}
                 </div>
-                <div class="filter-group">
+            </div>
+
+            <div class="filter-row">
+                <span class="filter-row-label">Priorities</span>
+                <div class="filter-pills">
                     <button class="filter-btn active" data-priority="all">All Priorities</button>
                     <button class="filter-btn" data-priority="must-have">Must Have</button>
                     <button class="filter-btn" data-priority="should-have">Should Have</button>
                     <button class="filter-btn" data-priority="could-have">Could Have</button>
+                    <button class="filter-btn" data-priority="not-assigned">Not Assigned</button>
                 </div>
-                <div class="filter-group">
+            </div>
+
+            <div class="filter-row">
+                <span class="filter-row-label">Schedule</span>
+                <div class="filter-pills">
                     <button class="filter-btn active" data-roadmap="all">All</button>
                     {roadmap_filters_html}
                 </div>
-                <div class="search-box">
+            </div>
+
+            <div class="filter-row">
+                <span class="filter-row-label">Search</span>
+                <div class="search-box" style="flex: 1; max-width: none;">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <circle cx="11" cy="11" r="8"></circle>
                         <path d="m21 21-4.35-4.35"></path>
@@ -13685,7 +13730,7 @@ def validate_dashboard_structure(html_content: str) -> list:
         ("Header section", 'class="header"'),
         ("Programs section", 'class="summary-card"'),
         ("Roadmap summary", 'class="roadmap-summary"'),
-        ("Filter buttons", 'class="filters"'),
+        ("Filter rows", 'class="filter-row"'),
         ("Program filter buttons", 'data-filter='),
         ("Priority filter buttons", 'data-priority='),
         ("Roadmap filter buttons", 'data-roadmap='),
@@ -13810,11 +13855,13 @@ async def generate_requirements_dashboard(
         total_tests_result = conn.execute(total_tests_query).fetchone()
         total_tests = total_tests_result['cnt'] if total_tests_result else 0
 
-        # Count by priority
-        priority_counts = {"Must Have": 0, "Should Have": 0, "Could Have": 0, "Won't Have": 0}
+        # Count by priority - includes "Not Assigned" for NULL values
+        priority_counts = {"Must Have": 0, "Should Have": 0, "Could Have": 0, "Won't Have": 0, "Not Assigned": 0}
         for story in stories:
             priority = story['priority']
-            if priority in priority_counts:
+            if priority is None or priority == '':
+                priority_counts["Not Assigned"] += 1
+            elif priority in priority_counts:
                 priority_counts[priority] += 1
 
         # Count by roadmap target (annual planning timeline)
@@ -13996,8 +14043,13 @@ async def generate_requirements_dashboard(
 
                 test_count = test_counts.get(story_id, 0)
 
-                # Priority badge class
-                priority_class = priority.lower().replace(" ", "-") if priority else "should-have"
+                # Priority badge class - NULL priorities display as "Not Assigned" with gray badge
+                if priority:
+                    priority_class = priority.lower().replace(" ", "-")
+                    priority_display = priority
+                else:
+                    priority_class = "not-assigned"
+                    priority_display = "Not Assigned"
 
                 # Roadmap badge (short format for display)
                 # Convert full format (Q1 2025) to abbreviated (Q1 '25)
@@ -14064,7 +14116,7 @@ async def generate_requirements_dashboard(
                                 <span class="story-id {prefix.lower()}">{story_id}</span>
                                 <h3 class="story-title">{escape_html(title)}</h3>
                                 <div class="story-meta">
-                                    <span class="badge badge-{priority_class}">{priority}</span>
+                                    <span class="badge badge-{priority_class}">{priority_display}</span>
                                     <span class="badge badge-roadmap badge-{roadmap_class}">{roadmap_display}</span>
                                     <span class="badge badge-status">{status} v{version}</span>
                                 </div>
