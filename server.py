@@ -13105,14 +13105,22 @@ def generate_full_html_template(
         .badge-should-have {{ background: var(--color-should-have-bg); color: var(--color-should-have); }}
         .badge-could-have {{ background: var(--color-could-have-bg); color: var(--color-could-have); }}
         .badge-status {{ background: var(--color-draft-bg); color: var(--color-draft); }}
-        .badge-roadmap {{ background: #fef3c7; color: #92400e; font-weight: 600; }}
+        /* Roadmap badges - blue/teal color scheme to differentiate from priority (red) and status (gray) */
+        .badge-roadmap {{ background: #e0f2fe; color: #0369a1; font-weight: 600; }}
+        /* 2025 quarters - lighter teal tones */
+        .badge-q1-2025 {{ background: #ccfbf1; color: #0d9488; }}
+        .badge-q2-2025 {{ background: #cffafe; color: #0891b2; }}
+        .badge-q3-2025 {{ background: #a5f3fc; color: #0e7490; }}
+        .badge-q4-2025 {{ background: #99f6e4; color: #0f766e; }}
+        /* 2026 quarters - blue tones */
         .badge-q1-2026 {{ background: #dbeafe; color: #1e40af; }}
-        .badge-q2-2026 {{ background: #dcfce7; color: #166534; }}
-        .badge-q3-2026 {{ background: #fef3c7; color: #92400e; }}
-        .badge-q4-2026 {{ background: #fce7f3; color: #9d174d; }}
-        .badge-2027 {{ background: #e0e7ff; color: #4338ca; }}
+        .badge-q2-2026 {{ background: #c7d2fe; color: #4338ca; }}
+        .badge-q3-2026 {{ background: #e0e7ff; color: #4f46e5; }}
+        .badge-q4-2026 {{ background: #ede9fe; color: #6d28d9; }}
+        /* Future and other */
+        .badge-2027-plus {{ background: #fae8ff; color: #a21caf; }}
         .badge-backlog {{ background: #f1f5f9; color: #64748b; }}
-        .badge-unassigned {{ background: #f1f5f9; color: #94a3b8; }}
+        .badge-unscheduled {{ background: #f1f5f9; color: #94a3b8; }}
         .story-toggle {{ color: var(--color-text-muted); transition: transform 0.2s; }}
         .story-card.open .story-toggle {{ transform: rotate(180deg); }}
         .story-body {{
@@ -13342,32 +13350,48 @@ def generate_full_html_template(
         <!-- Roadmap Distribution Summary -->
         <div class="roadmap-summary">
             <div class="roadmap-item">
-                <div class="roadmap-item-label">Q1 2026</div>
+                <div class="roadmap-item-label">Q1 '25</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Q1 2025", 0)}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Q2 '25</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Q2 2025", 0)}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Q3 '25</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Q3 2025", 0)}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Q4 '25</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Q4 2025", 0)}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Q1 '26</div>
                 <div class="roadmap-item-value">{roadmap_counts.get("Q1 2026", 0)}</div>
             </div>
             <div class="roadmap-item">
-                <div class="roadmap-item-label">Q2 2026</div>
+                <div class="roadmap-item-label">Q2 '26</div>
                 <div class="roadmap-item-value">{roadmap_counts.get("Q2 2026", 0)}</div>
             </div>
             <div class="roadmap-item">
-                <div class="roadmap-item-label">Q3 2026</div>
+                <div class="roadmap-item-label">Q3 '26</div>
                 <div class="roadmap-item-value">{roadmap_counts.get("Q3 2026", 0)}</div>
             </div>
             <div class="roadmap-item">
-                <div class="roadmap-item-label">Q4 2026</div>
+                <div class="roadmap-item-label">Q4 '26</div>
                 <div class="roadmap-item-value">{roadmap_counts.get("Q4 2026", 0)}</div>
             </div>
             <div class="roadmap-item">
-                <div class="roadmap-item-label">2027</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("2027", 0)}</div>
+                <div class="roadmap-item-label">2027+</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("2027+", 0)}</div>
             </div>
             <div class="roadmap-item">
                 <div class="roadmap-item-label">Backlog</div>
                 <div class="roadmap-item-value">{roadmap_counts.get("Backlog", 0)}</div>
             </div>
             <div class="roadmap-item">
-                <div class="roadmap-item-label">Unassigned</div>
-                <div class="roadmap-item-value">{roadmap_counts.get("Unassigned", 0)}</div>
+                <div class="roadmap-item-label">Unscheduled</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Unscheduled", 0)}</div>
             </div>
         </div>
 
@@ -13382,13 +13406,18 @@ def generate_full_html_template(
                 <button class="filter-btn" data-priority="could-have">Could Have</button>
             </div>
             <div class="filter-group">
-                <button class="filter-btn active" data-roadmap="all">All Roadmap</button>
-                <button class="filter-btn" data-roadmap="q1-2026">Q1</button>
-                <button class="filter-btn" data-roadmap="q2-2026">Q2</button>
-                <button class="filter-btn" data-roadmap="q3-2026">Q3</button>
-                <button class="filter-btn" data-roadmap="q4-2026">Q4</button>
-                <button class="filter-btn" data-roadmap="2027">'27</button>
+                <button class="filter-btn active" data-roadmap="all">All</button>
+                <button class="filter-btn" data-roadmap="q1-2025">Q1 '25</button>
+                <button class="filter-btn" data-roadmap="q2-2025">Q2 '25</button>
+                <button class="filter-btn" data-roadmap="q3-2025">Q3 '25</button>
+                <button class="filter-btn" data-roadmap="q4-2025">Q4 '25</button>
+                <button class="filter-btn" data-roadmap="q1-2026">Q1 '26</button>
+                <button class="filter-btn" data-roadmap="q2-2026">Q2 '26</button>
+                <button class="filter-btn" data-roadmap="q3-2026">Q3 '26</button>
+                <button class="filter-btn" data-roadmap="q4-2026">Q4 '26</button>
+                <button class="filter-btn" data-roadmap="2027-plus">2027+</button>
                 <button class="filter-btn" data-roadmap="backlog">Backlog</button>
+                <button class="filter-btn" data-roadmap="unscheduled">Unscheduled</button>
             </div>
             <div class="search-box">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -13502,6 +13531,7 @@ async def generate_requirements_dashboard(
         No build step required - just generate and push.
     """
     import re
+    import sqlite3
     import subprocess
     from pathlib import Path
 
@@ -13580,21 +13610,29 @@ async def generate_requirements_dashboard(
                 priority_counts[priority] += 1
 
         # Count by roadmap target (annual planning timeline)
+        # Valid values in order: Q1-Q4 2025, Q1-Q4 2026, 2027+, Backlog, NULL (Unscheduled)
         roadmap_counts = {
+            "Q1 2025": 0,
+            "Q2 2025": 0,
+            "Q3 2025": 0,
+            "Q4 2025": 0,
             "Q1 2026": 0,
             "Q2 2026": 0,
             "Q3 2026": 0,
             "Q4 2026": 0,
-            "2027": 0,
+            "2027+": 0,
             "Backlog": 0,
-            "Unassigned": 0
+            "Unscheduled": 0
         }
         for story in stories:
             roadmap = story['roadmap_target']
-            if roadmap in roadmap_counts:
+            if roadmap is None or roadmap == '':
+                roadmap_counts["Unscheduled"] += 1
+            elif roadmap in roadmap_counts:
                 roadmap_counts[roadmap] += 1
             else:
-                roadmap_counts["Unassigned"] += 1
+                # Handle any unexpected values by putting them in Unscheduled
+                roadmap_counts["Unscheduled"] += 1
 
         # Count by program
         program_counts = {}
@@ -13718,23 +13756,26 @@ async def generate_requirements_dashboard(
                 priority_class = priority.lower().replace(" ", "-") if priority else "should-have"
 
                 # Roadmap badge (short format for display)
-                roadmap_display = "-"
-                roadmap_class = "unassigned"
+                # Convert full format (Q1 2025) to abbreviated (Q1 '25)
+                roadmap_display = "Unscheduled"
+                roadmap_class = "unscheduled"
                 if roadmap_target:
-                    roadmap_display = roadmap_target.replace(" 2026", "").replace("2027", "'27")
-                    roadmap_class = roadmap_target.lower().replace(" ", "-")
+                    # Q1 2025 -> Q1 '25, Q1 2026 -> Q1 '26, 2027+ -> 2027+, Backlog -> Backlog
+                    roadmap_display = roadmap_target.replace(" 2025", " '25").replace(" 2026", " '26")
+                    roadmap_class = roadmap_target.lower().replace(" ", "-").replace("+", "-plus")
 
                 # Build status timeline HTML
-                # Format dates to short form (M/D)
+                # Format dates to short form (M/D/YY e.g., 1/10/26)
                 def format_short_date(date_str):
                     if not date_str:
                         return None
                     try:
                         # Parse YYYY-MM-DD HH:MM:SS format
                         dt = datetime.strptime(date_str[:10], '%Y-%m-%d')
-                        return dt.strftime('%-m/%-d')
+                        # Format as M/D/YY (e.g., 1/10/26)
+                        return dt.strftime('%-m/%-d/%y')
                     except:
-                        return date_str[:5] if date_str else None
+                        return date_str[:8] if date_str else None
 
                 # Timeline stages in order
                 timeline_stages = [
@@ -13769,8 +13810,8 @@ async def generate_requirements_dashboard(
 
                 timeline_html += '</div>'
 
-                # Roadmap filter data attribute
-                roadmap_filter = roadmap_target.lower().replace(" ", "-") if roadmap_target else "unassigned"
+                # Roadmap filter data attribute (must match filter button data-roadmap values)
+                roadmap_filter = roadmap_target.lower().replace(" ", "-").replace("+", "-plus") if roadmap_target else "unscheduled"
 
                 stories_html += f"""
                     <article class="story-card" data-program="{prefix.lower()}" data-priority="{priority_class}" data-roadmap="{roadmap_filter}" data-search="{title.lower()} {user_story.lower() if user_story else ''}">
