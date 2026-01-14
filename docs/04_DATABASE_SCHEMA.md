@@ -291,13 +291,30 @@ Stores user stories derived from requirements.
 | program_id | TEXT (FK) | References programs |
 | requirement_id | TEXT (FK) | References requirements |
 | title | TEXT | Story title |
-| story | TEXT | As a... I want... So that... |
-| acceptance_criteria | TEXT | Acceptance criteria (JSON) |
-| category | TEXT | Category |
-| priority | INTEGER | Priority score |
-| status | TEXT | Draft, Approved, In Progress, Done |
+| user_story | TEXT | As a... I want... So that... |
+| role | TEXT | User role extracted from story |
+| acceptance_criteria | TEXT | Acceptance criteria (multi-line text) |
+| category | TEXT | Category code (e.g., AUTH, DASH) |
+| category_full | TEXT | Full category name |
+| priority | TEXT | MoSCoW: Must Have, Should Have, Could Have, Won't Have |
+| roadmap_target | TEXT | Annual planning: Q1-Q4 2026, 2027, or Backlog |
+| status | TEXT | Draft, Internal Review, Pending Client Review, Approved, Needs Discussion, Out of Scope |
+| version | INTEGER | Version number (auto-incremented on changes) |
+| internal_notes | TEXT | Internal team notes |
+| client_feedback | TEXT | Feedback from client review |
 | created_date | TIMESTAMP | Record creation date |
 | updated_date | TIMESTAMP | Last update date |
+| draft_date | TIMESTAMP | When moved to Draft status |
+| internal_review_date | TIMESTAMP | When moved to Internal Review status |
+| client_review_date | TIMESTAMP | When moved to Pending Client Review status |
+| approved_date | TIMESTAMP | When moved to Approved status |
+| approved_by | TEXT | Who approved the story |
+| needs_discussion_date | TIMESTAMP | When moved to Needs Discussion status |
+
+**Status Timeline Notes:**
+- Each status transition automatically sets its corresponding date field
+- This creates an audit trail showing when stories moved through each workflow stage
+- Priority (MoSCoW) = what's in THIS release; Roadmap Target = WHEN on annual roadmap
 
 ---
 
@@ -367,4 +384,4 @@ audit_history (tracks all changes)
 
 ---
 
-*Last Updated: January 2025*
+*Last Updated: January 2026*

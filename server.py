@@ -2556,43 +2556,91 @@ Next Steps:
 def list_stories(
     program_prefix: str,
     status: Optional[str] = None,
-    category: Optional[str] = None
+    category: Optional[str] = None,
+    roadmap_target: Optional[str] = None
 ) -> str:
     """
     List user stories for a program.
+
+    PURPOSE:
+        Lists user stories for a program with optional filtering by status,
+        category, and/or roadmap target quarter.
 
     Args:
         program_prefix: Program prefix (e.g., "PROP")
         status: Filter by status (Draft, Approved, etc.)
         category: Filter by category
+        roadmap_target: Filter by roadmap quarter/year - "Q1 2026", "Q2 2026",
+                        "Q3 2026", "Q4 2026", "2027", or "Backlog"
 
     Returns:
-        List of user stories
+        List of user stories with status, priority, and roadmap target
     """
-    db = None
+    # ----------------------------------------------------------------
+    # Import sqlite3 for direct query with roadmap_target filter
+    # The db.get_stories() method doesn't support roadmap_target yet
+    # ----------------------------------------------------------------
+    import sqlite3
+
+    conn = None
     try:
-        db = get_req_database()
-        program = db.get_program_by_prefix(program_prefix.upper())
+        # ----------------------------------------------------------------
+        # STEP 1: Connect and validate program exists
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT program_id, name, prefix FROM programs WHERE UPPER(prefix) = ?",
+            (program_prefix.upper(),)
+        )
+        program = cursor.fetchone()
 
         if not program:
             return f"Program not found: {program_prefix}"
 
-        stories = db.get_stories(
-            program_id=program['program_id'],
-            status_filter=status,
-            category_filter=category
-        )
+        # ----------------------------------------------------------------
+        # STEP 2: Build query with optional filters
+        # ----------------------------------------------------------------
+        query = "SELECT * FROM user_stories WHERE program_id = ?"
+        params = [program['program_id']]
 
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+
+        if category:
+            query += " AND UPPER(category) = ?"
+            params.append(category.upper())
+
+        if roadmap_target:
+            query += " AND roadmap_target = ?"
+            params.append(roadmap_target)
+
+        query += " ORDER BY category, story_id"
+
+        cursor.execute(query, params)
+        stories = [dict(row) for row in cursor.fetchall()]
+
+        # ----------------------------------------------------------------
+        # STEP 3: Handle no results
+        # ----------------------------------------------------------------
         if not stories:
             filters = []
             if status:
                 filters.append(f"status={status}")
             if category:
                 filters.append(f"category={category}")
+            if roadmap_target:
+                filters.append(f"roadmap_target={roadmap_target}")
             filter_str = f" (filters: {', '.join(filters)})" if filters else ""
             return f"No stories found for {program_prefix}{filter_str}."
 
-        result = f"User Stories for {program['name']} [{program_prefix}]:\n"
+        # ----------------------------------------------------------------
+        # STEP 4: Build output with roadmap_target included
+        # ----------------------------------------------------------------
+        result = f"User Stories for {program['name']} [{program['prefix']}]:\n"
         result += f"Found {len(stories)} story(ies)\n\n"
 
         for story in stories[:50]:  # Limit display
@@ -2600,6 +2648,8 @@ def list_stories(
             result += f"  Status: {story['status']} | Priority: {story.get('priority', 'N/A')}"
             if story.get('category'):
                 result += f" | Category: {story['category']}"
+            if story.get('roadmap_target'):
+                result += f" | Roadmap: {story['roadmap_target']}"
             result += "\n"
 
         if len(stories) > 50:
@@ -2610,8 +2660,8 @@ def list_stories(
     except Exception as e:
         return f"Error listing stories: {str(e)}"
     finally:
-        if db:
-            db.close()
+        if conn:
+            conn.close()
 
 
 @mcp.tool()
@@ -2619,11 +2669,16 @@ def get_story(story_id: str) -> str:
     """
     Get detailed information about a specific user story.
 
+    PURPOSE:
+        Retrieves full story details including roadmap planning info and
+        status transition timeline for audit/tracking purposes.
+
     Args:
         story_id: The story ID (e.g., "PROP-AUTH-001")
 
     Returns:
-        Full story details including acceptance criteria
+        Full story details including acceptance criteria, roadmap target,
+        and status history timeline
     """
     db = None
     try:
@@ -2646,6 +2701,13 @@ def get_story(story_id: str) -> str:
         result += f"Title: {story.get('title', 'N/A')}\n"
         result += f"Status: {story['status']} | Version: {story.get('version', 1)}\n"
         result += f"Priority: {story.get('priority', 'N/A')}\n"
+
+        # ----------------------------------------------------------------
+        # Show roadmap target (annual planning timeline)
+        # ----------------------------------------------------------------
+        if story.get('roadmap_target'):
+            result += f"Roadmap Target: {story['roadmap_target']}\n"
+
         if story.get('category'):
             result += f"Category: {story['category']}"
             if story.get('category_full'):
@@ -2665,11 +2727,33 @@ def get_story(story_id: str) -> str:
         if story.get('success_metrics'):
             result += f"\nSuccess Metrics: {story['success_metrics']}\n"
 
+        # ----------------------------------------------------------------
+        # Status History Timeline (audit trail for status transitions)
+        # Shows when the story moved through each workflow stage
+        # ----------------------------------------------------------------
+        timeline_entries = []
+        if story.get('draft_date'):
+            timeline_entries.append(('Draft', story['draft_date']))
+        if story.get('internal_review_date'):
+            timeline_entries.append(('Internal Review', story['internal_review_date']))
+        if story.get('client_review_date'):
+            timeline_entries.append(('Pending Client Review', story['client_review_date']))
+        if story.get('needs_discussion_date'):
+            timeline_entries.append(('Needs Discussion', story['needs_discussion_date']))
         if story.get('approved_date'):
-            result += f"\nApproved: {story['approved_date']}"
-            if story.get('approved_by'):
-                result += f" by {story['approved_by']}"
-            result += "\n"
+            timeline_entries.append(('Approved', story['approved_date']))
+
+        if timeline_entries:
+            result += f"\nStatus Timeline:\n"
+            # Sort by date to show chronological order
+            timeline_entries.sort(key=lambda x: x[1] if x[1] else '')
+            for status_name, date_val in timeline_entries:
+                if date_val:
+                    result += f"  • {status_name}: {date_val}\n"
+
+        # Show approved_by separately if available
+        if story.get('approved_date') and story.get('approved_by'):
+            result += f"  (Approved by: {story['approved_by']})\n"
 
         return result
 
@@ -2690,7 +2774,8 @@ def create_story(
     priority: str = "Should Have",
     status: str = "Draft",
     role: Optional[str] = None,
-    internal_notes: Optional[str] = None
+    internal_notes: Optional[str] = None,
+    roadmap_target: Optional[str] = None
 ) -> str:
     """
     Create a new user story for tracking requirements, acceptance criteria, and test coverage.
@@ -2717,6 +2802,8 @@ def create_story(
         status: Workflow status (default: "Draft")
         role: User role if not extractable from user_story
         internal_notes: Internal team notes (not shared with client)
+        roadmap_target: Annual planning timeline - "Q1 2026", "Q2 2026", "Q3 2026",
+                        "Q4 2026", "2027", or "Backlog" (separate from priority)
 
     Returns:
         Confirmation with generated story_id and link to view it
@@ -2725,6 +2812,7 @@ def create_story(
         - Auto-increments story number within prefix+category for unique IDs
         - Validates program exists before creating
         - Parses user_story to extract role if not provided
+        - Sets draft_date automatically for status timeline tracking
         - Audit logging for FDA 21 CFR Part 11 compliance
     """
     logger.info(f"create_story() called - program={program_prefix}, category={category}, title={title[:50]}...")
@@ -2850,6 +2938,7 @@ def create_story(
 
         # ----------------------------------------------------------------
         # STEP 7: Insert the user story
+        # Sets draft_date automatically since all stories start as Draft
         # ----------------------------------------------------------------
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -2858,8 +2947,9 @@ def create_story(
             INSERT INTO user_stories (
                 story_id, program_id, title, user_story, role,
                 acceptance_criteria, priority, category, status,
-                internal_notes, version, created_date, updated_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                internal_notes, version, created_date, updated_date,
+                roadmap_target, draft_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 story_id,
@@ -2874,7 +2964,9 @@ def create_story(
                 internal_notes,
                 1,  # version starts at 1
                 now,
-                now
+                now,
+                roadmap_target,  # Annual roadmap planning target
+                now              # draft_date = now since all stories start as Draft
             )
         )
 
@@ -2917,6 +3009,8 @@ Story Details:
   Priority: {priority}
   Status: {status}
 """
+        if roadmap_target:
+            result += f"  Roadmap Target: {roadmap_target}\n"
         if extracted_role:
             result += f"  Role: {extracted_role}\n"
 
@@ -2973,7 +3067,8 @@ def update_story(
     priority: Optional[str] = None,
     client_feedback: Optional[str] = None,
     internal_notes: Optional[str] = None,
-    change_reason: Optional[str] = None
+    change_reason: Optional[str] = None,
+    roadmap_target: Optional[str] = None
 ) -> str:
     """
     Update an existing user story's content, status, or add feedback.
@@ -2997,6 +3092,8 @@ def update_story(
         client_feedback: Feedback from client review (optional)
         internal_notes: Internal team notes (optional)
         change_reason: Why this change was made - recorded in audit trail (optional)
+        roadmap_target: Annual planning timeline - "Q1 2026", "Q2 2026", "Q3 2026",
+                        "Q4 2026", "2027", or "Backlog" (separate from priority)
 
     Returns:
         Confirmation with updated fields and new version number
@@ -3004,7 +3101,7 @@ def update_story(
     WHY THIS APPROACH:
         - Only updates provided fields (sparse update pattern)
         - Auto-increments version on any change for tracking
-        - Special handling for "Approved" status (sets approved_date/approved_by)
+        - Status changes automatically set corresponding date field for audit trail
         - Per-field audit logging for regulatory compliance
     """
     import sqlite3
@@ -3041,6 +3138,19 @@ def update_story(
                 f"  • Should Have - Important but not critical\n"
                 f"  • Could Have - Nice to have\n"
                 f"  • Won't Have - Out of scope for now"
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 2b: Validate roadmap_target if provided
+        # Roadmap target is separate from priority - it indicates WHEN on the
+        # annual roadmap, while priority indicates importance for THIS release
+        # ----------------------------------------------------------------
+        valid_roadmap_targets = ["Q1 2026", "Q2 2026", "Q3 2026", "Q4 2026", "2027", "Backlog"]
+        if roadmap_target is not None and roadmap_target not in valid_roadmap_targets:
+            target_list = "\n".join(f"  • {t}" for t in valid_roadmap_targets)
+            return (
+                f"Invalid roadmap_target: '{roadmap_target}'\n\n"
+                f"Valid roadmap targets:\n{target_list}"
             )
 
         # ----------------------------------------------------------------
@@ -3109,11 +3219,27 @@ def update_story(
             updates['status'] = status
             changes.append(('status', old_story.get('status'), status))
 
-            # Special handling for Approved status
+            # ----------------------------------------------------------------
+            # Set the corresponding date field for each status transition
+            # This creates an audit trail showing when the story moved through
+            # each stage of the workflow
+            # ----------------------------------------------------------------
+            status_date_map = {
+                "Draft": "draft_date",
+                "Internal Review": "internal_review_date",
+                "Pending Client Review": "client_review_date",
+                "Approved": "approved_date",
+                "Needs Discussion": "needs_discussion_date"
+            }
+
+            if status in status_date_map:
+                date_field = status_date_map[status]
+                updates[date_field] = now
+                changes.append((date_field, old_story.get(date_field), now))
+
+            # Special handling for Approved status - also set approved_by
             if status == "Approved":
-                updates['approved_date'] = now
                 updates['approved_by'] = 'MCP:update_story'
-                changes.append(('approved_date', old_story.get('approved_date'), now))
 
         if priority is not None and priority != old_story.get('priority'):
             updates['priority'] = priority
@@ -3138,6 +3264,15 @@ def update_story(
                 new_notes = f"[{now}]\n{internal_notes}"
             updates['internal_notes'] = new_notes
             changes.append(('internal_notes', old_notes, new_notes))
+
+        # ----------------------------------------------------------------
+        # Handle roadmap_target updates (annual planning timeline)
+        # This is separate from priority - priority = what's in this release,
+        # roadmap_target = when on the annual roadmap
+        # ----------------------------------------------------------------
+        if roadmap_target is not None and roadmap_target != old_story.get('roadmap_target'):
+            updates['roadmap_target'] = roadmap_target
+            changes.append(('roadmap_target', old_story.get('roadmap_target'), roadmap_target))
 
         # ----------------------------------------------------------------
         # STEP 5: Check if there are any changes to make
@@ -12671,6 +12806,7 @@ def generate_full_html_template(
     program_filters_html: str,
     categories_html: str,
     priority_counts: dict,
+    roadmap_counts: dict,
     today: str
 ) -> str:
     """
@@ -12685,6 +12821,7 @@ def generate_full_html_template(
         program_filters_html (str): HTML for program filter buttons
         categories_html (str): HTML for all category sections with stories
         priority_counts (dict): Count of stories by priority
+        roadmap_counts (dict): Count of stories by roadmap target quarter
         today (str): Formatted date string for "Last Updated"
 
     RETURNS:
@@ -12967,7 +13104,15 @@ def generate_full_html_template(
         .badge-must-have {{ background: var(--color-must-have-bg); color: var(--color-must-have); }}
         .badge-should-have {{ background: var(--color-should-have-bg); color: var(--color-should-have); }}
         .badge-could-have {{ background: var(--color-could-have-bg); color: var(--color-could-have); }}
-        .badge-draft {{ background: var(--color-draft-bg); color: var(--color-draft); }}
+        .badge-status {{ background: var(--color-draft-bg); color: var(--color-draft); }}
+        .badge-roadmap {{ background: #fef3c7; color: #92400e; font-weight: 600; }}
+        .badge-q1-2026 {{ background: #dbeafe; color: #1e40af; }}
+        .badge-q2-2026 {{ background: #dcfce7; color: #166534; }}
+        .badge-q3-2026 {{ background: #fef3c7; color: #92400e; }}
+        .badge-q4-2026 {{ background: #fce7f3; color: #9d174d; }}
+        .badge-2027 {{ background: #e0e7ff; color: #4338ca; }}
+        .badge-backlog {{ background: #f1f5f9; color: #64748b; }}
+        .badge-unassigned {{ background: #f1f5f9; color: #94a3b8; }}
         .story-toggle {{ color: var(--color-text-muted); transition: transform 0.2s; }}
         .story-card.open .story-toggle {{ transform: rotate(180deg); }}
         .story-body {{
@@ -13036,6 +13181,93 @@ def generate_full_html_template(
             display: flex;
             align-items: center;
             gap: 0.5rem;
+        }}
+        /* Status Timeline Styles */
+        .status-timeline {{
+            display: flex;
+            align-items: flex-start;
+            gap: 0;
+            padding: 1rem 0.5rem;
+            background: var(--color-bg);
+            border-radius: var(--radius-md);
+            overflow-x: auto;
+        }}
+        .timeline-stage {{
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-width: 70px;
+            text-align: center;
+        }}
+        .timeline-dot {{
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--color-border);
+            border: 2px solid var(--color-border);
+            margin-bottom: 0.4rem;
+        }}
+        .timeline-stage.completed .timeline-dot {{
+            background: var(--color-primary);
+            border-color: var(--color-primary);
+        }}
+        .timeline-stage.current .timeline-dot {{
+            background: #fff;
+            border-color: var(--color-primary);
+            box-shadow: 0 0 0 3px var(--color-primary-light);
+        }}
+        .timeline-label {{
+            font-size: 0.65rem;
+            font-weight: 600;
+            color: var(--color-text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+        }}
+        .timeline-stage.completed .timeline-label,
+        .timeline-stage.current .timeline-label {{
+            color: var(--color-text);
+        }}
+        .timeline-date {{
+            font-size: 0.7rem;
+            color: var(--color-text-muted);
+            font-family: 'JetBrains Mono', monospace;
+        }}
+        .timeline-stage.completed .timeline-date,
+        .timeline-stage.current .timeline-date {{
+            color: var(--color-primary);
+            font-weight: 500;
+        }}
+        .timeline-connector {{
+            flex: 1;
+            height: 2px;
+            background: var(--color-border);
+            margin-top: 5px;
+            min-width: 20px;
+        }}
+        /* Roadmap Summary Section */
+        .roadmap-summary {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            gap: 0.75rem;
+            margin-top: 1rem;
+            padding: 1rem;
+            background: var(--color-surface);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-md);
+        }}
+        .roadmap-item {{
+            text-align: center;
+            padding: 0.5rem;
+        }}
+        .roadmap-item-label {{
+            font-size: 0.7rem;
+            font-weight: 600;
+            color: var(--color-text-secondary);
+        }}
+        .roadmap-item-value {{
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--color-text);
         }}
         .footer {{
             text-align: center;
@@ -13107,6 +13339,38 @@ def generate_full_html_template(
             </div>
         </div>
 
+        <!-- Roadmap Distribution Summary -->
+        <div class="roadmap-summary">
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Q1 2026</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Q1 2026", 0)}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Q2 2026</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Q2 2026", 0)}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Q3 2026</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Q3 2026", 0)}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Q4 2026</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Q4 2026", 0)}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">2027</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("2027", 0)}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Backlog</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Backlog", 0)}</div>
+            </div>
+            <div class="roadmap-item">
+                <div class="roadmap-item-label">Unassigned</div>
+                <div class="roadmap-item-value">{roadmap_counts.get("Unassigned", 0)}</div>
+            </div>
+        </div>
+
         <div class="filters">
             <div class="filter-group">
                 {program_filters_html}
@@ -13116,6 +13380,15 @@ def generate_full_html_template(
                 <button class="filter-btn" data-priority="must-have">Must Have</button>
                 <button class="filter-btn" data-priority="should-have">Should Have</button>
                 <button class="filter-btn" data-priority="could-have">Could Have</button>
+            </div>
+            <div class="filter-group">
+                <button class="filter-btn active" data-roadmap="all">All Roadmap</button>
+                <button class="filter-btn" data-roadmap="q1-2026">Q1</button>
+                <button class="filter-btn" data-roadmap="q2-2026">Q2</button>
+                <button class="filter-btn" data-roadmap="q3-2026">Q3</button>
+                <button class="filter-btn" data-roadmap="q4-2026">Q4</button>
+                <button class="filter-btn" data-roadmap="2027">'27</button>
+                <button class="filter-btn" data-roadmap="backlog">Backlog</button>
             </div>
             <div class="search-box">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -13155,23 +13428,34 @@ def generate_full_html_template(
             }});
         }});
 
+        document.querySelectorAll('.filter-btn[data-roadmap]').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+                document.querySelectorAll('.filter-btn[data-roadmap]').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                filterStories();
+            }});
+        }});
+
         document.getElementById('searchInput').addEventListener('input', filterStories);
 
         function filterStories() {{
             const programFilter = document.querySelector('.filter-btn[data-filter].active')?.dataset.filter || 'all';
             const priorityFilter = document.querySelector('.filter-btn[data-priority].active')?.dataset.priority || 'all';
+            const roadmapFilter = document.querySelector('.filter-btn[data-roadmap].active')?.dataset.roadmap || 'all';
             const searchTerm = document.getElementById('searchInput').value.toLowerCase();
 
             document.querySelectorAll('.story-card').forEach(card => {{
                 const program = card.dataset.program;
                 const priority = card.dataset.priority;
+                const roadmap = card.dataset.roadmap;
                 const searchText = card.dataset.search + ' ' + card.querySelector('.story-title').textContent.toLowerCase();
 
                 const matchesProgram = programFilter === 'all' || program === programFilter;
                 const matchesPriority = priorityFilter === 'all' || priority === priorityFilter;
+                const matchesRoadmap = roadmapFilter === 'all' || roadmap === roadmapFilter;
                 const matchesSearch = !searchTerm || searchText.includes(searchTerm);
 
-                card.classList.toggle('hidden', !(matchesProgram && matchesPriority && matchesSearch));
+                card.classList.toggle('hidden', !(matchesProgram && matchesPriority && matchesRoadmap && matchesSearch));
             }});
 
             document.querySelectorAll('.category-section').forEach(section => {{
@@ -13253,14 +13537,15 @@ async def generate_requirements_dashboard(
         # QUERY DATA FROM DATABASE
         # =====================================================================
 
-        # Get all stories with program info
-        # The stories table has: story_id, title, user_story, acceptance_criteria,
-        # status, priority, category, version, program_id
+        # Get all stories with program info and roadmap/status audit fields
+        # Includes roadmap_target for annual planning and status date fields for timeline
         stories_query = """
             SELECT s.story_id, s.title, s.user_story, s.acceptance_criteria,
                    s.status, s.priority, s.category, s.version,
-                   p.prefix, p.program_name
-            FROM stories s
+                   s.roadmap_target, s.draft_date, s.internal_review_date,
+                   s.client_review_date, s.approved_date, s.needs_discussion_date,
+                   p.prefix, p.name as program_name
+            FROM user_stories s
             JOIN programs p ON s.program_id = p.program_id
             ORDER BY p.prefix, s.category, s.story_id
         """
@@ -13274,7 +13559,7 @@ async def generate_requirements_dashboard(
         # Get test counts per story
         test_counts_query = """
             SELECT story_id, COUNT(*) as test_count
-            FROM test_cases
+            FROM uat_test_cases
             GROUP BY story_id
         """
 
@@ -13283,8 +13568,9 @@ async def generate_requirements_dashboard(
 
         # Get summary stats
         total_stories = len(stories)
-        total_tests_query = "SELECT COUNT(*) as cnt FROM test_cases"
-        total_tests = conn.execute(total_tests_query).fetchone()['cnt']
+        total_tests_query = "SELECT COUNT(*) as cnt FROM uat_test_cases"
+        total_tests_result = conn.execute(total_tests_query).fetchone()
+        total_tests = total_tests_result['cnt'] if total_tests_result else 0
 
         # Count by priority
         priority_counts = {"Must Have": 0, "Should Have": 0, "Could Have": 0, "Won't Have": 0}
@@ -13292,6 +13578,23 @@ async def generate_requirements_dashboard(
             priority = story['priority']
             if priority in priority_counts:
                 priority_counts[priority] += 1
+
+        # Count by roadmap target (annual planning timeline)
+        roadmap_counts = {
+            "Q1 2026": 0,
+            "Q2 2026": 0,
+            "Q3 2026": 0,
+            "Q4 2026": 0,
+            "2027": 0,
+            "Backlog": 0,
+            "Unassigned": 0
+        }
+        for story in stories:
+            roadmap = story['roadmap_target']
+            if roadmap in roadmap_counts:
+                roadmap_counts[roadmap] += 1
+            else:
+                roadmap_counts["Unassigned"] += 1
 
         # Count by program
         program_counts = {}
@@ -13383,6 +13686,14 @@ async def generate_requirements_dashboard(
                 priority = story['priority']
                 version = story['version']
                 prefix = story['prefix']
+                roadmap_target = story['roadmap_target']
+
+                # Get status timeline dates
+                draft_date = story['draft_date']
+                internal_review_date = story['internal_review_date']
+                client_review_date = story['client_review_date']
+                approved_date = story['approved_date']
+                needs_discussion_date = story['needs_discussion_date']
 
                 # Parse acceptance criteria (handle numbered list or newline separated)
                 ac_items = []
@@ -13406,20 +13717,80 @@ async def generate_requirements_dashboard(
                 # Priority badge class
                 priority_class = priority.lower().replace(" ", "-") if priority else "should-have"
 
+                # Roadmap badge (short format for display)
+                roadmap_display = "-"
+                roadmap_class = "unassigned"
+                if roadmap_target:
+                    roadmap_display = roadmap_target.replace(" 2026", "").replace("2027", "'27")
+                    roadmap_class = roadmap_target.lower().replace(" ", "-")
+
+                # Build status timeline HTML
+                # Format dates to short form (M/D)
+                def format_short_date(date_str):
+                    if not date_str:
+                        return None
+                    try:
+                        # Parse YYYY-MM-DD HH:MM:SS format
+                        dt = datetime.strptime(date_str[:10], '%Y-%m-%d')
+                        return dt.strftime('%-m/%-d')
+                    except:
+                        return date_str[:5] if date_str else None
+
+                # Timeline stages in order
+                timeline_stages = [
+                    ("Draft", draft_date, status == "Draft"),
+                    ("Internal Review", internal_review_date, status == "Internal Review"),
+                    ("Client Review", client_review_date, status == "Pending Client Review"),
+                    ("Approved", approved_date, status == "Approved"),
+                ]
+
+                # Add Needs Discussion if it has a date (shows it was in that state at some point)
+                if needs_discussion_date:
+                    timeline_stages.append(("Discussion", needs_discussion_date, status == "Needs Discussion"))
+
+                timeline_html = '<div class="status-timeline">'
+                for i, (stage_name, stage_date, is_current) in enumerate(timeline_stages):
+                    formatted_date = format_short_date(stage_date)
+                    has_date = formatted_date is not None
+                    stage_class = "completed" if has_date else "pending"
+                    if is_current:
+                        stage_class = "current"
+
+                    timeline_html += f'''
+                        <div class="timeline-stage {stage_class}">
+                            <div class="timeline-dot"></div>
+                            <div class="timeline-label">{stage_name}</div>
+                            <div class="timeline-date">{formatted_date if formatted_date else '-'}</div>
+                        </div>
+                    '''
+                    # Add connector between stages (except after last)
+                    if i < len(timeline_stages) - 1:
+                        timeline_html += '<div class="timeline-connector"></div>'
+
+                timeline_html += '</div>'
+
+                # Roadmap filter data attribute
+                roadmap_filter = roadmap_target.lower().replace(" ", "-") if roadmap_target else "unassigned"
+
                 stories_html += f"""
-                    <article class="story-card" data-program="{prefix.lower()}" data-priority="{priority_class}" data-search="{title.lower()} {user_story.lower() if user_story else ''}">
+                    <article class="story-card" data-program="{prefix.lower()}" data-priority="{priority_class}" data-roadmap="{roadmap_filter}" data-search="{title.lower()} {user_story.lower() if user_story else ''}">
                         <div class="story-header" onclick="toggleStory(this)">
                             <div>
                                 <span class="story-id {prefix.lower()}">{story_id}</span>
                                 <h3 class="story-title">{escape_html(title)}</h3>
                                 <div class="story-meta">
                                     <span class="badge badge-{priority_class}">{priority}</span>
-                                    <span class="badge badge-draft">{status} v{version}</span>
+                                    <span class="badge badge-roadmap badge-{roadmap_class}">{roadmap_display}</span>
+                                    <span class="badge badge-status">{status} v{version}</span>
                                 </div>
                             </div>
                             <svg class="story-toggle" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
                         </div>
                         <div class="story-body">
+                            <div class="story-section">
+                                <h4 class="story-section-title">Status Timeline</h4>
+                                {timeline_html}
+                            </div>
                             <div class="story-section">
                                 <h4 class="story-section-title">User Story</h4>
                                 <p class="user-story">{escape_html(user_story) if user_story else 'No user story defined.'}</p>
@@ -13459,6 +13830,7 @@ async def generate_requirements_dashboard(
             program_filters_html=program_filters_html,
             categories_html=categories_html,
             priority_counts=priority_counts,
+            roadmap_counts=roadmap_counts,
             today=today
         )
 
