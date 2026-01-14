@@ -13527,6 +13527,53 @@ def generate_full_html_template(
 </html>'''
 
 
+def validate_dashboard_structure(html_content: str) -> list:
+    """
+    PURPOSE:
+        Validate that generated dashboard HTML contains all required structural
+        elements. This catches accidental breaks during template updates.
+
+    R EQUIVALENT:
+        Like using rvest to check for expected HTML nodes in a document.
+
+    PARAMETERS:
+        html_content (str): The generated HTML content to validate
+
+    RETURNS:
+        list: List of missing elements (empty if all present)
+
+    WHY THIS APPROACH:
+        Simple string checks are fast and catch major structural breaks.
+        More sophisticated DOM parsing would be overkill for this use case.
+    """
+    # Required structural elements for v1.0 template
+    # Each tuple: (element_name, search_string)
+    required_elements = [
+        ("Header section", 'class="header"'),
+        ("Programs section", 'class="section-title">Programs'),
+        ("Priorities section", 'class="section-title">Priorities'),
+        ("Roadmap summary", 'class="roadmap-summary"'),
+        ("Filter controls", 'class="filter-controls"'),
+        ("Program filter dropdown", 'id="programFilter"'),
+        ("Priority filter dropdown", 'id="priorityFilter"'),
+        ("Roadmap filter dropdown", 'id="roadmapFilter"'),
+        ("Search input", 'id="searchInput"'),
+        ("Category sections", 'class="category-section"'),
+        ("Story cards", 'class="story-card"'),
+        ("Footer", 'class="footer"'),
+        ("Version attribution", f'Requirements Toolkit v{DASHBOARD_TEMPLATE_VERSION}'),
+        ("Filter JavaScript", 'function filterStories()'),
+        ("Toggle JavaScript", 'function toggleStory('),
+    ]
+
+    missing = []
+    for element_name, search_string in required_elements:
+        if search_string not in html_content:
+            missing.append(element_name)
+
+    return missing
+
+
 @mcp.tool()
 async def generate_requirements_dashboard(
     output_path: str = None,
@@ -13908,11 +13955,22 @@ async def generate_requirements_dashboard(
         # WRITE FILE
         # =====================================================================
 
+        # =====================================================================
+        # VALIDATE STRUCTURE (catches accidental breaks)
+        # =====================================================================
+        missing_elements = validate_dashboard_structure(html_content)
+        if missing_elements:
+            logger.warning(f"Dashboard validation: missing elements: {missing_elements}")
+
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
 
         result = f"✅ Dashboard generated: {output_path}\n"
         result += f"   Stories: {total_stories} | Tests: {total_tests}\n"
+
+        # Report validation warnings (but don't fail - still generate the file)
+        if missing_elements:
+            result += f"   ⚠️ Structure warning: missing {', '.join(missing_elements)}\n"
 
         # =====================================================================
         # PUSH TO GITHUB (optional)
