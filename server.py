@@ -12849,7 +12849,7 @@ def generate_full_html_template(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Propel Health | Requirements Dashboard</title>
+    <title>Providence GenomicsNow | Requirements Dashboard</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -13335,7 +13335,7 @@ def generate_full_html_template(
                 </svg>
                 Requirements Dashboard
             </div>
-            <h1>Propel Health Requirements</h1>
+            <h1>Providence GenomicsNow Requirements</h1>
             <p>User stories and acceptance criteria for all programs.</p>
             <div class="header-meta">
                 <div class="header-meta-item">
@@ -13460,7 +13460,7 @@ def generate_full_html_template(
     </main>
 
     <footer class="footer">
-        <p>Propel Health Requirements Dashboard</p>
+        <p>Providence GenomicsNow Requirements Dashboard</p>
         <p style="margin-top: 0.5rem;">Requirements Toolkit v{DASHBOARD_TEMPLATE_VERSION} | Designed by Glen Lewis</p>
         <p style="margin-top: 0.25rem; font-size: 0.75rem;">Generated {today}</p>
     </footer>
@@ -13733,7 +13733,9 @@ async def generate_requirements_dashboard(
             categories[category].append(story)
 
         # Category display info
+        # Includes all known categories from database with display names and icons
         category_info = {
+            # P4M categories
             "REFERRAL": {"icon": "📋", "title": "Referral Workflow", "css": "referral"},
             "ANALYTICS": {"icon": "📊", "title": "Analytics", "css": "analytics"},
             "DASH": {"icon": "🖥️", "title": "Dashboard", "css": "dash"},
@@ -13741,6 +13743,19 @@ async def generate_requirements_dashboard(
             "AUDIT": {"icon": "🔒", "title": "Compliance (Part 11)", "css": "audit"},
             "RECORD": {"icon": "🔒", "title": "Compliance (Part 11)", "css": "audit"},
             "ROLE": {"icon": "👤", "title": "Roles & Permissions", "css": "role"},
+            # ONB categories
+            "ADMIN": {"icon": "⚙️", "title": "Administration", "css": "config"},
+            "EXPORT": {"icon": "📤", "title": "Export & Download", "css": "analytics"},
+            "FORM": {"icon": "📝", "title": "Form Management", "css": "referral"},
+            "GENE": {"icon": "🧬", "title": "Genetic Testing", "css": "dash"},
+            "SAVE": {"icon": "💾", "title": "Save & Draft", "css": "config"},
+            "STEP": {"icon": "📋", "title": "Workflow Steps", "css": "referral"},
+            "UI": {"icon": "🎨", "title": "User Interface", "css": "dash"},
+            # DIS/TEST2 categories
+            "RECRUIT": {"icon": "👥", "title": "Patient Recruitment", "css": "referral"},
+            # PLAT categories
+            "RPT": {"icon": "📑", "title": "Reports", "css": "analytics"},
+            # Fallback
             "UNCATEGORIZED": {"icon": "📁", "title": "Other", "css": "other"},
         }
 
@@ -13780,8 +13795,24 @@ async def generate_requirements_dashboard(
         # Build category sections
         categories_html = ""
 
-        # Define category order
-        category_order = ["REFERRAL", "ANALYTICS", "DASH", "CONFIG", "COMPLIANCE", "ROLE", "UNCATEGORIZED"]
+        # Define category order (preferred display order)
+        # Categories not in this list will be added at the end alphabetically
+        preferred_order = [
+            "REFERRAL", "ANALYTICS", "DASH", "CONFIG", "COMPLIANCE", "ROLE",
+            "RECRUIT", "STEP", "FORM", "ADMIN", "GENE", "SAVE", "EXPORT", "UI",
+            "RPT", "UNCATEGORIZED"
+        ]
+
+        # Build complete category order: preferred categories first, then any others
+        category_order = [cat for cat in preferred_order if cat in categories]
+        for cat in sorted(categories.keys()):
+            if cat not in category_order:
+                # Insert before UNCATEGORIZED if present, else append
+                if "UNCATEGORIZED" in category_order:
+                    idx = category_order.index("UNCATEGORIZED")
+                    category_order.insert(idx, cat)
+                else:
+                    category_order.append(cat)
 
         for cat_key in category_order:
             if cat_key not in categories:
