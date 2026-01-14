@@ -13271,17 +13271,31 @@ def generate_full_html_template(
             color: var(--color-text-secondary);
             margin-bottom: 0.5rem;
         }}
+        /* Priority Planning Container - groups Priorities + Roadmap */
+        .priority-planning-container {{
+            background: #f9fafb;
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-lg);
+            padding: 1.25rem;
+            margin-bottom: 1.5rem;
+        }}
+        .priority-planning-container .section-title {{
+            margin-top: 0;
+        }}
+        .priority-planning-container .summary-grid {{
+            margin-bottom: 1rem;
+        }}
         /* Roadmap Summary Section */
         .roadmap-summary {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
-            gap: 0.75rem;
+            grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+            gap: 0.5rem;
             margin-top: 1rem;
             margin-bottom: 1.75rem;
-            padding: 1rem;
+            padding: 0.75rem;
             background: var(--color-surface);
-            border: 1px solid var(--color-border);
-            border-radius: var(--radius-md);
+            border: 1px solid var(--color-border-light);
+            border-radius: var(--radius-sm);
         }}
         .roadmap-item {{
             text-align: center;
@@ -13355,28 +13369,39 @@ def generate_full_html_template(
     </header>
 
     <main class="main">
+        <!-- Programs Section -->
         <div class="section-title">Programs</div>
-        <div class="summary-grid">
+        <div class="summary-grid" style="margin-bottom: 1.5rem;">
             {program_cards_html}
-            <div class="summary-card">
-                <div class="summary-card-label">Must Have</div>
-                <div class="summary-card-value">{priority_counts.get("Must Have", 0)}</div>
-                <div class="summary-card-sub">Critical priority</div>
-            </div>
-            <div class="summary-card">
-                <div class="summary-card-label">Should Have</div>
-                <div class="summary-card-value">{priority_counts.get("Should Have", 0)}</div>
-                <div class="summary-card-sub">High priority</div>
-            </div>
-            <div class="summary-card">
-                <div class="summary-card-label">Could Have</div>
-                <div class="summary-card-value">{priority_counts.get("Could Have", 0)}</div>
-                <div class="summary-card-sub">Future scope</div>
-            </div>
         </div>
 
-        <!-- Roadmap Distribution Summary -->
-        <div class="roadmap-summary">
+        <!-- Priority Planning Container - groups Priorities + Roadmap -->
+        <div class="priority-planning-container">
+            <div class="section-title">Priority Planning</div>
+
+            <!-- Priorities -->
+            <div class="section-title" style="font-size: 11px; margin-top: 0.75rem;">Priorities</div>
+            <div class="summary-grid">
+                <div class="summary-card">
+                    <div class="summary-card-label">Must Have</div>
+                    <div class="summary-card-value">{priority_counts.get("Must Have", 0)}</div>
+                    <div class="summary-card-sub">Critical priority</div>
+                </div>
+                <div class="summary-card">
+                    <div class="summary-card-label">Should Have</div>
+                    <div class="summary-card-value">{priority_counts.get("Should Have", 0)}</div>
+                    <div class="summary-card-sub">High priority</div>
+                </div>
+                <div class="summary-card">
+                    <div class="summary-card-label">Could Have</div>
+                    <div class="summary-card-value">{priority_counts.get("Could Have", 0)}</div>
+                    <div class="summary-card-sub">Future scope</div>
+                </div>
+            </div>
+
+            <!-- Roadmap -->
+            <div class="section-title" style="font-size: 11px; margin-top: 0.75rem;">Roadmap (Next 5 Quarters)</div>
+            <div class="roadmap-summary" style="margin-top: 0.5rem; margin-bottom: 0;">
             <div class="roadmap-item">
                 <div class="roadmap-item-label">Q1 '25</div>
                 <div class="roadmap-item-value">{roadmap_counts.get("Q1 2025", 0)}</div>
@@ -13422,6 +13447,7 @@ def generate_full_html_template(
                 <div class="roadmap-item-value">{roadmap_counts.get("Unscheduled", 0)}</div>
             </div>
         </div>
+        </div><!-- End Priority Planning Container -->
 
         <div class="filters">
             <div class="filter-group">
