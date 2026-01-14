@@ -2645,7 +2645,17 @@ def list_stories(
 
         for story in stories[:50]:  # Limit display
             result += f"[{story['story_id']}] {story.get('title', 'Untitled')}\n"
-            result += f"  Status: {story['status']} | Priority: {story.get('priority', 'N/A')}"
+            # Priority display logic:
+            # - No roadmap_target: Show "Not Assigned" (unscheduled work)
+            # - Has roadmap_target + has priority: Show actual priority
+            # - Has roadmap_target + no priority: Show "Not Assigned" (validation error)
+            if not story.get('roadmap_target'):
+                priority_display = "Not Assigned"
+            elif story.get('priority'):
+                priority_display = story['priority']
+            else:
+                priority_display = "Not Assigned"
+            result += f"  Status: {story['status']} | Priority: {priority_display}"
             if story.get('category'):
                 result += f" | Category: {story['category']}"
             if story.get('roadmap_target'):
@@ -2700,7 +2710,17 @@ def get_story(story_id: str) -> str:
         result += f"{'=' * 50}\n\n"
         result += f"Title: {story.get('title', 'N/A')}\n"
         result += f"Status: {story['status']} | Version: {story.get('version', 1)}\n"
-        result += f"Priority: {story.get('priority', 'N/A')}\n"
+        # Priority display logic:
+        # - No roadmap_target: Show "Not Assigned" (unscheduled work)
+        # - Has roadmap_target + has priority: Show actual priority
+        # - Has roadmap_target + no priority: Show "Not Assigned" (validation error)
+        if not story.get('roadmap_target'):
+            priority_display = "Not Assigned"
+        elif story.get('priority'):
+            priority_display = story['priority']
+        else:
+            priority_display = "Not Assigned"
+        result += f"Priority: {priority_display}\n"
 
         # ----------------------------------------------------------------
         # Show roadmap target (annual planning timeline)
@@ -2856,6 +2876,27 @@ def create_story(
         }
         if error := validate_choice(priority, list(priority_descriptions.keys()), "priority", priority_descriptions):
             return error
+
+        # ----------------------------------------------------------------
+        # STEP 2b: Validate priority/roadmap_target business rules
+        # - Scheduled work (has roadmap_target) MUST have priority set
+        # ----------------------------------------------------------------
+        if roadmap_target and (not priority or priority == "Not Assigned"):
+            return (
+                f"⚠️ Validation Warning: Roadmap target requires a priority.\n\n"
+                f"Roadmap Target: {roadmap_target}\n"
+                f"Priority: {priority or 'None'}\n\n"
+                f"Please provide priority (Must Have, Should Have, Could Have, Won't Have).\n\n"
+                f"Example:\n"
+                f"  create_story(\n"
+                f"      program_prefix=\"{program_prefix}\",\n"
+                f"      category=\"{category}\",\n"
+                f"      title=\"{title[:30]}...\",\n"
+                f"      ...,\n"
+                f"      roadmap_target=\"{roadmap_target}\",\n"
+                f"      priority=\"Should Have\"  # <-- Add priority\n"
+                f"  )"
+            )
 
         # ----------------------------------------------------------------
         # STEP 3: Connect to requirements database
@@ -3262,6 +3303,48 @@ def update_story(
         # Convert to dict for easier access
         old_story = dict(existing)
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # ----------------------------------------------------------------
+        # STEP 3d: Validate priority/roadmap_target business rules
+        # - Scheduled work (has roadmap_target) MUST have priority set
+        # - Cannot clear priority on scheduled work
+        # ----------------------------------------------------------------
+
+        # Determine what roadmap_target will be after this update
+        new_roadmap = roadmap_target if roadmap_target is not None else old_story.get('roadmap_target')
+
+        # Determine what priority will be after this update
+        new_priority = priority if priority is not None else old_story.get('priority')
+
+        # Rule 1: If roadmap_target is being SET and priority is missing
+        if roadmap_target is not None and new_roadmap:  # roadmap_target being set to non-empty
+            if not new_priority or new_priority == "Not Assigned":
+                return (
+                    f"⚠️ Validation Warning: Story has roadmap target but no priority.\n\n"
+                    f"Story: {story_id}\n"
+                    f"Roadmap Target: {new_roadmap}\n"
+                    f"Priority: {new_priority or 'None'}\n\n"
+                    f"Scheduled work must have a priority set.\n"
+                    f"Please provide priority (Must Have, Should Have, Could Have, Won't Have).\n\n"
+                    f"Example:\n"
+                    f"  update_story(\"{story_id}\", roadmap_target=\"{new_roadmap}\", priority=\"Should Have\")"
+                )
+
+        # Rule 2: If priority is being CLEARED on scheduled work
+        if priority is not None and (not priority or priority == "Not Assigned"):
+            existing_roadmap = old_story.get('roadmap_target')
+            # Check if roadmap_target exists and isn't being cleared in this same update
+            final_roadmap = roadmap_target if roadmap_target is not None else existing_roadmap
+            if final_roadmap:
+                return (
+                    f"⚠️ Validation Warning: Cannot clear priority on scheduled work.\n\n"
+                    f"Story: {story_id}\n"
+                    f"Roadmap Target: {final_roadmap}\n\n"
+                    f"Remove the roadmap target first, or set a new priority.\n\n"
+                    f"Options:\n"
+                    f"  1. Remove from schedule: update_story(\"{story_id}\", roadmap_target=\"\")\n"
+                    f"  2. Set new priority: update_story(\"{story_id}\", priority=\"Should Have\")"
+                )
 
         # ----------------------------------------------------------------
         # STEP 4: Build update fields and track changes
@@ -4877,6 +4960,104 @@ def get_coverage_gaps(program_prefix: str) -> str:
     finally:
         if db:
             db.close()
+
+
+@mcp.tool()
+def validate_story_priorities(program_prefix: str = None) -> str:
+    """
+    Find stories with scheduling/priority mismatches.
+
+    PURPOSE:
+        Identifies stories that have a roadmap_target but no priority set.
+        These represent data quality issues - scheduled work MUST have priority.
+
+    R EQUIVALENT:
+        Like dplyr::filter(df, !is.na(roadmap_target) & is.na(priority))
+
+    PARAMETERS:
+        program_prefix (str): Optional - Filter to specific program (e.g., "P4M")
+                              If not provided, checks all programs.
+
+    RETURNS:
+        List of stories that have roadmap_target but missing priority.
+        These need to be fixed using update_story().
+
+    WHY THIS APPROACH:
+        Business rule: Scheduled work (has roadmap_target) must have priority set.
+        This tool helps identify violations that need correction.
+    """
+    import sqlite3
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # ----------------------------------------------------------------
+        # Build query - find stories with roadmap_target but no priority
+        # ----------------------------------------------------------------
+        query = """
+            SELECT s.story_id, s.title, s.roadmap_target, s.priority, s.status,
+                   p.prefix, p.name as program_name
+            FROM user_stories s
+            JOIN programs p ON s.program_id = p.program_id
+            WHERE s.roadmap_target IS NOT NULL
+              AND s.roadmap_target != ''
+              AND (s.priority IS NULL OR s.priority = '' OR s.priority = 'Not Assigned')
+        """
+        params = []
+
+        if program_prefix:
+            query += " AND UPPER(p.prefix) = ?"
+            params.append(program_prefix.upper())
+
+        query += " ORDER BY p.prefix, s.story_id"
+
+        cursor.execute(query, params)
+        violations = [dict(row) for row in cursor.fetchall()]
+
+        # ----------------------------------------------------------------
+        # Build result summary
+        # ----------------------------------------------------------------
+        if not violations:
+            scope = f"for {program_prefix}" if program_prefix else "across all programs"
+            return (
+                f"✓ No priority/scheduling violations found {scope}.\n\n"
+                f"All stories with roadmap targets have priorities assigned."
+            )
+
+        result = f"⚠️ Found {len(violations)} story(ies) with scheduling/priority mismatch:\n\n"
+        result += "Stories with roadmap_target but no priority:\n"
+        result += "-" * 60 + "\n"
+
+        # Group by program for readability
+        by_program = {}
+        for v in violations:
+            prog = f"{v['prefix']} - {v['program_name']}"
+            if prog not in by_program:
+                by_program[prog] = []
+            by_program[prog].append(v)
+
+        for program, stories in by_program.items():
+            result += f"\n{program}:\n"
+            for story in stories:
+                result += f"  [{story['story_id']}] {story['title'][:40]}\n"
+                result += f"    Roadmap: {story['roadmap_target']} | Priority: {story['priority'] or 'NULL'}\n"
+
+        result += f"\n" + "-" * 60 + "\n"
+        result += f"\nTo fix these violations:\n"
+        result += f"  update_story(story_id=\"STORY-ID\", priority=\"Should Have\")\n"
+        result += f"\nOr remove from schedule:\n"
+        result += f"  update_story(story_id=\"STORY-ID\", roadmap_target=\"\")\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error validating story priorities: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
 
 
 # ============================================================
@@ -13983,7 +14164,7 @@ def generate_full_html_template(
         .badge-must-have {{ background: var(--color-must-have-bg); color: var(--color-must-have); }}
         .badge-should-have {{ background: var(--color-should-have-bg); color: var(--color-should-have); }}
         .badge-could-have {{ background: var(--color-could-have-bg); color: var(--color-could-have); }}
-        .badge-not-assigned {{ background: #e5e7eb; color: #6b7280; }}
+        .badge-not-assigned {{ background: #9CA3AF; color: white; }}
         .badge-status {{ background: var(--color-draft-bg); color: var(--color-draft); }}
         /* Roadmap badges - blue/teal color scheme to differentiate from priority (red) and status (gray) */
         .badge-roadmap {{ background: #e0f2fe; color: #0369a1; font-weight: 600; }}
@@ -14745,11 +14926,20 @@ async def generate_requirements_dashboard(
 
                 test_count = test_counts.get(story_id, 0)
 
-                # Priority badge class - NULL priorities display as "Not Assigned" with gray badge
-                if priority:
+                # Priority badge class - based on roadmap_target:
+                # - No roadmap_target: Always show "Not Assigned" (unscheduled work)
+                # - Has roadmap_target + has priority: Show actual priority
+                # - Has roadmap_target + no priority: Show "Not Assigned" (validation error state)
+                if not roadmap_target:
+                    # Unscheduled work - always show "Not Assigned"
+                    priority_class = "not-assigned"
+                    priority_display = "Not Assigned"
+                elif priority:
+                    # Scheduled work with priority set
                     priority_class = priority.lower().replace(" ", "-")
                     priority_display = priority
                 else:
+                    # Scheduled work missing priority - validation error state
                     priority_class = "not-assigned"
                     priority_display = "Not Assigned"
 
