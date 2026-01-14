@@ -13550,13 +13550,12 @@ def validate_dashboard_structure(html_content: str) -> list:
     # Each tuple: (element_name, search_string)
     required_elements = [
         ("Header section", 'class="header"'),
-        ("Programs section", 'class="section-title">Programs'),
-        ("Priorities section", 'class="section-title">Priorities'),
+        ("Programs section", 'class="summary-card"'),
         ("Roadmap summary", 'class="roadmap-summary"'),
-        ("Filter controls", 'class="filter-controls"'),
-        ("Program filter dropdown", 'id="programFilter"'),
-        ("Priority filter dropdown", 'id="priorityFilter"'),
-        ("Roadmap filter dropdown", 'id="roadmapFilter"'),
+        ("Filter buttons", 'class="filters"'),
+        ("Program filter buttons", 'data-filter='),
+        ("Priority filter buttons", 'data-priority='),
+        ("Roadmap filter buttons", 'data-roadmap='),
         ("Search input", 'id="searchInput"'),
         ("Category sections", 'class="category-section"'),
         ("Story cards", 'class="story-card"'),
