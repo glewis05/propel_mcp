@@ -57,6 +57,7 @@ import sys
 import csv
 import json
 import logging
+import sqlite3
 import importlib.util
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -15032,10 +15033,34 @@ async def generate_requirements_dashboard(
         """
 
         cursor = conn.execute(stories_query)
-        stories = cursor.fetchall()
+        stories_raw = cursor.fetchall()
+
+        if not stories_raw:
+            return "No stories found in database. Add stories first."
+
+        # =================================================================
+        # PROGRAM DISPLAY NAMES AND EXCLUSIONS
+        # =================================================================
+        # User-friendly names for dashboard display (stakeholder-facing)
+        PROGRAM_DISPLAY_NAMES = {
+            "P4M": "Prevention4ME",
+            "DIS": "Discover",
+            "PLAT": "Platform",
+            "ONB": "Onboarding",
+        }
+
+        def get_program_display_name(prefix: str) -> str:
+            """Return user-friendly display name for program prefix."""
+            return PROGRAM_DISPLAY_NAMES.get(prefix, prefix)
+
+        # Exclude test and empty programs from stakeholder dashboard
+        EXCLUDED_PROGRAMS = {"TEST2", "FRESH", "IMPORT", "P4ME"}
+
+        # Filter out excluded programs
+        stories = [s for s in stories_raw if s['prefix'] not in EXCLUDED_PROGRAMS]
 
         if not stories:
-            return "No stories found in database. Add stories first."
+            return "No stories found after filtering excluded programs."
 
         # Get test counts per story (EXCLUDE compliance tests for stakeholder view)
         # Compliance tests are tracked separately for audit purposes
@@ -15050,13 +15075,10 @@ async def generate_requirements_dashboard(
         test_counts = {row['story_id']: row['test_count'] for row in cursor.fetchall()}
 
         # Get summary stats (EXCLUDE compliance tests for stakeholder view)
+        # Only count stories/tests from non-excluded programs
         total_stories = len(stories)
-        total_tests_query = """
-            SELECT COUNT(*) as cnt FROM uat_test_cases
-            WHERE is_compliance_test = FALSE OR is_compliance_test IS NULL
-        """
-        total_tests_result = conn.execute(total_tests_query).fetchone()
-        total_tests = total_tests_result['cnt'] if total_tests_result else 0
+        # Sum test counts only for displayed stories
+        total_tests = sum(test_counts.get(s['story_id'], 0) for s in stories)
 
         # Count by priority - includes "Not Assigned" for NULL values
         priority_counts = {"Must Have": 0, "Should Have": 0, "Could Have": 0, "Won't Have": 0, "Not Assigned": 0}
@@ -15166,9 +15188,10 @@ async def generate_requirements_dashboard(
         # Build program summary cards
         program_cards_html = ""
         for prefix, count in program_counts.items():
+            display_name = get_program_display_name(prefix)
             program_cards_html += f"""
                 <div class="summary-card">
-                    <div class="summary-card-label">{prefix}</div>
+                    <div class="summary-card-label">{display_name}</div>
                     <div class="summary-card-value">{count}</div>
                     <div class="summary-card-sub">{program_test_counts[prefix]} test cases</div>
                 </div>
@@ -15177,7 +15200,8 @@ async def generate_requirements_dashboard(
         # Build program filter buttons
         program_filters_html = '<button class="filter-btn active" data-filter="all">All Programs</button>'
         for prefix, count in program_counts.items():
-            program_filters_html += f'<button class="filter-btn {prefix.lower()}" data-filter="{prefix.lower()}">{prefix} ({count})</button>'
+            display_name = get_program_display_name(prefix)
+            program_filters_html += f'<button class="filter-btn {prefix.lower()}" data-filter="{prefix.lower()}">{display_name} ({count})</button>'
 
         # Build category sections
         categories_html = ""
