@@ -3602,6 +3602,243 @@ Next Steps:
 
 
 @mcp.tool()
+def delete_story(
+    story_id: str,
+    reason: str
+) -> str:
+    """
+    Delete a user story from the database with full audit trail.
+
+    PURPOSE:
+        Permanently removes a user story that is no longer needed (duplicate,
+        out of scope, or superseded). The full story data and associated test
+        cases are captured in the audit trail before deletion for compliance.
+
+    R EQUIVALENT:
+        Like dplyr::filter(!story_id == id) but with cascade delete of test
+        cases and full audit logging. Deleted records preserved in audit_history.
+
+    Args:
+        story_id: Story ID to delete (e.g., "PLAT-LANG-001")
+        reason: Reason for deletion - recorded in audit trail for compliance
+
+    Returns:
+        Confirmation with deleted story_id, title, test case count, and timestamp
+
+    WHY THIS APPROACH:
+        - Hard delete (not soft delete) since stories can be recreated if needed
+        - Full record snapshot captured in audit_history before deletion
+        - Associated test cases deleted first (referential integrity)
+        - Reason field ensures audit trail explains why the deletion occurred
+        - Part 11 compliant audit trail
+
+    Example:
+        delete_story(
+            story_id="PLAT-LANG-001",
+            reason="Duplicate - Moved to P4M-LANG-001"
+        )
+    """
+    import sqlite3
+    import json
+
+    conn = None
+    try:
+        # ----------------------------------------------------------------
+        # STEP 1: Connect to database and fetch existing story
+        # ----------------------------------------------------------------
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT s.*, p.name as program_name, p.prefix
+            FROM user_stories s
+            JOIN programs p ON s.program_id = p.program_id
+            WHERE s.story_id = ?
+            """,
+            (story_id,)
+        )
+        existing = cursor.fetchone()
+
+        if not existing:
+            # Story not found - provide helpful suggestions
+            parts = story_id.split('-')
+            if len(parts) >= 2:
+                prefix = parts[0]
+                cursor.execute(
+                    "SELECT story_id, title FROM user_stories WHERE story_id LIKE ? ORDER BY story_id LIMIT 5",
+                    (f"{prefix}-%",)
+                )
+                similar = cursor.fetchall()
+                if similar:
+                    similar_list = "\n".join(f"  • {s['story_id']}: {s['title'][:40]}" for s in similar)
+                    return (
+                        f"Story not found: '{story_id}'\n\n"
+                        f"Stories in {prefix}:\n{similar_list}"
+                    )
+
+            return f"Story not found: '{story_id}'"
+
+        # Convert to dict for easier access and JSON serialization
+        story_data = dict(existing)
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # ----------------------------------------------------------------
+        # STEP 2: Count associated test cases
+        # ----------------------------------------------------------------
+        cursor.execute(
+            "SELECT COUNT(*) as cnt FROM uat_test_cases WHERE story_id = ?",
+            (story_id,)
+        )
+        test_case_count = cursor.fetchone()['cnt']
+
+        # ----------------------------------------------------------------
+        # STEP 3: Prepare audit record with full story data
+        # Remove non-serializable or redundant joined fields
+        # ----------------------------------------------------------------
+        audit_record = {
+            'story_id': story_data.get('story_id'),
+            'program_id': story_data.get('program_id'),
+            'title': story_data.get('title'),
+            'user_story': story_data.get('user_story'),
+            'role': story_data.get('role'),
+            'acceptance_criteria': story_data.get('acceptance_criteria'),
+            'priority': story_data.get('priority'),
+            'category': story_data.get('category'),
+            'category_full': story_data.get('category_full'),
+            'status': story_data.get('status'),
+            'roadmap_target': story_data.get('roadmap_target'),
+            'success_metrics': story_data.get('success_metrics'),
+            'internal_notes': story_data.get('internal_notes'),
+            'client_feedback': story_data.get('client_feedback'),
+            'version': story_data.get('version'),
+            'draft_date': story_data.get('draft_date'),
+            'internal_review_date': story_data.get('internal_review_date'),
+            'client_review_date': story_data.get('client_review_date'),
+            'approved_date': story_data.get('approved_date'),
+            'approved_by': story_data.get('approved_by'),
+            'needs_discussion_date': story_data.get('needs_discussion_date'),
+            'created_date': story_data.get('created_date'),
+            'updated_date': story_data.get('updated_date'),
+            'test_cases_deleted': test_case_count
+        }
+
+        # ----------------------------------------------------------------
+        # STEP 4: Log story deletion to audit_history BEFORE deleting
+        # ----------------------------------------------------------------
+        cursor.execute(
+            """
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                'user_story',                   # record_type
+                story_id,                       # record_id
+                'Deleted',                      # action
+                'record',                       # field_changed
+                json.dumps(audit_record),       # old_value (full record)
+                None,                           # new_value (null for delete)
+                'MCP:delete_story',             # changed_by
+                now,                            # changed_date
+                reason                          # change_reason
+            )
+        )
+
+        # ----------------------------------------------------------------
+        # STEP 5: Delete associated test cases FIRST (referential integrity)
+        # Log each test case deletion separately for compliance
+        # ----------------------------------------------------------------
+        if test_case_count > 0:
+            # Get test case IDs for logging
+            cursor.execute(
+                "SELECT test_id, title FROM uat_test_cases WHERE story_id = ?",
+                (story_id,)
+            )
+            test_cases = cursor.fetchall()
+
+            # Log cascade deletion in audit
+            cursor.execute(
+                """
+                INSERT INTO audit_history (
+                    record_type, record_id, action, field_changed,
+                    old_value, new_value, changed_by, changed_date, change_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    'test_case',
+                    story_id,
+                    'Cascade Delete',
+                    'record',
+                    json.dumps([{'test_id': tc['test_id'], 'title': tc['title']} for tc in test_cases]),
+                    None,
+                    'MCP:delete_story',
+                    now,
+                    f"Cascade delete: Parent story {story_id} deleted - {reason}"
+                )
+            )
+
+            # Delete test cases
+            cursor.execute(
+                "DELETE FROM uat_test_cases WHERE story_id = ?",
+                (story_id,)
+            )
+
+        # ----------------------------------------------------------------
+        # STEP 6: Delete the story
+        # ----------------------------------------------------------------
+        cursor.execute(
+            "DELETE FROM user_stories WHERE story_id = ?",
+            (story_id,)
+        )
+
+        conn.commit()
+
+        # ----------------------------------------------------------------
+        # STEP 7: Build success response
+        # ----------------------------------------------------------------
+        result = f"""Story deleted successfully!
+
+Deleted Story:
+  Story ID: {story_id}
+  Title: {story_data['title']}
+  Program: {story_data['program_name']} [{story_data['prefix']}]
+  Category: {story_data.get('category', 'N/A')}
+  Status: {story_data.get('status', 'N/A')}
+  Priority: {story_data.get('priority', 'N/A')}
+
+Associated Data Deleted:
+  Test Cases: {test_case_count} test case(s) also deleted
+
+Deletion Details:
+  Reason: {reason}
+  Deleted At: {now}
+  Deleted By: MCP:delete_story
+
+Audit Trail:
+  Full story record and {test_case_count} test case(s) have been preserved
+  in audit_history. The deletion is traceable for compliance purposes.
+
+Next Steps:
+  • list_stories(program_prefix="{story_data['prefix']}") - View remaining stories
+  • create_story(...) - Create a replacement story if needed
+"""
+        return result
+
+    except Exception as e:
+        # Explicit rollback for compliance audit trail clarity
+        if conn:
+            conn.rollback()
+        return f"Error deleting story: {str(e)}"
+
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
 def get_approval_pipeline(program_prefix: str) -> str:
     """
     Get Kanban-style view of story workflow status.
