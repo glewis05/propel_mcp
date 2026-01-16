@@ -31,6 +31,7 @@ UAT TOOLKIT INTEGRATION:
 - Tester Assignment: assign_uat_testers - Add/modify tester assignments
 - Tracker Generation: generate_uat_trackers - Generate HTML files + push to GitHub
 - Results Import: import_uat_results_json - Paste JSON from Formspree email
+- Notion Import: import_notion_uat_results - Import results from Notion database
 - Dashboard: regenerate_uat_dashboard, get_uat_progress - View/update progress
 
 ONBOARDING PROJECT MANAGEMENT:
@@ -8467,7 +8468,7 @@ def _log_form_audit(
 
         conn.commit()
     except Exception as e:
-        print(f"Audit log warning: {e}")
+        logger.warning(f"Audit log warning: {e}")
     finally:
         conn.close()
 
@@ -13851,6 +13852,460 @@ def import_uat_results_json(
     finally:
         if conn:
             conn.close()
+
+
+@mcp.tool()
+def import_notion_uat_results(
+    cycle_id: str,
+    notion_results: str = "",
+    preview_only: bool = True,
+    tester_filter: Optional[str] = None
+) -> str:
+    """
+    Import UAT test results from Notion database back into SQLite.
+
+    This tool closes the loop in the Notion-based UAT workflow where testers
+    execute tests in Notion and results are synced back to SQLite.
+
+    WORKFLOW:
+    1. First, query the Notion database using Notion MCP:
+       notion-search with data_source_url="collection://f9831b48-803c-4451-abd1-e730f4200e1f"
+    2. Pass the JSON results to this tool for import
+
+    Args:
+        cycle_id: UAT cycle ID to match records (e.g., "UAT-NCCN-001")
+        notion_results: JSON string containing Notion query results. Expected format:
+            [{"Test ID": "NCCN-RULE-001-TC01", "Status": "Pass", "Actual Result": "...",
+              "Defect Notes": "...", "Assigned To": "Kim Childers"}, ...]
+        preview_only: If True, show what WOULD change without committing (default True)
+        tester_filter: Optional - only import results for a specific tester
+
+    Returns:
+        Summary of import results or preview of changes
+
+    Notion Schema Mapping:
+        | Notion Property | SQLite Column    | Notes                              |
+        |-----------------|------------------|------------------------------------|
+        | Test ID         | test_id          | Primary key for matching           |
+        | Status          | test_status      | Not Run, Pass, Fail, Blocked, Skipped |
+        | Actual Result   | execution_notes  | Tester observations                |
+        | Defect Notes    | defect_id        | Failure details/bug reference      |
+        | Assigned To     | tested_by        | Who executed the test              |
+
+    Example:
+        # Step 1: Query Notion (use Notion MCP)
+        notion-search data_source_url="collection://f9831b48-803c-4451-abd1-e730f4200e1f"
+
+        # Step 2: Preview import
+        import_notion_uat_results(
+            cycle_id="UAT-NCCN-001",
+            notion_results='[{"Test ID": "NCCN-RULE-001-TC01", "Status": "Pass", ...}]',
+            preview_only=True
+        )
+
+        # Step 3: Commit import
+        import_notion_uat_results(
+            cycle_id="UAT-NCCN-001",
+            notion_results='[{"Test ID": "NCCN-RULE-001-TC01", "Status": "Pass", ...}]',
+            preview_only=False
+        )
+    """
+    logger.info(f"import_notion_uat_results() called - cycle={cycle_id}, preview={preview_only}, tester_filter={tester_filter}")
+
+    # If no notion_results provided, return instructions
+    if not notion_results or notion_results.strip() == "":
+        return """## Import Notion UAT Results
+
+To import results from Notion, follow these steps:
+
+### Step 1: Query the Notion Database
+Use the Notion MCP tool to fetch test results:
+```
+notion-search with data_source_url="collection://f9831b48-803c-4451-abd1-e730f4200e1f"
+```
+
+Or fetch from the database directly:
+- Database ID: 74882519de814d81af7957793434cfe6
+- Data Source ID: f9831b48-803c-4451-abd1-e730f4200e1f
+
+### Step 2: Pass Results to This Tool
+Copy the JSON results and call:
+```
+import_notion_uat_results(
+    cycle_id="{cycle_id}",
+    notion_results='<paste JSON here>',
+    preview_only=True  # Preview first!
+)
+```
+
+### Expected Notion Properties
+- Test ID (title) - Used to match SQLite records
+- Status (select) - Pass, Fail, Blocked, Skipped, Not Run
+- Actual Result (text) - Tester observations
+- Defect Notes (text) - Bug details if failed
+- Assigned To (text) - Tester name
+""".format(cycle_id=cycle_id)
+
+    # Parse the notion_results JSON
+    try:
+        results = json.loads(notion_results)
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON in notion_results: {str(e)}\n\nMake sure you paste valid JSON from the Notion query."
+
+    # Handle different Notion response formats
+    # Notion MCP might return results in different structures
+    if isinstance(results, dict):
+        # Check common Notion response structures
+        if 'results' in results:
+            results = results['results']
+        elif 'data' in results:
+            results = results['data']
+        elif 'pages' in results:
+            results = results['pages']
+        else:
+            # Try to find an array in the response
+            for key, value in results.items():
+                if isinstance(value, list):
+                    results = value
+                    break
+
+    if not isinstance(results, list):
+        return f"Error: Expected a list of test results, got {type(results).__name__}.\n\nMake sure the Notion query returned an array of records."
+
+    if not results:
+        return "No results found in the Notion data. The query returned an empty list."
+
+    conn = None
+    try:
+        conn = sqlite3.connect(REQ_DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Track statistics
+        would_update = []
+        skipped_not_run = 0
+        skipped_tester_filter = 0
+        not_found = []
+        by_status = {"Pass": 0, "Fail": 0, "Blocked": 0, "Skipped": 0}
+        by_tester = {}
+
+        for record in results:
+            # Extract fields from Notion record
+            # Handle different property access patterns
+            test_id = _extract_notion_property(record, ['Test ID', 'test_id', 'TestID', 'title', 'Name'])
+            status = _extract_notion_property(record, ['Status', 'status', 'Test Status'])
+            actual_result = _extract_notion_property(record, ['Actual Result', 'actual_result', 'ActualResult', 'Notes', 'notes'])
+            defect_notes = _extract_notion_property(record, ['Defect Notes', 'defect_notes', 'DefectNotes', 'Defects', 'defect_id'])
+            assigned_to = _extract_notion_property(record, ['Assigned To', 'assigned_to', 'AssignedTo', 'Tester', 'tester'])
+
+            if not test_id:
+                continue  # Skip records without test ID
+
+            # Normalize status
+            status = _normalize_notion_status(status)
+
+            # Skip "Not Run" tests
+            if status in ('Not Run', 'Not_Run', '', None):
+                skipped_not_run += 1
+                continue
+
+            # Apply tester filter if specified
+            if tester_filter and assigned_to:
+                if tester_filter.lower() not in assigned_to.lower():
+                    skipped_tester_filter += 1
+                    continue
+
+            # Verify test exists in SQLite for this cycle
+            cursor = conn.execute("""
+                SELECT test_id, test_status, tested_by, execution_notes, defect_id
+                FROM uat_test_cases
+                WHERE test_id = ? AND (uat_cycle_id = ? OR uat_cycle_id IS NULL)
+            """, (test_id, cycle_id))
+            existing = cursor.fetchone()
+
+            if not existing:
+                # Try without cycle filter (maybe test_id is unique)
+                cursor = conn.execute("""
+                    SELECT test_id, test_status, tested_by, execution_notes, defect_id
+                    FROM uat_test_cases
+                    WHERE test_id = ?
+                """, (test_id,))
+                existing = cursor.fetchone()
+
+            if not existing:
+                not_found.append(test_id)
+                continue
+
+            # Track what would change
+            would_update.append({
+                'test_id': test_id,
+                'old_status': existing['test_status'],
+                'new_status': status,
+                'old_notes': existing['execution_notes'] or '',
+                'new_notes': actual_result or '',
+                'old_defect': existing['defect_id'] or '',
+                'new_defect': defect_notes or '',
+                'tester': assigned_to or existing['tested_by'] or 'Unknown'
+            })
+
+            # Track statistics
+            if status in by_status:
+                by_status[status] += 1
+            tester_name = assigned_to or 'Unknown'
+            by_tester[tester_name] = by_tester.get(tester_name, 0) + 1
+
+        # If preview mode, show what would change
+        if preview_only:
+            lines = [
+                f"## {cycle_id} - Notion UAT Results Import",
+                f"### ⚠️ PREVIEW MODE - No changes made",
+                f"",
+                f"**Would import {len(would_update)} test results:**",
+                f"  ✅ Pass: {by_status['Pass']}",
+                f"  ❌ Fail: {by_status['Fail']}",
+                f"  🚧 Blocked: {by_status['Blocked']}",
+                f"  ⏭️ Skipped: {by_status['Skipped']}",
+                f""
+            ]
+
+            if by_tester:
+                lines.append("**Changes by tester:**")
+                for tester, count in sorted(by_tester.items(), key=lambda x: -x[1]):
+                    lines.append(f"  • {tester}: {count} results")
+                lines.append("")
+
+            if skipped_not_run > 0:
+                lines.append(f"⏸️ Skipped {skipped_not_run} tests with 'Not Run' status")
+
+            if skipped_tester_filter > 0:
+                lines.append(f"🔍 Skipped {skipped_tester_filter} tests (tester filter: {tester_filter})")
+
+            if not_found:
+                lines.append(f"")
+                lines.append(f"⚠️ **Not found in SQLite ({len(not_found)}):**")
+                for tid in not_found[:10]:
+                    lines.append(f"  • {tid}")
+                if len(not_found) > 10:
+                    lines.append(f"  • ... and {len(not_found) - 10} more")
+
+            # Show sample changes
+            if would_update:
+                lines.append(f"")
+                lines.append(f"**Sample changes (first 5):**")
+                for change in would_update[:5]:
+                    status_change = f"{change['old_status'] or 'Not Run'} → {change['new_status']}"
+                    lines.append(f"  • {change['test_id']}: {status_change} ({change['tester']})")
+
+            lines.extend([
+                f"",
+                f"---",
+                f"**To commit these changes, run:**",
+                f"```",
+                f"import_notion_uat_results(",
+                f"    cycle_id=\"{cycle_id}\",",
+                f"    notion_results='<same JSON>',",
+                f"    preview_only=False",
+                f")",
+                f"```"
+            ])
+
+            return "\n".join(lines)
+
+        # Actually perform the import
+        now = datetime.now().isoformat()
+        updated = 0
+
+        for change in would_update:
+            cursor = conn.execute("""
+                UPDATE uat_test_cases
+                SET test_status = ?,
+                    tested_by = ?,
+                    tested_date = ?,
+                    execution_notes = CASE
+                        WHEN ? != '' THEN ?
+                        ELSE execution_notes
+                    END,
+                    defect_id = CASE
+                        WHEN ? != '' THEN ?
+                        ELSE defect_id
+                    END,
+                    updated_date = CURRENT_TIMESTAMP
+                WHERE test_id = ?
+            """, (
+                change['new_status'],
+                change['tester'],
+                now,
+                change['new_notes'], change['new_notes'],
+                change['new_defect'], change['new_defect'],
+                change['test_id']
+            ))
+
+            if cursor.rowcount > 0:
+                updated += 1
+
+        # Log to audit_history
+        cursor = conn.execute("""
+            INSERT INTO audit_history (
+                record_type, record_id, action, field_changed,
+                old_value, new_value, changed_by, changed_date, change_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            'uat_test_cases',
+            cycle_id,
+            'Notion Import',
+            'test_status',
+            json.dumps({
+                'source': 'notion',
+                'database_id': '74882519de814d81af7957793434cfe6',
+                'preview_only': False
+            }),
+            json.dumps({
+                'updated': updated,
+                'by_status': by_status,
+                'by_tester': by_tester,
+                'not_found': len(not_found)
+            }),
+            'MCP:import_notion_uat_results',
+            now,
+            f'Imported {updated} test results from Notion database'
+        ))
+
+        conn.commit()
+
+        logger.info(f"import_notion_uat_results() SUCCESS - updated {updated} tests")
+
+        # Build success summary
+        lines = [
+            f"## ✅ Notion Import Complete",
+            f"",
+            f"**Cycle:** {cycle_id}",
+            f"**Imported:** {updated} test results",
+            f"",
+            f"**Results breakdown:**",
+            f"  ✅ Pass: {by_status['Pass']}",
+            f"  ❌ Fail: {by_status['Fail']}",
+            f"  🚧 Blocked: {by_status['Blocked']}",
+            f"  ⏭️ Skipped: {by_status['Skipped']}",
+            f""
+        ]
+
+        if by_tester:
+            lines.append("**By tester:**")
+            for tester, count in sorted(by_tester.items(), key=lambda x: -x[1]):
+                lines.append(f"  • {tester}: {count} results")
+            lines.append("")
+
+        if not_found:
+            lines.append(f"⚠️ {len(not_found)} test IDs not found in SQLite")
+
+        lines.extend([
+            f"",
+            f"**Next steps:**",
+            f"  • Run `get_uat_progress(cycle_id=\"{cycle_id}\")` to see updated progress",
+            f"  • Run `regenerate_uat_dashboard(\"{cycle_id}\")` to update the dashboard"
+        ])
+
+        return "\n".join(lines)
+
+    except sqlite3.Error as e:
+        logger.error(f"import_notion_uat_results() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"import_notion_uat_results() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+def _extract_notion_property(record: dict, keys: list) -> Optional[str]:
+    """
+    Extract a property value from a Notion record, trying multiple key names.
+
+    Handles various Notion property formats:
+    - Simple string values
+    - Title/rich_text arrays
+    - Select objects
+    - Nested property structures
+    """
+    for key in keys:
+        if key in record:
+            value = record[key]
+
+            # Handle None
+            if value is None:
+                continue
+
+            # Simple string
+            if isinstance(value, str):
+                return value.strip()
+
+            # Notion title/rich_text array format
+            if isinstance(value, list):
+                texts = []
+                for item in value:
+                    if isinstance(item, str):
+                        texts.append(item)
+                    elif isinstance(item, dict):
+                        # rich_text format: {"plain_text": "...", "text": {"content": "..."}}
+                        if 'plain_text' in item:
+                            texts.append(item['plain_text'])
+                        elif 'text' in item and isinstance(item['text'], dict):
+                            texts.append(item['text'].get('content', ''))
+                        elif 'content' in item:
+                            texts.append(item['content'])
+                if texts:
+                    return ' '.join(texts).strip()
+
+            # Notion select format: {"name": "Pass", "color": "green"}
+            if isinstance(value, dict):
+                if 'name' in value:
+                    return value['name']
+                if 'plain_text' in value:
+                    return value['plain_text']
+                if 'title' in value:
+                    return _extract_notion_property({'title': value['title']}, ['title'])
+                if 'rich_text' in value:
+                    return _extract_notion_property({'rich_text': value['rich_text']}, ['rich_text'])
+                if 'select' in value and value['select']:
+                    return value['select'].get('name', '')
+
+    return None
+
+
+def _normalize_notion_status(status: Optional[str]) -> str:
+    """
+    Normalize Notion status values to match SQLite expected values.
+    """
+    if not status:
+        return 'Not Run'
+
+    status = status.strip()
+
+    # Map variations to standard values
+    status_map = {
+        'pass': 'Pass',
+        'passed': 'Pass',
+        'success': 'Pass',
+        '✅': 'Pass',
+        'fail': 'Fail',
+        'failed': 'Fail',
+        'failure': 'Fail',
+        '❌': 'Fail',
+        'blocked': 'Blocked',
+        'block': 'Blocked',
+        '🚧': 'Blocked',
+        'skipped': 'Skipped',
+        'skip': 'Skipped',
+        'n/a': 'Skipped',
+        '⏭️': 'Skipped',
+        'not run': 'Not Run',
+        'not_run': 'Not Run',
+        'notrun': 'Not Run',
+        'pending': 'Not Run',
+        '': 'Not Run'
+    }
+
+    return status_map.get(status.lower(), status)
 
 
 @mcp.tool()
