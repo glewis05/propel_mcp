@@ -12290,6 +12290,40 @@ def create_onboarding_project(
             f'New onboarding project for {clinic_name}'
         ))
 
+        # Create corresponding roadmap project
+        import secrets
+        roadmap_start_date = (target_date - timedelta(weeks=8)).isoformat()
+        roadmap_end_date = target_launch_date
+
+        # Generate roadmap project_id
+        roadmap_project_id = f"RM-ONB-{datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(2).upper()}"
+
+        # Find an available row number (simple: use next available between 1-20)
+        cursor = conn.execute("SELECT row_number FROM roadmap_projects ORDER BY row_number")
+        used_rows = {row['row_number'] for row in cursor.fetchall()}
+        available_row = 1
+        for r in range(1, 21):
+            if r not in used_rows:
+                available_row = r
+                break
+
+        conn.execute("""
+            INSERT INTO roadmap_projects (
+                project_id, name, full_name, program_prefix, project_type,
+                start_date, end_date, status, row_number,
+                onboarding_project_id
+            ) VALUES (?, ?, ?, ?, 'onboarding', ?, ?, 'planned', ?, ?)
+        """, (
+            roadmap_project_id,
+            clinic_name[:30],  # Short name
+            f"{program_prefix} {clinic_name} Onboarding",  # Full name
+            program_prefix,
+            roadmap_start_date,
+            roadmap_end_date,
+            available_row,
+            project_id
+        ))
+
         conn.commit()
 
         # Build response
@@ -12319,10 +12353,16 @@ MILESTONE TIMELINE:
             result += f"  {m_dict['sequence_order'] if 'sequence_order' in m_dict else '•'}. {m_dict['milestone_name']:<30} Target: {m_dict['target_date']}\n"
 
         result += f"""
+ROADMAP:
+  📊 Roadmap Project: {roadmap_project_id}
+  📅 Timeline: {roadmap_start_date} → {roadmap_end_date}
+  📍 Row: {available_row}
+
 Next Steps:
   • get_onboarding_project("{project_id}") - View full project details
   • update_milestone("{project_id}", "QUESTIONNAIRE", "COMPLETE") - Mark questionnaire received
   • add_onboarding_dependency("{project_id}", "EPIC_EXTRACT", "Build ticket #12345") - Add dependency
+  • get_roadmap_project("{roadmap_project_id}") - View roadmap visualization entry
 """
         return result
 
@@ -15917,6 +15957,2363 @@ async def generate_requirements_dashboard(
     finally:
         if conn:
             conn.close()
+
+
+# ============================================================
+# ROADMAP TOOLS
+# ============================================================
+
+@mcp.tool()
+def create_roadmap_project(
+    name: str,
+    full_name: str,
+    project_type: str,
+    start_date: str,
+    end_date: str,
+    row_number: int,
+    program_prefix: str = None,
+    status: str = "planned",
+    priority: int = None,
+    notes: str = None,
+    onboarding_project_id: str = None,
+    clinic_ids: str = None
+) -> str:
+    """
+    Create a new roadmap project for timeline visualization.
+
+    Args:
+        name: Short display name (e.g., "Portland Clinic")
+        full_name: Full project name (e.g., "P4M Portland Clinic Onboarding")
+        project_type: Type of project - one of: onboarding, integration, feature, migration, nccn, maintenance, program_launch
+        start_date: Project start date (YYYY-MM-DD)
+        end_date: Project end date (YYYY-MM-DD)
+        row_number: Row position on roadmap (1-20)
+        program_prefix: Optional program prefix (e.g., "P4M", "PXME")
+        status: Project status - planned, in_progress, completed, on_hold, at_risk (default: planned)
+        priority: Priority level 1-4 (1=highest)
+        notes: Optional project notes
+        onboarding_project_id: Link to onboarding project if applicable
+        clinic_ids: Comma-separated list of clinic IDs to associate
+
+    Returns:
+        Confirmation with project_id and details
+
+    Example:
+        create_roadmap_project(
+            name="Portland Clinic",
+            full_name="P4M Portland Clinic Onboarding",
+            project_type="onboarding",
+            start_date="2025-09-01",
+            end_date="2025-11-15",
+            row_number=3,
+            program_prefix="P4M"
+        )
+    """
+    import sqlite3
+    import secrets
+
+    logger.info(f"create_roadmap_project() called - name={name}, type={project_type}")
+
+    # Validate project_type
+    valid_types = ['onboarding', 'integration', 'feature', 'migration', 'nccn', 'maintenance', 'program_launch']
+    if project_type not in valid_types:
+        return f"Error: Invalid project_type '{project_type}'. Must be one of: {', '.join(valid_types)}"
+
+    # Validate status
+    valid_statuses = ['planned', 'in_progress', 'completed', 'on_hold', 'at_risk']
+    if status not in valid_statuses:
+        return f"Error: Invalid status '{status}'. Must be one of: {', '.join(valid_statuses)}"
+
+    # Validate row_number
+    if row_number < 1 or row_number > 20:
+        return f"Error: row_number must be between 1 and 20, got {row_number}"
+
+    # Validate priority
+    if priority is not None and (priority < 1 or priority > 4):
+        return f"Error: priority must be between 1 and 4, got {priority}"
+
+    # Parse dates
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+        if end_dt < start_dt:
+            return f"Error: end_date ({end_date}) cannot be before start_date ({start_date})"
+    except ValueError as e:
+        return f"Error: Invalid date format. Use YYYY-MM-DD. Details: {e}"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Validate program_prefix if provided
+        if program_prefix:
+            cursor = conn.execute("SELECT prefix FROM programs WHERE prefix = ?", (program_prefix,))
+            if not cursor.fetchone():
+                return f"Error: Program prefix '{program_prefix}' not found"
+
+        # Generate project_id: RM-{TYPE[:3].upper()}-{YYYYMMDD}-{4 random hex}
+        type_code = project_type[:3].upper()
+        date_code = datetime.now().strftime("%Y%m%d")
+        hex_suffix = secrets.token_hex(2).upper()
+        project_id = f"RM-{type_code}-{date_code}-{hex_suffix}"
+
+        # Insert project
+        conn.execute("""
+            INSERT INTO roadmap_projects (
+                project_id, name, full_name, program_prefix, project_type,
+                start_date, end_date, status, priority, row_number,
+                notes, onboarding_project_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            project_id, name, full_name, program_prefix, project_type,
+            start_date, end_date, status, priority, row_number,
+            notes, onboarding_project_id
+        ))
+
+        # Handle clinic associations
+        clinics_added = 0
+        if clinic_ids:
+            for clinic_id in clinic_ids.split(','):
+                clinic_id = clinic_id.strip()
+                if clinic_id:
+                    # Verify clinic exists
+                    cursor = conn.execute("SELECT clinic_id FROM clinics WHERE clinic_id = ?", (clinic_id,))
+                    if cursor.fetchone():
+                        conn.execute(
+                            "INSERT INTO roadmap_project_clinics (project_id, clinic_id) VALUES (?, ?)",
+                            (project_id, clinic_id)
+                        )
+                        clinics_added += 1
+
+        conn.commit()
+
+        result = f"""## Roadmap Project Created
+
+**Project ID:** {project_id}
+**Name:** {name}
+**Full Name:** {full_name}
+**Type:** {project_type}
+**Program:** {program_prefix or 'N/A'}
+**Timeline:** {start_date} → {end_date}
+**Row:** {row_number}
+**Status:** {status}
+**Priority:** {priority or 'Not set'}
+"""
+        if clinics_added > 0:
+            result += f"**Clinics Linked:** {clinics_added}\n"
+        if notes:
+            result += f"**Notes:** {notes}\n"
+
+        result += "\n### Next Steps\n"
+        result += f"- `get_roadmap_project(project_id=\"{project_id}\")` - View details\n"
+        result += f"- `add_roadmap_dependency(blocked_project_id=\"{project_id}\", blocking_project_id=\"...\")` - Add dependency\n"
+        result += "- `generate_roadmap_html()` - Regenerate roadmap visualization\n"
+
+        return result
+
+    except sqlite3.IntegrityError as e:
+        return f"Database integrity error: {str(e)}"
+    except sqlite3.Error as e:
+        logger.error(f"create_roadmap_project() database error: {e}")
+        return f"Database error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def update_roadmap_project(
+    project_id: str,
+    name: str = None,
+    full_name: str = None,
+    program_prefix: str = None,
+    project_type: str = None,
+    start_date: str = None,
+    end_date: str = None,
+    status: str = None,
+    priority: int = None,
+    row_number: int = None,
+    notes: str = None
+) -> str:
+    """
+    Update an existing roadmap project (sparse update - only provided fields).
+
+    Args:
+        project_id: The project ID to update (required)
+        name: New short display name
+        full_name: New full project name
+        program_prefix: New program prefix
+        project_type: New project type
+        start_date: New start date (YYYY-MM-DD)
+        end_date: New end date (YYYY-MM-DD)
+        status: New status (planned, in_progress, completed, on_hold, at_risk)
+        priority: New priority (1-4)
+        row_number: New row position (1-20)
+        notes: New notes
+
+    Returns:
+        Confirmation with updated fields
+    """
+    import sqlite3
+
+    logger.info(f"update_roadmap_project() called - project_id={project_id}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Check project exists
+        cursor = conn.execute("SELECT * FROM roadmap_projects WHERE project_id = ?", (project_id,))
+        project = cursor.fetchone()
+        if not project:
+            return f"Error: Project not found with ID '{project_id}'"
+
+        # Build update
+        updates = []
+        params = []
+
+        if name is not None:
+            updates.append("name = ?")
+            params.append(name)
+        if full_name is not None:
+            updates.append("full_name = ?")
+            params.append(full_name)
+        if program_prefix is not None:
+            # Validate program exists
+            cursor = conn.execute("SELECT prefix FROM programs WHERE prefix = ?", (program_prefix,))
+            if not cursor.fetchone():
+                return f"Error: Program prefix '{program_prefix}' not found"
+            updates.append("program_prefix = ?")
+            params.append(program_prefix)
+        if project_type is not None:
+            valid_types = ['onboarding', 'integration', 'feature', 'migration', 'nccn', 'maintenance', 'program_launch']
+            if project_type not in valid_types:
+                return f"Error: Invalid project_type. Must be one of: {', '.join(valid_types)}"
+            updates.append("project_type = ?")
+            params.append(project_type)
+        if start_date is not None:
+            try:
+                datetime.strptime(start_date, "%Y-%m-%d")
+            except ValueError:
+                return "Error: Invalid start_date format. Use YYYY-MM-DD"
+            updates.append("start_date = ?")
+            params.append(start_date)
+        if end_date is not None:
+            try:
+                datetime.strptime(end_date, "%Y-%m-%d")
+            except ValueError:
+                return "Error: Invalid end_date format. Use YYYY-MM-DD"
+            updates.append("end_date = ?")
+            params.append(end_date)
+        if status is not None:
+            valid_statuses = ['planned', 'in_progress', 'completed', 'on_hold', 'at_risk']
+            if status not in valid_statuses:
+                return f"Error: Invalid status. Must be one of: {', '.join(valid_statuses)}"
+            updates.append("status = ?")
+            params.append(status)
+        if priority is not None:
+            if priority < 1 or priority > 4:
+                return "Error: priority must be between 1 and 4"
+            updates.append("priority = ?")
+            params.append(priority)
+        if row_number is not None:
+            if row_number < 1 or row_number > 20:
+                return "Error: row_number must be between 1 and 20"
+            updates.append("row_number = ?")
+            params.append(row_number)
+        if notes is not None:
+            updates.append("notes = ?")
+            params.append(notes)
+
+        if not updates:
+            return "No fields provided to update."
+
+        # Always update updated_at
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+
+        # Execute update
+        params.append(project_id)
+        sql = f"UPDATE roadmap_projects SET {', '.join(updates)} WHERE project_id = ?"
+        conn.execute(sql, params)
+        conn.commit()
+
+        # Fetch updated project
+        cursor = conn.execute("SELECT * FROM roadmap_projects WHERE project_id = ?", (project_id,))
+        updated = cursor.fetchone()
+
+        return f"""## Roadmap Project Updated
+
+**Project ID:** {project_id}
+**Name:** {updated['name']}
+**Full Name:** {updated['full_name']}
+**Type:** {updated['project_type']}
+**Program:** {updated['program_prefix'] or 'N/A'}
+**Timeline:** {updated['start_date']} → {updated['end_date']}
+**Row:** {updated['row_number']}
+**Status:** {updated['status']}
+**Priority:** {updated['priority'] or 'Not set'}
+**Updated:** {updated['updated_at']}
+
+Fields updated: {len(updates) - 1}
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"update_roadmap_project() database error: {e}")
+        return f"Database error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def list_roadmap_projects(
+    program_prefix: str = None,
+    project_type: str = None,
+    status: str = None,
+    start_after: str = None,
+    end_before: str = None
+) -> str:
+    """
+    List roadmap projects with optional filters.
+
+    Args:
+        program_prefix: Filter by program (e.g., "P4M", "PXME")
+        project_type: Filter by type (onboarding, integration, feature, etc.)
+        status: Filter by status (planned, in_progress, completed, on_hold, at_risk)
+        start_after: Only show projects starting after this date (YYYY-MM-DD)
+        end_before: Only show projects ending before this date (YYYY-MM-DD)
+
+    Returns:
+        Formatted list of projects with key details
+    """
+    import sqlite3
+
+    logger.info(f"list_roadmap_projects() called - program={program_prefix}, type={project_type}, status={status}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Build query with filters
+        sql = """
+            SELECT
+                rp.*,
+                p.name as program_name,
+                p.color_hex,
+                (SELECT COUNT(*) FROM roadmap_project_clinics WHERE project_id = rp.project_id) as clinic_count,
+                (SELECT COUNT(*) FROM roadmap_dependencies WHERE blocked_project_id = rp.project_id) as blocked_by_count,
+                (SELECT COUNT(*) FROM roadmap_dependencies WHERE blocking_project_id = rp.project_id) as blocks_count
+            FROM roadmap_projects rp
+            LEFT JOIN programs p ON rp.program_prefix = p.prefix
+            WHERE 1=1
+        """
+        params = []
+
+        if program_prefix:
+            sql += " AND rp.program_prefix = ?"
+            params.append(program_prefix)
+        if project_type:
+            sql += " AND rp.project_type = ?"
+            params.append(project_type)
+        if status:
+            sql += " AND rp.status = ?"
+            params.append(status)
+        if start_after:
+            sql += " AND rp.start_date >= ?"
+            params.append(start_after)
+        if end_before:
+            sql += " AND rp.end_date <= ?"
+            params.append(end_before)
+
+        sql += " ORDER BY rp.row_number, rp.start_date"
+
+        cursor = conn.execute(sql, params)
+        projects = cursor.fetchall()
+
+        if not projects:
+            return "No roadmap projects found matching the filters."
+
+        # Format output
+        result = f"## Roadmap Projects ({len(projects)} found)\n\n"
+
+        # Group by status for summary
+        status_counts = {}
+        for p in projects:
+            status_counts[p['status']] = status_counts.get(p['status'], 0) + 1
+
+        result += "**Status Summary:** "
+        result += " | ".join([f"{s}: {c}" for s, c in sorted(status_counts.items())])
+        result += "\n\n"
+
+        result += "| Row | Project ID | Name | Type | Program | Timeline | Status | Deps |\n"
+        result += "|-----|------------|------|------|---------|----------|--------|------|\n"
+
+        for p in projects:
+            deps = ""
+            if p['blocked_by_count'] > 0:
+                deps += f"←{p['blocked_by_count']}"
+            if p['blocks_count'] > 0:
+                deps += f"→{p['blocks_count']}"
+
+            result += f"| {p['row_number']} | {p['project_id']} | {p['name']} | {p['project_type']} | {p['program_prefix'] or '-'} | {p['start_date']} → {p['end_date']} | {p['status']} | {deps or '-'} |\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"list_roadmap_projects() database error: {e}")
+        return f"Database error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def get_roadmap_project(project_id: str) -> str:
+    """
+    Get detailed information about a specific roadmap project.
+
+    Args:
+        project_id: The project ID to retrieve
+
+    Returns:
+        Detailed project information including clinics and dependencies
+    """
+    import sqlite3
+
+    logger.info(f"get_roadmap_project() called - project_id={project_id}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get project
+        cursor = conn.execute("""
+            SELECT
+                rp.*,
+                p.name as program_name,
+                p.color_hex
+            FROM roadmap_projects rp
+            LEFT JOIN programs p ON rp.program_prefix = p.prefix
+            WHERE rp.project_id = ?
+        """, (project_id,))
+        project = cursor.fetchone()
+
+        if not project:
+            return f"Error: Project not found with ID '{project_id}'"
+
+        # Get linked clinics
+        cursor = conn.execute("""
+            SELECT c.clinic_id, c.name
+            FROM roadmap_project_clinics rpc
+            JOIN clinics c ON rpc.clinic_id = c.clinic_id
+            WHERE rpc.project_id = ?
+        """, (project_id,))
+        clinics = cursor.fetchall()
+
+        # Get dependencies (this project is blocked by)
+        cursor = conn.execute("""
+            SELECT
+                rd.dependency_id, rd.dependency_color, rd.is_key_dependency, rd.notes,
+                rp.project_id, rp.name, rp.status
+            FROM roadmap_dependencies rd
+            JOIN roadmap_projects rp ON rd.blocking_project_id = rp.project_id
+            WHERE rd.blocked_project_id = ?
+        """, (project_id,))
+        blocked_by = cursor.fetchall()
+
+        # Get dependencies (this project blocks)
+        cursor = conn.execute("""
+            SELECT
+                rd.dependency_id, rd.dependency_color, rd.is_key_dependency, rd.notes,
+                rp.project_id, rp.name, rp.status
+            FROM roadmap_dependencies rd
+            JOIN roadmap_projects rp ON rd.blocked_project_id = rp.project_id
+            WHERE rd.blocking_project_id = ?
+        """, (project_id,))
+        blocks = cursor.fetchall()
+
+        # Build output
+        result = f"""## Roadmap Project: {project['name']}
+
+**Project ID:** {project['project_id']}
+**Full Name:** {project['full_name']}
+**Type:** {project['project_type']}
+**Program:** {project['program_prefix'] or 'N/A'} ({project['program_name'] or 'N/A'})
+**Color:** {project['color_hex'] or '#6B7280'}
+
+### Timeline
+- **Start:** {project['start_date']}
+- **End:** {project['end_date']}
+- **Row:** {project['row_number']}
+
+### Status
+- **Status:** {project['status']}
+- **Priority:** {project['priority'] or 'Not set'}
+
+"""
+
+        if project['notes']:
+            result += f"### Notes\n{project['notes']}\n\n"
+
+        if clinics:
+            result += "### Linked Clinics\n"
+            for c in clinics:
+                result += f"- {c['name']} (`{c['clinic_id']}`)\n"
+            result += "\n"
+
+        if blocked_by:
+            result += "### Blocked By (Dependencies)\n"
+            for d in blocked_by:
+                key = "🔑" if d['is_key_dependency'] else ""
+                color = f"[{d['dependency_color']}]" if d['dependency_color'] else ""
+                result += f"- {key}{d['name']} (`{d['project_id']}`) - {d['status']} {color}\n"
+            result += "\n"
+
+        if blocks:
+            result += "### Blocks (Dependents)\n"
+            for d in blocks:
+                key = "🔑" if d['is_key_dependency'] else ""
+                color = f"[{d['dependency_color']}]" if d['dependency_color'] else ""
+                result += f"- {key}{d['name']} (`{d['project_id']}`) - {d['status']} {color}\n"
+            result += "\n"
+
+        if project['onboarding_project_id']:
+            result += f"### Linked Onboarding\n- Onboarding Project: `{project['onboarding_project_id']}`\n\n"
+
+        result += f"### Metadata\n- Created: {project['created_at']}\n- Updated: {project['updated_at']}\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"get_roadmap_project() database error: {e}")
+        return f"Database error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def delete_roadmap_project(project_id: str, reason: str) -> str:
+    """
+    Delete a roadmap project with audit trail.
+
+    Args:
+        project_id: The project ID to delete
+        reason: Reason for deletion (required for audit)
+
+    Returns:
+        Confirmation of deletion with details
+    """
+    import sqlite3
+
+    logger.info(f"delete_roadmap_project() called - project_id={project_id}, reason={reason}")
+
+    if not reason or len(reason.strip()) < 5:
+        return "Error: A reason for deletion is required (minimum 5 characters)"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get project details for audit
+        cursor = conn.execute("SELECT * FROM roadmap_projects WHERE project_id = ?", (project_id,))
+        project = cursor.fetchone()
+
+        if not project:
+            return f"Error: Project not found with ID '{project_id}'"
+
+        # Count related records
+        cursor = conn.execute("SELECT COUNT(*) as cnt FROM roadmap_project_clinics WHERE project_id = ?", (project_id,))
+        clinic_count = cursor.fetchone()['cnt']
+
+        cursor = conn.execute("SELECT COUNT(*) as cnt FROM roadmap_dependencies WHERE blocked_project_id = ? OR blocking_project_id = ?", (project_id, project_id))
+        dep_count = cursor.fetchone()['cnt']
+
+        # Log to audit_history
+        conn.execute("""
+            INSERT INTO audit_history (
+                table_name, record_id, action, old_values, changed_by, change_reason
+            ) VALUES (?, ?, 'DELETE', ?, 'MCP:delete_roadmap_project', ?)
+        """, (
+            'roadmap_projects',
+            project_id,
+            json.dumps(dict(project)),
+            reason
+        ))
+
+        # Delete (cascades to clinics and dependencies due to foreign key)
+        conn.execute("DELETE FROM roadmap_project_clinics WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM roadmap_dependencies WHERE blocked_project_id = ? OR blocking_project_id = ?", (project_id, project_id))
+        conn.execute("DELETE FROM roadmap_projects WHERE project_id = ?", (project_id,))
+
+        conn.commit()
+
+        return f"""## Roadmap Project Deleted
+
+**Project ID:** {project_id}
+**Name:** {project['name']}
+**Type:** {project['project_type']}
+**Reason:** {reason}
+
+**Cascaded Deletions:**
+- Clinic associations: {clinic_count}
+- Dependencies: {dep_count}
+
+Deletion logged to audit_history for compliance.
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"delete_roadmap_project() database error: {e}")
+        return f"Database error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def add_roadmap_dependency(
+    blocked_project_id: str,
+    blocking_project_id: str,
+    dependency_color: str = None,
+    is_key_dependency: bool = False,
+    notes: str = None
+) -> str:
+    """
+    Add a dependency between two roadmap projects.
+
+    The blocking_project must complete before the blocked_project can proceed.
+
+    Args:
+        blocked_project_id: The project that is blocked/waiting
+        blocking_project_id: The project that must complete first
+        dependency_color: Visual color for the dependency line (blue, green, purple, orange)
+        is_key_dependency: Whether this is a critical/key dependency
+        notes: Optional notes about the dependency
+
+    Returns:
+        Confirmation with dependency details
+
+    Example:
+        add_roadmap_dependency(
+            blocked_project_id="RM-ONB-20250901-A1B2",
+            blocking_project_id="RM-INT-20250801-C3D4",
+            dependency_color="blue",
+            is_key_dependency=True,
+            notes="Integration must complete before onboarding"
+        )
+    """
+    import sqlite3
+
+    logger.info(f"add_roadmap_dependency() called - {blocking_project_id} blocks {blocked_project_id}")
+
+    if blocked_project_id == blocking_project_id:
+        return "Error: A project cannot depend on itself"
+
+    # Validate color
+    valid_colors = ['blue', 'green', 'purple', 'orange', None]
+    if dependency_color and dependency_color not in valid_colors:
+        return f"Error: Invalid color. Must be one of: blue, green, purple, orange"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Validate both projects exist
+        cursor = conn.execute("SELECT project_id, name FROM roadmap_projects WHERE project_id = ?", (blocked_project_id,))
+        blocked = cursor.fetchone()
+        if not blocked:
+            return f"Error: Blocked project not found: '{blocked_project_id}'"
+
+        cursor = conn.execute("SELECT project_id, name FROM roadmap_projects WHERE project_id = ?", (blocking_project_id,))
+        blocking = cursor.fetchone()
+        if not blocking:
+            return f"Error: Blocking project not found: '{blocking_project_id}'"
+
+        # Check for existing dependency
+        cursor = conn.execute("""
+            SELECT dependency_id FROM roadmap_dependencies
+            WHERE blocked_project_id = ? AND blocking_project_id = ?
+        """, (blocked_project_id, blocking_project_id))
+        if cursor.fetchone():
+            return f"Error: This dependency already exists"
+
+        # Check for circular dependency (simple check - blocking project is already blocked by this project)
+        cursor = conn.execute("""
+            SELECT dependency_id FROM roadmap_dependencies
+            WHERE blocked_project_id = ? AND blocking_project_id = ?
+        """, (blocking_project_id, blocked_project_id))
+        if cursor.fetchone():
+            return f"Error: This would create a circular dependency. {blocking['name']} is already blocked by {blocked['name']}"
+
+        # Insert dependency
+        cursor = conn.execute("""
+            INSERT INTO roadmap_dependencies (
+                blocked_project_id, blocking_project_id, dependency_color, is_key_dependency, notes
+            ) VALUES (?, ?, ?, ?, ?)
+        """, (blocked_project_id, blocking_project_id, dependency_color, 1 if is_key_dependency else 0, notes))
+
+        dependency_id = cursor.lastrowid
+        conn.commit()
+
+        key_str = "🔑 KEY DEPENDENCY" if is_key_dependency else ""
+        color_str = f"({dependency_color})" if dependency_color else ""
+
+        return f"""## Dependency Added {key_str}
+
+**Dependency ID:** {dependency_id}
+
+**Relationship:**
+`{blocking['name']}` → blocks → `{blocked['name']}`
+
+- Blocking: {blocking_project_id}
+- Blocked: {blocked_project_id}
+- Color: {dependency_color or 'default'} {color_str}
+
+{f"**Notes:** {notes}" if notes else ""}
+
+The roadmap will show this dependency as a connector line between the projects.
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"add_roadmap_dependency() database error: {e}")
+        return f"Database error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def remove_roadmap_dependency(
+    dependency_id: int = None,
+    blocked_project_id: str = None,
+    blocking_project_id: str = None
+) -> str:
+    """
+    Remove a roadmap dependency.
+
+    Can remove by dependency_id OR by the blocked+blocking project pair.
+
+    Args:
+        dependency_id: The dependency ID to remove
+        blocked_project_id: The blocked project ID (use with blocking_project_id)
+        blocking_project_id: The blocking project ID (use with blocked_project_id)
+
+    Returns:
+        Confirmation of removal
+    """
+    import sqlite3
+
+    logger.info(f"remove_roadmap_dependency() called - id={dependency_id}, blocked={blocked_project_id}, blocking={blocking_project_id}")
+
+    if dependency_id is None and (blocked_project_id is None or blocking_project_id is None):
+        return "Error: Provide either dependency_id OR both blocked_project_id and blocking_project_id"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Find the dependency
+        if dependency_id is not None:
+            cursor = conn.execute("SELECT * FROM roadmap_dependencies WHERE dependency_id = ?", (dependency_id,))
+        else:
+            cursor = conn.execute("""
+                SELECT * FROM roadmap_dependencies
+                WHERE blocked_project_id = ? AND blocking_project_id = ?
+            """, (blocked_project_id, blocking_project_id))
+
+        dep = cursor.fetchone()
+        if not dep:
+            return "Error: Dependency not found"
+
+        # Get project names for confirmation
+        cursor = conn.execute("SELECT name FROM roadmap_projects WHERE project_id = ?", (dep['blocked_project_id'],))
+        blocked_name = cursor.fetchone()['name']
+
+        cursor = conn.execute("SELECT name FROM roadmap_projects WHERE project_id = ?", (dep['blocking_project_id'],))
+        blocking_name = cursor.fetchone()['name']
+
+        # Delete
+        conn.execute("DELETE FROM roadmap_dependencies WHERE dependency_id = ?", (dep['dependency_id'],))
+        conn.commit()
+
+        return f"""## Dependency Removed
+
+**Dependency ID:** {dep['dependency_id']}
+**Was:** `{blocking_name}` → blocked → `{blocked_name}`
+
+The dependency has been removed from the roadmap.
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"remove_roadmap_dependency() database error: {e}")
+        return f"Database error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def list_roadmap_dependencies(project_id: str = None) -> str:
+    """
+    List roadmap dependencies, optionally filtered by project.
+
+    Args:
+        project_id: Optional - show only dependencies involving this project
+
+    Returns:
+        Formatted list of dependencies showing both directions
+    """
+    import sqlite3
+
+    logger.info(f"list_roadmap_dependencies() called - project_id={project_id}")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        if project_id:
+            sql = """
+                SELECT
+                    rd.*,
+                    blocked.name as blocked_name, blocked.status as blocked_status,
+                    blocking.name as blocking_name, blocking.status as blocking_status
+                FROM roadmap_dependencies rd
+                JOIN roadmap_projects blocked ON rd.blocked_project_id = blocked.project_id
+                JOIN roadmap_projects blocking ON rd.blocking_project_id = blocking.project_id
+                WHERE rd.blocked_project_id = ? OR rd.blocking_project_id = ?
+                ORDER BY rd.created_at DESC
+            """
+            cursor = conn.execute(sql, (project_id, project_id))
+        else:
+            sql = """
+                SELECT
+                    rd.*,
+                    blocked.name as blocked_name, blocked.status as blocked_status,
+                    blocking.name as blocking_name, blocking.status as blocking_status
+                FROM roadmap_dependencies rd
+                JOIN roadmap_projects blocked ON rd.blocked_project_id = blocked.project_id
+                JOIN roadmap_projects blocking ON rd.blocking_project_id = blocking.project_id
+                ORDER BY rd.created_at DESC
+            """
+            cursor = conn.execute(sql)
+
+        deps = cursor.fetchall()
+
+        if not deps:
+            if project_id:
+                return f"No dependencies found involving project '{project_id}'"
+            return "No dependencies defined in the roadmap."
+
+        result = f"## Roadmap Dependencies ({len(deps)} found)\n\n"
+
+        if project_id:
+            result += f"Showing dependencies for: `{project_id}`\n\n"
+
+        result += "| ID | Blocking Project | → | Blocked Project | Color | Key? |\n"
+        result += "|----|------------------|---|-----------------|-------|------|\n"
+
+        for d in deps:
+            key = "🔑" if d['is_key_dependency'] else ""
+            color = d['dependency_color'] or "-"
+            result += f"| {d['dependency_id']} | {d['blocking_name']} ({d['blocking_status']}) | → | {d['blocked_name']} ({d['blocked_status']}) | {color} | {key} |\n"
+
+        return result
+
+    except sqlite3.Error as e:
+        logger.error(f"list_roadmap_dependencies() database error: {e}")
+        return f"Database error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def generate_roadmap_html(output_path: str = None) -> str:
+    """
+    Generate the roadmap HTML visualization from database data.
+
+    Queries all projects, dependencies, holidays, and config to build
+    an interactive HTML timeline using fixed-pixel positioning.
+
+    Args:
+        output_path: Output path for HTML file (default: ~/projects/propel-ops-roadmap/docs/index.html)
+
+    Returns:
+        Confirmation with project count and output path
+    """
+    import sqlite3
+    import os
+
+    logger.info("generate_roadmap_html() called")
+
+    if output_path is None:
+        output_path = os.path.expanduser("~/projects/propel-ops-roadmap/docs/index.html")
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+
+        # Get config
+        cursor = conn.execute("SELECT config_key, config_value FROM roadmap_config")
+        config = {row['config_key']: row['config_value'] for row in cursor.fetchall()}
+
+        timeline_start = config.get('timeline_start', '2025-08-01')
+        timeline_end = config.get('timeline_end', '2026-12-31')
+        month_width = int(config.get('month_width_px', '80'))
+
+        # Get projects with program colors
+        cursor = conn.execute("""
+            SELECT
+                rp.*,
+                COALESCE(p.color_hex, '#6B7280') as color_hex,
+                p.name as program_name
+            FROM roadmap_projects rp
+            LEFT JOIN programs p ON rp.program_prefix = p.prefix
+            ORDER BY rp.row_number, rp.start_date
+        """)
+        projects = cursor.fetchall()
+
+        # Get dependencies
+        cursor = conn.execute("SELECT * FROM roadmap_dependencies")
+        dependencies = cursor.fetchall()
+
+        # Get holidays
+        cursor = conn.execute("SELECT * FROM roadmap_holidays ORDER BY holiday_date")
+        holidays = cursor.fetchall()
+
+        # Calculate timeline months
+        start_dt = datetime.strptime(timeline_start, "%Y-%m-%d")
+        end_dt = datetime.strptime(timeline_end, "%Y-%m-%d")
+
+        months = []
+        current = start_dt.replace(day=1)
+        while current <= end_dt:
+            months.append(current)
+            # Move to next month
+            if current.month == 12:
+                current = current.replace(year=current.year + 1, month=1)
+            else:
+                current = current.replace(month=current.month + 1)
+
+        total_width = len(months) * month_width
+        row_height = 40
+        header_height = 60
+
+        # Build HTML
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Propel Operations Roadmap</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            overflow-x: auto;
+        }}
+        .roadmap-container {{
+            padding: 20px;
+            min-width: {total_width + 200}px;
+        }}
+        h1 {{
+            color: #fff;
+            margin-bottom: 10px;
+        }}
+        .subtitle {{
+            color: #888;
+            margin-bottom: 20px;
+        }}
+        .timeline-wrapper {{
+            position: relative;
+            margin-left: 150px;
+        }}
+        .month-header {{
+            display: flex;
+            height: {header_height}px;
+            border-bottom: 1px solid #333;
+        }}
+        .month {{
+            width: {month_width}px;
+            text-align: center;
+            border-right: 1px solid #333;
+            padding-top: 10px;
+        }}
+        .month-name {{ font-weight: bold; color: #fff; }}
+        .month-year {{ font-size: 11px; color: #666; }}
+        .rows-container {{
+            position: relative;
+        }}
+        .row {{
+            height: {row_height}px;
+            border-bottom: 1px solid #222;
+            position: relative;
+        }}
+        .row:nth-child(even) {{ background: rgba(255,255,255,0.02); }}
+        .project-bar {{
+            position: absolute;
+            height: 28px;
+            top: 6px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            padding: 0 8px;
+            font-size: 12px;
+            font-weight: 500;
+            color: #fff;
+            cursor: pointer;
+            transition: transform 0.1s, box-shadow 0.1s;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+        }}
+        .project-bar:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            z-index: 100;
+        }}
+        .project-bar.status-planned {{ opacity: 0.7; }}
+        .project-bar.status-on_hold {{
+            background-image: repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(0,0,0,0.1) 5px, rgba(0,0,0,0.1) 10px);
+        }}
+        .project-bar.status-at_risk {{ border: 2px solid #ef4444; }}
+        .project-bar.status-completed {{ opacity: 0.5; }}
+        .holiday-marker {{
+            position: absolute;
+            top: 0;
+            width: 2px;
+            background: rgba(255,255,255,0.3);
+            z-index: 5;
+        }}
+        .holiday-icon {{
+            position: absolute;
+            top: -25px;
+            transform: translateX(-50%);
+            font-size: 16px;
+        }}
+        .today-line {{
+            position: absolute;
+            top: 0;
+            width: 2px;
+            background: #ef4444;
+            z-index: 10;
+        }}
+        .legend {{
+            display: flex;
+            gap: 20px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }}
+        .legend-item {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+        }}
+        .legend-color {{
+            width: 20px;
+            height: 12px;
+            border-radius: 2px;
+        }}
+        .tooltip {{
+            display: none;
+            position: absolute;
+            background: #2a2a4a;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 12px;
+            z-index: 1000;
+            min-width: 200px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+        }}
+        .tooltip.active {{ display: block; }}
+        .tooltip h3 {{ margin-bottom: 8px; color: #fff; }}
+        .tooltip p {{ font-size: 12px; color: #aaa; margin: 4px 0; }}
+        .row-labels {{
+            position: absolute;
+            left: 0;
+            top: {header_height}px;
+            width: 140px;
+        }}
+        .row-label {{
+            height: {row_height}px;
+            display: flex;
+            align-items: center;
+            padding-right: 10px;
+            font-size: 11px;
+            color: #666;
+            justify-content: flex-end;
+        }}
+    </style>
+</head>
+<body>
+    <div class="roadmap-container">
+        <h1>🗺️ Propel Operations Roadmap</h1>
+        <p class="subtitle">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | {len(projects)} projects</p>
+
+        <div class="legend">
+"""
+
+        # Add legend for programs
+        program_colors = {}
+        for p in projects:
+            if p['program_prefix'] and p['program_prefix'] not in program_colors:
+                program_colors[p['program_prefix']] = p['color_hex']
+
+        for prefix, color in sorted(program_colors.items()):
+            html += f'            <div class="legend-item"><div class="legend-color" style="background:{color}"></div>{prefix}</div>\n'
+
+        html += """        </div>
+
+        <div style="position: relative;">
+            <div class="row-labels">
+"""
+
+        # Row labels
+        for i in range(1, 21):
+            html += f'                <div class="row-label">Row {i}</div>\n'
+
+        html += """            </div>
+            <div class="timeline-wrapper">
+                <div class="month-header">
+"""
+
+        # Month headers
+        for m in months:
+            html += f'                    <div class="month"><div class="month-name">{m.strftime("%b")}</div><div class="month-year">{m.strftime("%Y")}</div></div>\n'
+
+        html += """                </div>
+                <div class="rows-container">
+"""
+
+        # Create rows
+        for i in range(1, 21):
+            html += f'                    <div class="row" data-row="{i}"></div>\n'
+
+        html += """                </div>
+
+                <!-- Projects -->
+"""
+
+        # Helper function to calculate x position from date
+        def date_to_x(date_str):
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            # Days from start
+            days_from_start = (dt - start_dt).days
+            total_days = (end_dt - start_dt).days
+            return int((days_from_start / total_days) * total_width)
+
+        # Add project bars
+        for p in projects:
+            x_start = date_to_x(p['start_date'])
+            x_end = date_to_x(p['end_date'])
+            width = max(x_end - x_start, 40)  # Minimum width
+            top = header_height + (p['row_number'] - 1) * row_height + 6
+
+            status_class = f"status-{p['status']}"
+
+            html += f"""                <div class="project-bar {status_class}"
+                     style="left:{x_start}px; width:{width}px; top:{top}px; background:{p['color_hex']};"
+                     data-project="{p['project_id']}"
+                     title="{p['full_name']}">
+                    {p['name']}
+                </div>
+"""
+
+        # Add holiday markers
+        total_row_height = 20 * row_height
+        for h in holidays:
+            try:
+                x = date_to_x(h['holiday_date'])
+                if 0 <= x <= total_width:
+                    html += f"""                <div class="holiday-marker" style="left:{x}px; height:{total_row_height}px; top:{header_height}px;">
+                    <span class="holiday-icon">{h['icon']}</span>
+                </div>
+"""
+            except:
+                pass
+
+        # Add today line
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        try:
+            today_x = date_to_x(today_str)
+            if 0 <= today_x <= total_width:
+                html += f"""                <div class="today-line" style="left:{today_x}px; height:{total_row_height}px; top:{header_height}px;"></div>
+"""
+        except:
+            pass
+
+        html += """            </div>
+        </div>
+
+        <div class="tooltip" id="tooltip">
+            <h3 id="tooltip-title"></h3>
+            <p id="tooltip-type"></p>
+            <p id="tooltip-dates"></p>
+            <p id="tooltip-status"></p>
+        </div>
+    </div>
+
+    <script>
+        // Tooltip handling
+        document.querySelectorAll('.project-bar').forEach(bar => {
+            bar.addEventListener('mouseenter', (e) => {
+                const tooltip = document.getElementById('tooltip');
+                const title = bar.getAttribute('title');
+                const projectId = bar.dataset.project;
+
+                document.getElementById('tooltip-title').textContent = title;
+
+                tooltip.style.left = (e.pageX + 10) + 'px';
+                tooltip.style.top = (e.pageY + 10) + 'px';
+                tooltip.classList.add('active');
+            });
+
+            bar.addEventListener('mouseleave', () => {
+                document.getElementById('tooltip').classList.remove('active');
+            });
+        });
+    </script>
+</body>
+</html>
+"""
+
+        # Write HTML
+        with open(output_path, 'w') as f:
+            f.write(html)
+
+        return f"""## Roadmap HTML Generated
+
+**Output:** {output_path}
+**Projects:** {len(projects)}
+**Dependencies:** {len(dependencies)}
+**Holidays:** {len(holidays)}
+**Timeline:** {timeline_start} → {timeline_end}
+
+### Summary by Status
+"""  + "\n".join([f"- {status}: {sum(1 for p in projects if p['status'] == status)}"
+                 for status in ['planned', 'in_progress', 'completed', 'on_hold', 'at_risk']
+                 if any(p['status'] == status for p in projects)]) + f"""
+
+### Next Steps
+- Open in browser: `file://{output_path}`
+- Push to GitHub: `push_roadmap_to_github()`
+"""
+
+    except sqlite3.Error as e:
+        logger.error(f"generate_roadmap_html() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"generate_roadmap_html() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def push_roadmap_to_github(commit_message: str = None) -> str:
+    """
+    Push the roadmap HTML to GitHub Pages.
+
+    Args:
+        commit_message: Optional custom commit message
+
+    Returns:
+        Confirmation of push with URL
+    """
+    import subprocess
+    import os
+
+    logger.info("push_roadmap_to_github() called")
+
+    repo_path = os.path.expanduser("~/projects/propel-ops-roadmap")
+
+    if not os.path.exists(repo_path):
+        return f"Error: Repository not found at {repo_path}. Run setup first."
+
+    if not os.path.exists(os.path.join(repo_path, ".git")):
+        return f"Error: {repo_path} is not a git repository. Initialize git first."
+
+    original_dir = os.getcwd()
+
+    try:
+        os.chdir(repo_path)
+
+        # Check for changes
+        status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+        if not status.stdout.strip():
+            return "No changes to push. Run `generate_roadmap_html()` first to generate updates."
+
+        # Git add
+        subprocess.run(["git", "add", "docs/"], check=True, capture_output=True)
+
+        # Commit
+        if commit_message is None:
+            commit_message = f"Update roadmap - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+        commit_result = subprocess.run(
+            ["git", "commit", "-m", commit_message],
+            capture_output=True,
+            text=True
+        )
+
+        if "nothing to commit" in commit_result.stdout or "nothing to commit" in commit_result.stderr:
+            return "No changes to commit."
+
+        # Push
+        push_result = subprocess.run(
+            ["git", "push"],
+            capture_output=True,
+            text=True
+        )
+
+        if push_result.returncode != 0:
+            return f"Push failed: {push_result.stderr}"
+
+        return f"""## Roadmap Pushed to GitHub
+
+**Commit:** {commit_message}
+**Repository:** {repo_path}
+
+The roadmap should be available at your GitHub Pages URL shortly.
+"""
+
+    except subprocess.CalledProcessError as e:
+        return f"Git error: {e}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+    finally:
+        os.chdir(original_dir)
+
+
+# ============================================================
+# AUDIT TRAIL TOOLS
+# ============================================================
+
+@mcp.tool()
+def get_audit_trail(
+    record_type: str,
+    record_id: str = None,
+    start_date: str = None,
+    end_date: str = None,
+    action: str = None,
+    limit: int = 50
+) -> str:
+    """
+    View audit history for records (FDA 21 CFR Part 11 compliance).
+
+    Args:
+        record_type: Type of record ('story', 'test_case', 'user', 'access', 'config', 'client', 'program')
+        record_id: Optional specific record ID to filter
+        start_date: Optional start date (YYYY-MM-DD)
+        end_date: Optional end date (YYYY-MM-DD)
+        action: Optional action filter ('Created', 'Updated', 'Deleted', 'Status Changed', 'Approved')
+        limit: Maximum records to return (default 50)
+
+    Returns:
+        Formatted audit trail with who, what, when, why
+    """
+    logger.info(f"get_audit_trail() called - record_type={record_type}, record_id={record_id}")
+
+    conn = None
+    try:
+        db_path = os.path.expanduser(os.environ.get("PROPEL_DB_PATH", "~/projects/data/client_product_database.db"))
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+
+        # Build query
+        query = """
+            SELECT
+                audit_id,
+                record_type,
+                record_id,
+                action,
+                field_changed,
+                old_value,
+                new_value,
+                changed_by,
+                changed_date,
+                change_reason
+            FROM audit_history
+            WHERE record_type = ?
+        """
+        params = [record_type]
+
+        if record_id:
+            query += " AND record_id = ?"
+            params.append(record_id)
+
+        if start_date:
+            query += " AND date(changed_date) >= ?"
+            params.append(start_date)
+
+        if end_date:
+            query += " AND date(changed_date) <= ?"
+            params.append(end_date)
+
+        if action:
+            query += " AND action = ?"
+            params.append(action)
+
+        query += " ORDER BY changed_date DESC LIMIT ?"
+        params.append(limit)
+
+        cursor = conn.execute(query, params)
+        rows = cursor.fetchall()
+
+        if not rows:
+            return f"No audit records found for record_type='{record_type}'" + (f", record_id='{record_id}'" if record_id else "")
+
+        # Format output
+        output = f"## Audit Trail: {record_type}\n\n"
+        output += f"**Records Found:** {len(rows)}\n\n"
+
+        output += "| Date | Action | Record ID | Field | Changed By | Reason |\n"
+        output += "|------|--------|-----------|-------|------------|--------|\n"
+
+        for row in rows:
+            date_str = row['changed_date'][:19] if row['changed_date'] else 'N/A'
+            action_str = row['action'] or 'N/A'
+            record_str = row['record_id'][:20] if row['record_id'] and len(row['record_id']) > 20 else (row['record_id'] or 'N/A')
+            field_str = row['field_changed'] or '-'
+            by_str = row['changed_by'] or 'system'
+            reason_str = (row['change_reason'][:30] + '...' if row['change_reason'] and len(row['change_reason']) > 30 else row['change_reason']) or '-'
+
+            output += f"| {date_str} | {action_str} | {record_str} | {field_str} | {by_str} | {reason_str} |\n"
+
+        # Show details for first few records
+        output += "\n### Recent Changes Detail\n\n"
+        for row in rows[:5]:
+            output += f"**{row['changed_date']}** - {row['action']} by {row['changed_by'] or 'system'}\n"
+            output += f"- Record: {row['record_id']}\n"
+            if row['field_changed']:
+                output += f"- Field: {row['field_changed']}\n"
+            if row['old_value']:
+                old_display = row['old_value'][:100] + '...' if len(row['old_value'] or '') > 100 else row['old_value']
+                output += f"- Old: {old_display}\n"
+            if row['new_value']:
+                new_display = row['new_value'][:100] + '...' if len(row['new_value'] or '') > 100 else row['new_value']
+                output += f"- New: {new_display}\n"
+            if row['change_reason']:
+                output += f"- Reason: {row['change_reason']}\n"
+            output += "\n"
+
+        return output
+
+    except sqlite3.Error as e:
+        logger.error(f"get_audit_trail() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"get_audit_trail() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def get_audit_report(
+    program_prefix: str = None,
+    start_date: str = None,
+    end_date: str = None,
+    include_types: str = None
+) -> str:
+    """
+    Generate audit summary report for compliance review.
+
+    Args:
+        program_prefix: Optional program prefix to filter (e.g., 'PROP', 'P4M')
+        start_date: Start date (YYYY-MM-DD), defaults to 30 days ago
+        end_date: End date (YYYY-MM-DD), defaults to today
+        include_types: Comma-separated record types to include (default: all)
+
+    Returns:
+        Summary report of audit activity by type and action
+    """
+    logger.info(f"get_audit_report() called - program={program_prefix}")
+
+    conn = None
+    try:
+        db_path = os.path.expanduser(os.environ.get("PROPEL_DB_PATH", "~/projects/data/client_product_database.db"))
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+
+        # Default date range: last 30 days
+        if not end_date:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        if not start_date:
+            start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+
+        # Summary by record type and action
+        query = """
+            SELECT
+                record_type,
+                action,
+                COUNT(*) as count,
+                COUNT(DISTINCT changed_by) as unique_users,
+                MIN(changed_date) as first_change,
+                MAX(changed_date) as last_change
+            FROM audit_history
+            WHERE date(changed_date) BETWEEN ? AND ?
+        """
+        params = [start_date, end_date]
+
+        if include_types:
+            types = [t.strip() for t in include_types.split(',')]
+            placeholders = ','.join(['?' for _ in types])
+            query += f" AND record_type IN ({placeholders})"
+            params.extend(types)
+
+        query += " GROUP BY record_type, action ORDER BY record_type, count DESC"
+
+        cursor = conn.execute(query, params)
+        rows = cursor.fetchall()
+
+        # Total count
+        total_query = """
+            SELECT COUNT(*) as total FROM audit_history
+            WHERE date(changed_date) BETWEEN ? AND ?
+        """
+        total_row = conn.execute(total_query, [start_date, end_date]).fetchone()
+        total_count = total_row['total'] if total_row else 0
+
+        # Format output
+        output = f"## Audit Report\n\n"
+        output += f"**Period:** {start_date} to {end_date}\n"
+        output += f"**Total Audit Records:** {total_count}\n\n"
+
+        if not rows:
+            output += "No audit activity in this period.\n"
+            return output
+
+        output += "### Activity by Record Type\n\n"
+        output += "| Record Type | Action | Count | Users | First | Last |\n"
+        output += "|-------------|--------|-------|-------|-------|------|\n"
+
+        current_type = None
+        for row in rows:
+            if row['record_type'] != current_type:
+                current_type = row['record_type']
+            output += f"| {row['record_type']} | {row['action']} | {row['count']} | {row['unique_users']} | {row['first_change'][:10]} | {row['last_change'][:10]} |\n"
+
+        # Most active users
+        user_query = """
+            SELECT changed_by, COUNT(*) as count
+            FROM audit_history
+            WHERE date(changed_date) BETWEEN ? AND ?
+            AND changed_by IS NOT NULL AND changed_by != 'system'
+            GROUP BY changed_by
+            ORDER BY count DESC
+            LIMIT 10
+        """
+        user_rows = conn.execute(user_query, [start_date, end_date]).fetchall()
+
+        if user_rows:
+            output += "\n### Most Active Users\n\n"
+            output += "| User | Changes |\n"
+            output += "|------|--------|\n"
+            for row in user_rows:
+                output += f"| {row['changed_by']} | {row['count']} |\n"
+
+        return output
+
+    except sqlite3.Error as e:
+        logger.error(f"get_audit_report() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"get_audit_report() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# COMPLIANCE TEST GENERATION TOOLS
+# ============================================================
+
+@mcp.tool()
+def generate_compliance_tests(
+    story_id: str,
+    framework: str,
+    save_to_db: bool = True
+) -> str:
+    """
+    Generate compliance-specific test cases from a user story.
+
+    Args:
+        story_id: The story ID to generate tests for (e.g., 'PROP-DASH-001')
+        framework: Compliance framework ('Part11', 'HIPAA', 'SOC2', or 'all')
+        save_to_db: Whether to save generated tests to database (default True)
+
+    Returns:
+        Generated test cases with compliance controls covered
+    """
+    logger.info(f"generate_compliance_tests() called - story={story_id}, framework={framework}")
+
+    conn = None
+    try:
+        db_path = os.path.expanduser(os.environ.get("PROPEL_DB_PATH", "~/projects/data/client_product_database.db"))
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+
+        # Get story details
+        story_query = """
+            SELECT s.*, p.prefix, p.name as program_name
+            FROM user_stories s
+            JOIN programs p ON s.program_id = p.program_id
+            WHERE s.story_id = ?
+        """
+        story_row = conn.execute(story_query, [story_id]).fetchone()
+
+        if not story_row:
+            return f"Story not found: {story_id}"
+
+        story = dict(story_row)
+
+        # Define compliance test templates per framework
+        frameworks_to_generate = []
+        if framework.lower() == 'all':
+            frameworks_to_generate = ['Part11', 'HIPAA', 'SOC2']
+        else:
+            frameworks_to_generate = [framework]
+
+        generated_tests = []
+        test_counter = 1
+
+        for fw in frameworks_to_generate:
+            templates = get_compliance_templates(fw, story)
+
+            for template in templates:
+                test_id = f"{story['prefix']}-{fw.upper()[:3]}-{test_counter:03d}"
+
+                test = {
+                    'test_id': test_id,
+                    'story_id': story_id,
+                    'program_id': story['program_id'],
+                    'title': f"[{fw}] {template['title']}",
+                    'category': fw,
+                    'test_type': 'compliance',
+                    'prerequisites': template.get('prerequisites', 'User has appropriate access'),
+                    'test_steps': template['steps'],
+                    'expected_results': template['expected'],
+                    'compliance_framework': fw,
+                    'control_id': template.get('control_id', ''),
+                    'is_compliance_test': True,
+                    'priority': 'High',
+                    'test_status': 'Not Run'
+                }
+
+                generated_tests.append(test)
+                test_counter += 1
+
+                if save_to_db:
+                    # Insert test case
+                    insert_query = """
+                        INSERT OR REPLACE INTO uat_test_cases (
+                            test_id, story_id, program_id, title, category, test_type,
+                            prerequisites, test_steps, expected_results, compliance_framework,
+                            control_id, is_compliance_test, priority, test_status,
+                            created_date, updated_date
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """
+                    conn.execute(insert_query, [
+                        test['test_id'], test['story_id'], test['program_id'],
+                        test['title'], test['category'], test['test_type'],
+                        test['prerequisites'], test['test_steps'], test['expected_results'],
+                        test['compliance_framework'], test['control_id'],
+                        1 if test['is_compliance_test'] else 0, test['priority'], test['test_status']
+                    ])
+
+        if save_to_db:
+            conn.commit()
+
+            # Log to audit trail
+            conn.execute("""
+                INSERT INTO audit_history (record_type, record_id, action, new_value, changed_by, change_reason)
+                VALUES ('test_case', ?, 'Created', ?, 'system', ?)
+            """, [story_id, json.dumps([t['test_id'] for t in generated_tests]), f"Generated compliance tests for {framework}"])
+            conn.commit()
+
+        # Format output
+        output = f"## Compliance Tests Generated\n\n"
+        output += f"**Story:** {story_id} - {story['title']}\n"
+        output += f"**Framework(s):** {', '.join(frameworks_to_generate)}\n"
+        output += f"**Tests Generated:** {len(generated_tests)}\n"
+        output += f"**Saved to DB:** {'Yes' if save_to_db else 'No'}\n\n"
+
+        for test in generated_tests:
+            output += f"### {test['test_id']}: {test['title']}\n"
+            output += f"- **Control:** {test['control_id']}\n"
+            output += f"- **Steps:** {test['test_steps'][:100]}...\n"
+            output += f"- **Expected:** {test['expected_results'][:100]}...\n\n"
+
+        return output
+
+    except sqlite3.Error as e:
+        logger.error(f"generate_compliance_tests() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"generate_compliance_tests() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_compliance_templates(framework: str, story: dict) -> list:
+    """
+    Get compliance test templates for a given framework.
+
+    This is a helper function that returns appropriate test templates
+    based on the framework and story characteristics.
+    """
+    templates = []
+
+    if framework == 'Part11':
+        # FDA 21 CFR Part 11 - Electronic Records
+        templates = [
+            {
+                'title': 'Verify audit trail captures all changes',
+                'control_id': '11.10(e)',
+                'steps': '1. Make a change to the record\\n2. Verify audit_history entry created\\n3. Check timestamp, user, old/new values captured',
+                'expected': 'Audit trail entry exists with: changed_by, changed_date, old_value, new_value, change_reason',
+                'prerequisites': 'User has edit permissions'
+            },
+            {
+                'title': 'Verify user authentication required',
+                'control_id': '11.10(d)',
+                'steps': '1. Attempt to access without authentication\\n2. Verify access denied\\n3. Authenticate and verify access granted',
+                'expected': 'Unauthenticated users cannot access or modify records',
+                'prerequisites': 'Test user accounts available'
+            },
+            {
+                'title': 'Verify electronic signature captures signer identity',
+                'control_id': '11.50',
+                'steps': '1. Approve/sign record\\n2. Verify signature includes user ID, date/time\\n3. Verify signature meaning indicated',
+                'expected': 'Electronic signature includes: unique user ID, timestamp, signature meaning (approved/reviewed)',
+                'prerequisites': 'User has approval permissions'
+            }
+        ]
+
+    elif framework == 'HIPAA':
+        # HIPAA Security Rule
+        templates = [
+            {
+                'title': 'Verify minimum necessary access controls',
+                'control_id': '164.502(b)',
+                'steps': '1. Review user role permissions\\n2. Verify user can only access data needed for role\\n3. Verify PHI access is logged',
+                'expected': 'Users can only access PHI required for their job function',
+                'prerequisites': 'Multiple user roles configured'
+            },
+            {
+                'title': 'Verify PHI access logging',
+                'control_id': '164.312(b)',
+                'steps': '1. Access a record containing PHI\\n2. Verify access is logged\\n3. Check log includes user, timestamp, record accessed',
+                'expected': 'All PHI access is logged with user identity and timestamp',
+                'prerequisites': 'Audit logging enabled'
+            },
+            {
+                'title': 'Verify user termination procedure',
+                'control_id': '164.308(a)(3)(ii)(C)',
+                'steps': '1. Terminate user account\\n2. Verify all access revoked immediately\\n3. Verify user cannot login\\n4. Check audit trail',
+                'expected': 'Terminated users have all access revoked and cannot authenticate',
+                'prerequisites': 'Test user account to terminate'
+            }
+        ]
+
+    elif framework == 'SOC2':
+        # SOC 2 Trust Services Criteria
+        templates = [
+            {
+                'title': 'Verify periodic access review process',
+                'control_id': 'CC6.2',
+                'steps': '1. Run access review report\\n2. Verify all users included\\n3. Verify review due dates tracked\\n4. Complete review certification',
+                'expected': 'Access reviews conducted quarterly with certification recorded',
+                'prerequisites': 'Access review process configured'
+            },
+            {
+                'title': 'Verify segregation of duties',
+                'control_id': 'CC5.1',
+                'steps': '1. Attempt to assign conflicting roles\\n2. Verify system blocks or warns\\n3. Check role_conflicts table enforced',
+                'expected': 'Conflicting role combinations (e.g., Admin+Auditor) are prevented or flagged',
+                'prerequisites': 'Role conflict rules configured'
+            },
+            {
+                'title': 'Verify change management logging',
+                'control_id': 'CC8.1',
+                'steps': '1. Make configuration change\\n2. Verify change logged with reason\\n3. Verify change can be traced to authorized request',
+                'expected': 'All configuration changes logged with who, what, when, why',
+                'prerequisites': 'Change management process active'
+            }
+        ]
+
+    return templates
+
+
+# ============================================================
+# FILE PARSING TOOLS
+# ============================================================
+
+@mcp.tool()
+def parse_requirements_file(
+    file_path: str,
+    program_prefix: str,
+    sheet_name: str = None,
+    save_to_db: bool = False
+) -> str:
+    """
+    Parse requirements from an Excel file and optionally save to database.
+
+    Args:
+        file_path: Path to the Excel file (supports .xlsx)
+        program_prefix: Program prefix for generated IDs (e.g., 'PROP', 'P4M')
+        sheet_name: Optional sheet name (default: first sheet)
+        save_to_db: Whether to save parsed requirements to database (default False)
+
+    Returns:
+        Summary of parsed requirements with any issues found
+    """
+    logger.info(f"parse_requirements_file() called - file={file_path}, prefix={program_prefix}")
+
+    try:
+        # Check if file exists
+        expanded_path = os.path.expanduser(file_path)
+        if not os.path.exists(expanded_path):
+            return f"File not found: {file_path}"
+
+        # Import openpyxl
+        from openpyxl import load_workbook
+
+        # Load workbook
+        wb = load_workbook(expanded_path, read_only=True, data_only=True)
+
+        if sheet_name and sheet_name not in wb.sheetnames:
+            return f"Sheet '{sheet_name}' not found. Available sheets: {', '.join(wb.sheetnames)}"
+
+        ws = wb[sheet_name] if sheet_name else wb.active
+
+        # Read headers from first row
+        headers = []
+        for cell in ws[1]:
+            headers.append(str(cell.value).lower().strip() if cell.value else '')
+
+        # Map common column names
+        column_mapping = {
+            'requirement': ['requirement', 'req', 'description', 'text', 'requirement text'],
+            'title': ['title', 'name', 'summary', 'feature'],
+            'priority': ['priority', 'importance', 'criticality'],
+            'type': ['type', 'category', 'requirement type'],
+            'source': ['source', 'origin', 'reference']
+        }
+
+        # Find column indices
+        col_indices = {}
+        for field, aliases in column_mapping.items():
+            for i, header in enumerate(headers):
+                if header in aliases:
+                    col_indices[field] = i
+                    break
+
+        # Parse rows
+        requirements = []
+        issues = []
+
+        for row_num, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            # Skip empty rows
+            if not any(row):
+                continue
+
+            req = {
+                'source_row': row_num,
+                'raw_text': '',
+                'title': '',
+                'priority': 'Medium',
+                'requirement_type': 'functional'
+            }
+
+            # Extract values based on mapping
+            if 'requirement' in col_indices and row[col_indices['requirement']]:
+                req['raw_text'] = str(row[col_indices['requirement']])
+            if 'title' in col_indices and row[col_indices['title']]:
+                req['title'] = str(row[col_indices['title']])
+            if 'priority' in col_indices and row[col_indices['priority']]:
+                req['priority'] = str(row[col_indices['priority']])
+            if 'type' in col_indices and row[col_indices['type']]:
+                req['requirement_type'] = str(row[col_indices['type']])
+
+            # Generate title from raw_text if missing
+            if not req['title'] and req['raw_text']:
+                req['title'] = req['raw_text'][:100] + ('...' if len(req['raw_text']) > 100 else '')
+
+            # Validate
+            if not req['raw_text'] and not req['title']:
+                issues.append(f"Row {row_num}: Empty requirement")
+                continue
+
+            requirements.append(req)
+
+        wb.close()
+
+        # Save to database if requested
+        if save_to_db and requirements:
+            conn = None
+            try:
+                db_path = os.path.expanduser(os.environ.get("PROPEL_DB_PATH", "~/projects/data/client_product_database.db"))
+                conn = sqlite3.connect(db_path)
+
+                # Get or create program
+                program_row = conn.execute("SELECT program_id FROM programs WHERE prefix = ?", [program_prefix]).fetchone()
+                if not program_row:
+                    return f"Program not found with prefix: {program_prefix}. Create it first."
+                program_id = program_row[0]
+
+                # Create import batch
+                batch_id = f"{program_prefix}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+                # Insert requirements
+                for i, req in enumerate(requirements, start=1):
+                    req_id = f"{program_prefix}-REQ-{i:03d}"
+                    conn.execute("""
+                        INSERT OR REPLACE INTO requirements (
+                            requirement_id, program_id, source_file, source_row,
+                            raw_text, title, priority, requirement_type, import_batch,
+                            created_date, updated_date
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """, [req_id, program_id, file_path, req['source_row'],
+                          req['raw_text'], req['title'], req['priority'],
+                          req['requirement_type'], batch_id])
+
+                conn.commit()
+
+            finally:
+                if conn:
+                    conn.close()
+
+        # Format output
+        output = f"## Requirements Parsed\n\n"
+        output += f"**File:** {file_path}\n"
+        output += f"**Sheet:** {ws.title}\n"
+        output += f"**Program:** {program_prefix}\n"
+        output += f"**Requirements Found:** {len(requirements)}\n"
+        output += f"**Saved to DB:** {'Yes' if save_to_db else 'No'}\n"
+
+        if issues:
+            output += f"\n### Issues ({len(issues)})\n"
+            for issue in issues[:10]:
+                output += f"- {issue}\n"
+            if len(issues) > 10:
+                output += f"- ... and {len(issues) - 10} more\n"
+
+        output += f"\n### Column Mapping\n"
+        for field, idx in col_indices.items():
+            output += f"- {field}: Column {idx + 1} ('{headers[idx]}')\n"
+
+        output += f"\n### Sample Requirements\n"
+        for req in requirements[:5]:
+            output += f"\n**Row {req['source_row']}:** {req['title'][:80]}\n"
+            output += f"- Priority: {req['priority']}\n"
+            output += f"- Type: {req['requirement_type']}\n"
+
+        if len(requirements) > 5:
+            output += f"\n... and {len(requirements) - 5} more requirements\n"
+
+        return output
+
+    except Exception as e:
+        logger.error(f"parse_requirements_file() error: {e}", exc_info=True)
+        return f"Error parsing file: {str(e)}"
+
+
+# ============================================================
+# TWO-PHASE WORKFLOW TOOLS
+# ============================================================
+
+@mcp.tool()
+def generate_draft_stories(
+    program_prefix: str,
+    source: str = 'requirements'
+) -> str:
+    """
+    Phase 1: Generate draft user stories from requirements for human review.
+
+    Args:
+        program_prefix: Program prefix (e.g., 'PROP', 'P4M')
+        source: Source of requirements ('requirements' table or 'file')
+
+    Returns:
+        Summary of generated draft stories ready for review
+    """
+    logger.info(f"generate_draft_stories() called - prefix={program_prefix}")
+
+    conn = None
+    try:
+        db_path = os.path.expanduser(os.environ.get("PROPEL_DB_PATH", "~/projects/data/client_product_database.db"))
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+
+        # Get program
+        program_row = conn.execute(
+            "SELECT program_id, name FROM programs WHERE prefix = ?",
+            [program_prefix]
+        ).fetchone()
+
+        if not program_row:
+            return f"Program not found with prefix: {program_prefix}"
+
+        program_id = program_row['program_id']
+        program_name = program_row['name']
+
+        # Get requirements without stories
+        req_query = """
+            SELECT r.*
+            FROM requirements r
+            LEFT JOIN user_stories s ON r.requirement_id = s.requirement_id
+            WHERE r.program_id = ?
+            AND s.story_id IS NULL
+            ORDER BY r.source_row
+        """
+        requirements = conn.execute(req_query, [program_id]).fetchall()
+
+        if not requirements:
+            # Check if there are any requirements at all
+            total = conn.execute(
+                "SELECT COUNT(*) FROM requirements WHERE program_id = ?",
+                [program_id]
+            ).fetchone()[0]
+
+            if total == 0:
+                return f"No requirements found for {program_prefix}. Import requirements first using parse_requirements_file()."
+            else:
+                return f"All {total} requirements already have stories generated."
+
+        # Generate stories
+        generated_stories = []
+        category_counters = {}
+
+        for req in requirements:
+            # Determine category from requirement type
+            req_type = req['requirement_type'] or 'general'
+            category = categorize_requirement(req_type, req['raw_text'] or req['title'])
+
+            # Get next sequence number for this category
+            if category not in category_counters:
+                # Check existing stories for this category
+                existing = conn.execute(
+                    "SELECT MAX(CAST(SUBSTR(story_id, -3) AS INTEGER)) FROM user_stories WHERE program_id = ? AND category = ?",
+                    [program_id, category]
+                ).fetchone()[0]
+                category_counters[category] = (existing or 0) + 1
+            else:
+                category_counters[category] += 1
+
+            seq = category_counters[category]
+            story_id = f"{program_prefix}-{category}-{seq:03d}"
+
+            # Generate user story text
+            title = req['title'] or req['raw_text'][:100]
+            user_story = generate_user_story_text(title, req['raw_text'])
+            acceptance_criteria = generate_acceptance_criteria(req['raw_text'])
+
+            story = {
+                'story_id': story_id,
+                'requirement_id': req['requirement_id'],
+                'program_id': program_id,
+                'title': title,
+                'user_story': user_story,
+                'role': 'user',
+                'acceptance_criteria': acceptance_criteria,
+                'priority': req['priority'] or 'Medium',
+                'category': category,
+                'status': 'Draft',
+                'is_technical': True
+            }
+
+            # Insert story
+            conn.execute("""
+                INSERT INTO user_stories (
+                    story_id, requirement_id, program_id, title, user_story, role,
+                    acceptance_criteria, priority, category, status, is_technical,
+                    draft_date, created_date, updated_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, [
+                story['story_id'], story['requirement_id'], story['program_id'],
+                story['title'], story['user_story'], story['role'],
+                story['acceptance_criteria'], story['priority'], story['category'],
+                story['status'], 1 if story['is_technical'] else 0
+            ])
+
+            generated_stories.append(story)
+
+        conn.commit()
+
+        # Log to audit
+        conn.execute("""
+            INSERT INTO audit_history (record_type, record_id, action, new_value, changed_by, change_reason)
+            VALUES ('user_story', ?, 'Created', ?, 'system', 'Phase 1: Draft story generation')
+        """, [program_prefix, json.dumps([s['story_id'] for s in generated_stories])])
+        conn.commit()
+
+        # Format output
+        output = f"## Draft Stories Generated (Phase 1)\n\n"
+        output += f"**Program:** {program_name} ({program_prefix})\n"
+        output += f"**Stories Generated:** {len(generated_stories)}\n"
+        output += f"**Status:** Draft (ready for review)\n\n"
+
+        output += "### Next Steps\n"
+        output += "1. Review generated stories in the database\n"
+        output += "2. Update story status to 'Pending Client Review' when ready\n"
+        output += "3. After approval, run `generate_uat_from_approved()` for Phase 2\n\n"
+
+        output += "### Generated Stories by Category\n\n"
+        category_summary = {}
+        for story in generated_stories:
+            cat = story['category']
+            category_summary[cat] = category_summary.get(cat, 0) + 1
+
+        for cat, count in sorted(category_summary.items()):
+            output += f"- **{cat}**: {count} stories\n"
+
+        output += "\n### Sample Stories\n"
+        for story in generated_stories[:5]:
+            output += f"\n**{story['story_id']}**: {story['title'][:60]}\n"
+            output += f"- {story['user_story'][:100]}...\n"
+
+        return output
+
+    except sqlite3.Error as e:
+        logger.error(f"generate_draft_stories() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"generate_draft_stories() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+@mcp.tool()
+def generate_uat_from_approved(
+    program_prefix: str,
+    include_compliance: bool = True
+) -> str:
+    """
+    Phase 2: Generate UAT test cases from approved user stories.
+
+    Args:
+        program_prefix: Program prefix (e.g., 'PROP', 'P4M')
+        include_compliance: Whether to generate compliance tests (default True)
+
+    Returns:
+        Summary of generated UAT test cases
+    """
+    logger.info(f"generate_uat_from_approved() called - prefix={program_prefix}")
+
+    conn = None
+    try:
+        db_path = os.path.expanduser(os.environ.get("PROPEL_DB_PATH", "~/projects/data/client_product_database.db"))
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+
+        # Get program
+        program_row = conn.execute(
+            "SELECT program_id, name FROM programs WHERE prefix = ?",
+            [program_prefix]
+        ).fetchone()
+
+        if not program_row:
+            return f"Program not found with prefix: {program_prefix}"
+
+        program_id = program_row['program_id']
+        program_name = program_row['name']
+
+        # Get approved stories without test cases
+        story_query = """
+            SELECT s.*
+            FROM user_stories s
+            LEFT JOIN uat_test_cases t ON s.story_id = t.story_id
+            WHERE s.program_id = ?
+            AND s.status = 'Approved'
+            AND s.is_technical = 1
+            AND t.test_id IS NULL
+            ORDER BY s.category, s.story_id
+        """
+        stories = conn.execute(story_query, [program_id]).fetchall()
+
+        if not stories:
+            # Check counts
+            total_stories = conn.execute(
+                "SELECT COUNT(*) FROM user_stories WHERE program_id = ?",
+                [program_id]
+            ).fetchone()[0]
+            approved_stories = conn.execute(
+                "SELECT COUNT(*) FROM user_stories WHERE program_id = ? AND status = 'Approved'",
+                [program_id]
+            ).fetchone()[0]
+
+            if approved_stories == 0:
+                return f"No approved stories found for {program_prefix}. Approve stories first (status = 'Approved')."
+            else:
+                return f"All {approved_stories} approved stories already have test cases."
+
+        # Generate test cases
+        generated_tests = []
+        test_counter = 1
+
+        for story in stories:
+            # Parse acceptance criteria
+            ac_text = story['acceptance_criteria'] or ''
+            criteria = [c.strip() for c in ac_text.split('\n') if c.strip() and c.strip().startswith('-')]
+
+            if not criteria:
+                criteria = [f"Verify: {story['title']}"]
+
+            # Generate test for each criterion
+            for i, criterion in enumerate(criteria, start=1):
+                test_id = f"{program_prefix}-TC-{test_counter:03d}"
+
+                # Clean criterion text
+                criterion_text = criterion.lstrip('- •[]').strip()
+
+                test = {
+                    'test_id': test_id,
+                    'story_id': story['story_id'],
+                    'program_id': program_id,
+                    'title': f"Validate: {criterion_text[:80]}",
+                    'category': story['category'],
+                    'test_type': 'validation',
+                    'prerequisites': 'User logged in with appropriate permissions',
+                    'test_steps': f"1. Navigate to the relevant feature\n2. Verify: {criterion_text}\n3. Document actual behavior\n4. Compare to expected",
+                    'expected_results': f"**Given** the feature is accessible\n**When** the validation is performed\n**Then** {criterion_text}",
+                    'priority': story['priority'] or 'Medium',
+                    'test_status': 'Not Run'
+                }
+
+                # Insert test
+                conn.execute("""
+                    INSERT INTO uat_test_cases (
+                        test_id, story_id, program_id, title, category, test_type,
+                        prerequisites, test_steps, expected_results, priority, test_status,
+                        created_date, updated_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, [
+                    test['test_id'], test['story_id'], test['program_id'],
+                    test['title'], test['category'], test['test_type'],
+                    test['prerequisites'], test['test_steps'], test['expected_results'],
+                    test['priority'], test['test_status']
+                ])
+
+                generated_tests.append(test)
+                test_counter += 1
+
+        conn.commit()
+
+        # Log to audit
+        conn.execute("""
+            INSERT INTO audit_history (record_type, record_id, action, new_value, changed_by, change_reason)
+            VALUES ('test_case', ?, 'Created', ?, 'system', 'Phase 2: UAT generation from approved stories')
+        """, [program_prefix, json.dumps([t['test_id'] for t in generated_tests])])
+        conn.commit()
+
+        # Format output
+        output = f"## UAT Test Cases Generated (Phase 2)\n\n"
+        output += f"**Program:** {program_name} ({program_prefix})\n"
+        output += f"**Stories Processed:** {len(stories)}\n"
+        output += f"**Tests Generated:** {len(generated_tests)}\n\n"
+
+        output += "### Tests by Category\n\n"
+        category_summary = {}
+        for test in generated_tests:
+            cat = test['category']
+            category_summary[cat] = category_summary.get(cat, 0) + 1
+
+        for cat, count in sorted(category_summary.items()):
+            output += f"- **{cat}**: {count} tests\n"
+
+        output += "\n### Next Steps\n"
+        output += "1. Create UAT cycle: `create_uat_cycle()`\n"
+        output += "2. Assign testers: `assign_uat_testers()`\n"
+        output += "3. Generate tracker: `generate_uat_trackers()`\n"
+
+        if include_compliance:
+            output += "\n### Compliance Tests\n"
+            output += "Run `generate_compliance_tests(story_id, 'all')` for each story requiring compliance coverage.\n"
+
+        return output
+
+    except sqlite3.Error as e:
+        logger.error(f"generate_uat_from_approved() database error: {e}")
+        return f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"generate_uat_from_approved() error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+def categorize_requirement(req_type: str, text: str) -> str:
+    """Categorize a requirement based on type and content."""
+    text_lower = (text or '').lower()
+
+    # Category detection based on keywords
+    if any(kw in text_lower for kw in ['dashboard', 'display', 'view', 'show', 'report']):
+        return 'DASH'
+    elif any(kw in text_lower for kw in ['recruit', 'invite', 'enroll', 'consent', 'patient']):
+        return 'RECRUIT'
+    elif any(kw in text_lower for kw in ['message', 'email', 'sms', 'notification', 'remind']):
+        return 'MSG'
+    elif any(kw in text_lower for kw in ['workflow', 'process', 'approval']):
+        return 'WF'
+    elif any(kw in text_lower for kw in ['config', 'setting', 'preference']):
+        return 'CFG'
+    elif any(kw in text_lower for kw in ['integrat', 'api', 'sync', 'connect']):
+        return 'INT'
+    elif any(kw in text_lower for kw in ['access', 'permission', 'role', 'auth']):
+        return 'ACC'
+    else:
+        return 'GEN'
+
+
+def generate_user_story_text(title: str, description: str) -> str:
+    """Generate user story text from title and description."""
+    # Simple template-based generation
+    return f"As a user, I want to {title.lower()}, so that I can accomplish my goals efficiently."
+
+
+def generate_acceptance_criteria(raw_text: str) -> str:
+    """Generate acceptance criteria from requirement text."""
+    if not raw_text:
+        return "- Verify the feature works as described"
+
+    # Simple extraction - split on sentence boundaries
+    sentences = raw_text.replace('. ', '.\n').split('\n')
+    criteria = []
+
+    for sentence in sentences[:5]:  # Limit to 5 criteria
+        sentence = sentence.strip()
+        if sentence and len(sentence) > 10:
+            criteria.append(f"- {sentence}")
+
+    if not criteria:
+        criteria.append(f"- Verify: {raw_text[:100]}")
+
+    return '\n'.join(criteria)
 
 
 # ============================================================
